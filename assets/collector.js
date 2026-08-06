@@ -213,9 +213,14 @@ function collectSnapshot() {
 	// different components don't. The audit keys element coverage on (rule, esig) to cover each
 	// distinct element in a given state exactly ONCE, however many pages/times it appears.
 	function esig(el) {
+		return sigOf(el, (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean).sort().join('.'));
+	}
+
+	// The half of a signature that isn't the class set: tag, role, child shape, ARIA hooks. Shared by
+	// `esig` and `fsig` so the two signatures can only ever differ in how they read the CLASS set.
+	function sigOf(el, cls) {
 		const tag = el.tagName.toLowerCase();
 		const role = (el.getAttribute('role') || '').toLowerCase();
-		const cls = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean).sort().join('.');
 		let shape = '';
 		let prev = '';
 		for (const c of el.children) {
@@ -229,6 +234,90 @@ function collectSnapshot() {
 		let h = 0x811c9dc5;
 		for (let i = 0; i < raw.length; i++) { h ^= raw.charCodeAt(i); h = Math.imul(h, 0x01000193); }
 		return (h >>> 0).toString(36);
+	}
+
+	// ── Component FAMILY signature (`fsig`) — a COARSER companion to `esig`, never a replacement ──
+	// `esig` is the exact RENDERING; `fsig` is the component the rendering came from. They answer two
+	// different questions and both are needed:
+	//   • esig → COVERAGE dedupe. A warning chip and a success chip genuinely differ in colour, so a
+	//     contrast finding on one is NOT a finding on the other; coverage must keep them apart.
+	//   • fsig → ATTRIBUTION. Those same chips are one <Chip> rendered with a different prop, so the
+	//     fix is ONE edit. Root-cause grouping has to see all of them, or "fix the component, not the
+	//     instances" reports the same defect three times and understates its blast radius by 3×.
+	// Do NOT "simplify" these into one signature: whichever grain won, the other question would get
+	// the wrong answer. Measured on a CSS-in-JS corpus site, the split is real — one MUI <Chip>
+	// rendered 39 times carried 3 esigs (one per colour prop) and one nav item rendered 55 times
+	// carried 2 (the active one wears an extra class).
+	// fsig drops the class tokens that vary while the COMPONENT does not — generated/hashed names,
+	// state classes, and variant modifiers of a block that also declares its base class — and keeps
+	// everything else, including tag/role/shape/ARIA. Every rule below is deliberately reluctant:
+	// failing to merge two renderings of one component only costs a duplicate finding, whereas
+	// merging two genuinely different components files their findings under one wrong root cause.
+
+	// Class tokens that name a STATE rather than a component — the active nav item, the open menu.
+	// A closed list of conventional names, because an unrecognised token is kept (safe) while a
+	// wrongly dropped one merges components (not safe).
+	const STATE_CLASS = /^(?:is|has)[-_]|^(?:active|current|selected|checked|open|opened|closed|expanded|collapsed|disabled|enabled|hidden|shown|show|visible|focus|focused|focus-visible|hover|hovered|pressed|dragging|loading|busy|sticky|stuck|first|last|even|odd)$/i;
+	// What's left of a generated token once its hash is stripped: a library's prefix, which names no
+	// component (`css-1qz9irk` → `css`).
+	const GENERIC_STUB = /^(?:css|jss|emotion|em|sc|style|styles|module|modules|makeStyles|useStyles)$/i;
+
+	// Does a class-name run read as a generated HASH rather than a name? Judged structurally — vowel
+	// density, syllable shape, digit placement, case noise — never against a library list, so an
+	// unknown CSS-in-JS runtime is covered too. Tuned to answer NO on anything word-shaped: `hStack`,
+	// `navBar`, `sizeSmall`, `colorSuccess`, `elevation0`, `bp4` and `flex` all survive it.
+	function hashish(t) {
+		const n = t.length;
+		if (n < 4 || n > 12 || !/^[A-Za-z0-9]+$/.test(t)) return false;
+		const big = (re) => Math.max(0, ...(t.match(re) || []).map((s) => s.length));
+		const vowels = (t.match(/[aeiou]/gi) || []).length;
+		// A name has syllables: a letter run long enough to pronounce, with no consonant pile-up.
+		if (big(/[A-Za-z]+/g) > 3 && big(/[b-df-hj-np-tv-z]+/gi) < 4) return false;
+		// emotion / CSS-Modules (`1qz9irk`, `lz0uxg`, `x1y2`) and lowercase runs like `tbnvsp`: a digit
+		// INSIDE the run, or no vowel at all, on too few vowels for the length. A TRAILING number is a
+		// scale step rather than a hash, so `elevation0`, `h3`, `bp4` and `col6` keep theirs.
+		if ((vowels === 0 || /\d/.test(t.slice(0, -1))) && vowels * 3 <= n) return true;
+		// styled-components (`hXlPTf`, `kQwWXy`, `iJKvXn`): short, case-noisy, vowel-starved.
+		const CASE_RUNS = /[A-Z]+|[^A-Z]+/g;
+		return n <= 8 && (t.match(CASE_RUNS) || []).length >= 3 && big(CASE_RUNS) <= 3 && vowels * 4 <= n;
+	}
+
+	// One class token reduced to the part that identifies a COMPONENT, or '' to drop it entirely.
+	function familyToken(t) {
+		if (STATE_CLASS.test(t)) return '';
+		// styled-components emits a PAIR: a componentId (`sc-gzVnrw`), stable for the life of the
+		// component and identical across all of its variants, plus a per-style-rule class that changes
+		// with the props (`hXlPTf`). Svelte's `svelte-1x2abc` is the same idea, one per component FILE.
+		// Such an id is precisely the identity we're after, so it is kept however hashy it looks — and
+		// it is what stops a de-hashed element collapsing to no classes at all.
+		if (/^(?:sc|svelte)-[A-Za-z0-9]+$/.test(t)) return t;
+		const segs = t.split(/[-_]+/).filter(Boolean);
+		const kept = segs.filter((s) => !hashish(s));
+		if (kept.length === segs.length) return t; // nothing generated in it
+		const rest = kept.join('-'); // `Button_root__x1y2` → `Button-root`
+		return rest.length < 3 || GENERIC_STUB.test(rest) ? '' : rest;
+	}
+
+	function fsig(el) {
+		const raw = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean);
+		const seen = [];
+		for (const t of raw) {
+			const f = familyToken(t);
+			if (f && seen.indexOf(f) < 0) seen.push(f);
+		}
+		// A BLOCK that declares its base class (`MuiChip-root`, `btn`) alongside modifiers of the same
+		// block (`MuiChip-colorWarning`, `btn-primary`) is one component wearing a prop: keep the base,
+		// drop the modifiers. Only when the base is actually present — without it there is no evidence
+		// the token is a modifier at all, and `card-header` must not collapse into `card`.
+		const base = (t) => { const b = t.split('-')[0]; const r = t.slice(b.length + 1); return !r || r === 'root' || r === 'base' ? b : ''; };
+		const based = new Set(seen.map(base).filter(Boolean));
+		const cls = seen.filter((t) => base(t) || !based.has(t.split('-')[0]));
+		// Nothing survived — an element whose only classes were state or hash. It must NOT fall into
+		// the pool of class-LESS elements of its shape: with no stable token left there is no evidence
+		// of a family at all, and filing 1000 bare <span>s under one root cause is the mis-attribution
+		// this signature exists to prevent. Keep the exact class set (so fsig === esig, and the field
+		// isn't even emitted) — no grouping is the honest answer when nothing identifies the component.
+		return cls.length || !raw.length ? sigOf(el, cls.sort().join('.')) : esig(el);
 	}
 
 	// Framework fingerprint — synthetic-event frameworks change what "interactive" looks like.
@@ -1120,11 +1209,24 @@ function collectSnapshot() {
 		// elements aren't in the HTML namespace, so tagName stays lowercase ("svg", not "SVG").
 		const vz = el.tagName.toLowerCase() === 'svg' ? vizSignal(el, rect.width, rect.height) : null;
 
+		// Component identity at two grains — the exact rendering, and the component family. This loop
+		// has no try/catch of its own, so `fsig` — much the more intricate of the two — gets one here:
+		// falling back to the exact rendering costs one un-grouped element, throwing costs the whole
+		// page's capture.
+		const es = esig(el);
+		let fs = es;
+		try { fs = fsig(el); } catch (_) { /* keep es — no family is better than no snapshot */ }
+
 		els.push({
 			idx,
 			parentIdx,
 			sel: shortSel(el),
-			esig: esig(el),
+			esig: es,
+			// Component FAMILY (see `fsig`): the same element grouped by which COMPONENT it came
+			// from, so root-cause attribution can say "one fix, N instances". OMITTED when it equals
+			// `esig` — the common case on hand-written CSS, where nothing in the class set varies per
+			// rendering — so it costs no bytes on most sites. A missing `fsig` means "same as esig".
+			fsig: fs === es ? undefined : fs,
 			tag: el.tagName.toLowerCase(),
 			role: role || null,
 			position: cs.position,
