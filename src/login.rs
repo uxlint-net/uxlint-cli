@@ -8,6 +8,75 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// The web app to send someone to, for a link they can actually click. In production the Axum server
+/// serves the SPA itself (`UXLINT_WEB_DIR`), so the API origin IS the web origin and deriving one
+/// from the other is correct rather than a guess; `UXLINT_WEB_URL` overrides it for local dev, where
+/// Vite serves the app on its own port.
+pub(crate) fn web_base(server: &str) -> String {
+    std::env::var("UXLINT_WEB_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| server.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Why we can't authenticate. The two cases read completely differently to a human and must not
+/// share one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialProblem {
+    /// No credential at all: never signed in, or signed out. An onboarding moment.
+    Missing,
+    /// A credential exists and the server REFUSED it. Usually revoked — an admin or an org admin can
+    /// invalidate tokens, and incident response rotates them — occasionally a token minted for a
+    /// different server. Telling this person to "sign in" implies they never did, which sends them
+    /// hunting for a mistake they did not make.
+    Rejected,
+}
+
+/// What to tell someone whose credential is missing or refused, and how to fix it — including a URL
+/// they can click, because "run this command" is useless advice to whoever is reading it relayed
+/// through a coding agent.
+///
+/// `for_agent` switches the AUDIENCE, not just the wording: an MCP client is a model that cannot open
+/// a browser or run a terminal command, so its copy has to tell it to relay the link and the command
+/// to the human. Without that, agents report "authentication failed" and stop.
+pub(crate) fn credential_help(server: &str, problem: CredentialProblem, for_agent: bool) -> String {
+    let web = web_base(server);
+    let lead = match problem {
+        CredentialProblem::Missing => {
+            "uxlint isn't signed in, so it can't reach the server.".to_string()
+        }
+        CredentialProblem::Rejected => "uxlint's saved credential was refused by the server — it has \
+             most likely been revoked (an admin can invalidate tokens, and incident response rotates \
+             them). It needs replacing; nothing is wrong with your setup."
+            .to_string(),
+    };
+    let mut out = format!(
+        "{lead}\n\nMint a new one:\n  \
+         • in a terminal:   uxlint auth login\n  \
+         • or in a browser: {web}/settings  (Access tokens → create), then save it with \
+         `uxlint auth login` or set UXLINT_API_KEY"
+    );
+    if problem == CredentialProblem::Rejected {
+        out.push_str(
+            "\n\nThe old credential is dead — a revoked token never comes back, so re-running \
+             without replacing it fails exactly the same way.",
+        );
+    }
+    if for_agent {
+        out.push_str(
+            "\n\nYou can't do this yourself — opening a browser and running a terminal command are \
+             the user's to do. Show them the link and the command above, then call this tool again \
+             once they confirm. If they use `uxlint auth login`, they must restart the editor \
+             afterwards so this MCP server re-reads the credential.",
+        );
+    } else {
+        out.push_str(&format!("\n\nServer: {server}"));
+    }
+    out
+}
+
 /// Where the token lives. XDG_CONFIG_HOME/uxlint/credentials, else ~/.config/uxlint/credentials.
 pub(crate) fn cred_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -219,4 +288,62 @@ pub(crate) fn run_status(server: &str) -> Result<()> {
         Err(e) => println!("A token is saved, but it didn't check out against {server}: {e}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_revoked_credential_does_not_read_as_never_signed_in() {
+        // The distinction this whole helper exists for. Someone whose token was just revoked HAS
+        // signed in; telling them they haven't sends them hunting for a setup mistake they didn't
+        // make, and an agent relaying it walks them through first-run all over again.
+        let rejected = credential_help("https://uxlint.net", CredentialProblem::Rejected, false);
+        assert!(rejected.contains("revoked"), "{rejected}");
+        assert!(!rejected.contains("isn't signed in"), "{rejected}");
+        // And it must say the old one is gone for good, or the obvious move is to retry as-is.
+        assert!(rejected.contains("never comes back"), "{rejected}");
+
+        let missing = credential_help("https://uxlint.net", CredentialProblem::Missing, false);
+        assert!(missing.contains("isn't signed in"), "{missing}");
+        assert!(!missing.contains("revoked"), "{missing}");
+    }
+
+    #[test]
+    fn both_cases_offer_a_link_and_a_command() {
+        // "Run uxlint auth login" is useless to whoever is reading this relayed through an agent in
+        // a chat window, and a link alone is useless in CI. Every message carries both.
+        for p in [CredentialProblem::Missing, CredentialProblem::Rejected] {
+            let m = credential_help("https://uxlint.net", p, false);
+            assert!(m.contains("https://uxlint.net/settings"), "{m}");
+            assert!(m.contains("uxlint auth login"), "{m}");
+            assert!(m.contains("UXLINT_API_KEY"), "{m}");
+        }
+    }
+
+    #[test]
+    fn the_agent_variant_tells_the_model_to_hand_it_over() {
+        // An MCP client can't open a browser or run a shell command. Unless it's told to relay, it
+        // reports "authentication failed" and stops, and the user never sees the way out.
+        let a = credential_help("https://uxlint.net", CredentialProblem::Rejected, true);
+        assert!(a.contains("can't do this yourself"), "{a}");
+        assert!(a.contains("restart the editor"), "{a}");
+        // The human-facing variant shouldn't carry agent instructions.
+        let h = credential_help("https://uxlint.net", CredentialProblem::Rejected, false);
+        assert!(!h.contains("can't do this yourself"), "{h}");
+    }
+
+    #[test]
+    fn the_link_follows_the_server_this_run_points_at() {
+        // A self-hosted deployment's user must not be sent to our hosted settings page. In prod the
+        // API origin serves the SPA, so deriving it is right; UXLINT_WEB_URL covers local dev.
+        let m = credential_help(
+            "https://uxlint.example.com",
+            CredentialProblem::Missing,
+            false,
+        );
+        assert!(m.contains("https://uxlint.example.com/settings"), "{m}");
+        assert!(!m.contains("uxlint.net"), "{m}");
+    }
 }

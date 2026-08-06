@@ -95,19 +95,60 @@ pub(crate) fn base_path_hint(base: &str) -> Option<String> {
 /// The audit's ONE pre-flight `GET /v1/me`, before any browser work. Two callers ride on it —
 /// `prevalidate_org` (is this uxlint.toml's org/site filable?) and the CLI-alignment check (is this
 /// binary the one THIS server expects? — `update::print_server_alignment`) — and neither is worth a
-/// second round trip. Best-effort by design: unreachable, non-2xx or unparseable all collapse to
-/// `None`, and the post-audit POST is left to surface the real error.
-pub(crate) fn fetch_me(cli: &Cli) -> Option<Value> {
+/// second round trip.
+///
+/// `Err` = the server DEFINITIVELY refused this credential (401/403). `Ok(None)` = we couldn't ask
+/// (unreachable, other non-2xx, unparseable), which is unknowable, so the caller carries on and lets
+/// the POST surface whatever is really wrong.
+///
+/// Separating those two is the point. A refused credential used to look identical to an unreachable
+/// server here, so an audit with a REVOKED token crawled the whole site and only failed at the POST —
+/// and a 401 against a large body surfaces client-side as "Broken pipe", which says nothing about
+/// auth at all. This call already runs before any browser work, so it is the cheapest place to find
+/// out and the only one where the user hasn't already paid for the crawl.
+pub(crate) fn fetch_me(cli: &Cli) -> Result<Option<Value>> {
     let http = reqwest::blocking::Client::new();
-    let resp = http
+    let Ok(resp) = http
         .get(format!("{}/v1/me", cli.server))
         .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
         .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+    else {
+        return Ok(None); // unreachable — not a verdict on the credential
+    };
+    let status = resp.status();
+    // A rejected credential is only a verdict on one we actually SENT. With no key at all this is
+    // just the signed-out state, which the commands that need auth report in their own words.
+    let sent_a_key = cli.api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if sent_a_key {
+            anyhow::bail!(crate::login::credential_help(
+                &cli.server,
+                crate::login::CredentialProblem::Rejected,
+                false,
+            ));
+        }
+        return Ok(None);
     }
-    resp.json::<Value>().ok()
+    if !status.is_success() {
+        return Ok(None);
+    }
+    let me = resp.json::<Value>().ok();
+    // THE ACTUAL SHAPE OF A REFUSAL, and it is not a status code: `/v1/me` answers 200 with
+    // `{"authenticated": false}` for a bad, expired or revoked token. Checking only for a 401 here
+    // silently passed a dead credential straight through to a full crawl — verified against the
+    // running server, not assumed.
+    if sent_a_key
+        && me
+            .as_ref()
+            .is_some_and(|m| m["authenticated"].as_bool() != Some(true))
+    {
+        anyhow::bail!(crate::login::credential_help(
+            &cli.server,
+            crate::login::CredentialProblem::Rejected,
+            false,
+        ));
+    }
+    Ok(me)
 }
 
 /// Pre-flight the declared org/site against an already-fetched `/v1/me` (see `fetch_me`) so a
@@ -512,7 +553,7 @@ pub(crate) fn resolve_target(
     //     file under.
     //
     // Best-effort throughout: an unreachable /v1/me yields None and the post step reports it.
-    if let Some(me) = fetch_me(cli) {
+    if let Some(me) = fetch_me(cli)? {
         crate::update::print_server_alignment(me.get("cli"));
         if let Some(org_name) = &org {
             prevalidate_org(&me, org_name, site.as_deref())?;

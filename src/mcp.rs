@@ -194,12 +194,17 @@ fn failure_text(r: reqwest::blocking::Response) -> String {
 /// Shown when the MCP server has no API key — the common first-run state for someone who just
 /// installed uxlint from a marketplace. A clean, agent-relayable onboarding funnel beats the raw
 /// 401 JSON the server would otherwise surface.
-const SIGNUP_HINT: &str = "uxlint isn't signed in yet, so it can't run audits.\n\n\
-Run in a terminal:  uxlint auth login\n\
-— it opens your browser to sign in (email/password or Google) and saves credentials this MCP \
-server reads automatically. Then restart your editor so it picks them up, and call this tool again.\n\n\
-(CI / headless instead: set the UXLINT_API_KEY env var — from `uxlint auth login` or Settings → API keys.)\n\
-(Tell the user to run `uxlint auth login` — they need to do it.)";
+fn signup_hint(server: &str) -> String {
+    crate::login::credential_help(server, crate::login::CredentialProblem::Missing, true)
+}
+
+/// Shown when the server REFUSED a key we did send — a revoked token, not a missing one. Distinct
+/// wording matters here: an agent told "uxlint isn't signed in yet" will walk the user through
+/// first-run setup they already did, when what actually happened is that their credential was
+/// invalidated and has to be replaced.
+fn credential_rejected(server: &str) -> String {
+    crate::login::credential_help(server, crate::login::CredentialProblem::Rejected, true)
+}
 
 // ── Tool input schemas ────────────────────────────────────────────────────────
 // Field descriptions live in `///` doc comments (schemars reads them into the JSON Schema).
@@ -397,7 +402,7 @@ impl UxlintMcp {
     ) -> Result<CallToolResult, McpError> {
         if self.cli.api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                SIGNUP_HINT,
+                signup_hint(&self.cli.server),
             )]));
         }
         let args = AuditArgs {
@@ -801,7 +806,7 @@ impl UxlintMcp {
         };
         if self.cli.api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                SIGNUP_HINT,
+                signup_hint(&self.cli.server),
             )]));
         }
         let cli = self.cli.clone();
@@ -964,7 +969,7 @@ impl UxlintMcp {
     ) -> Result<CallToolResult, McpError> {
         if self.cli.api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                SIGNUP_HINT,
+                signup_hint(&self.cli.server),
             )]));
         }
         let cli = self.cli.clone();
@@ -1004,7 +1009,7 @@ impl UxlintMcp {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     Ok((b64, mime, path.display().to_string()))
                 }
-                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => Err(SIGNUP_HINT.to_string()),
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => Err(credential_rejected(&cli.server)),
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
                     Err("no such screenshot — check the report_id/route/viewport, or you may not have access to that report".to_string())
                 }
@@ -1093,7 +1098,7 @@ optionally url/note."
                     .send();
                 match resp {
                     Ok(r) if r.status().is_success() => "recorded — this trains which uxlint rules to keep, tune, or retire".to_string(),
-                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => SIGNUP_HINT.to_string(),
+                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => credential_rejected(&cli.server),
                     Ok(r) => failure_text(r),
                     Err(e) => format!("feedback failed: {e}"),
                 }
@@ -1109,7 +1114,7 @@ optionally url/note."
                     .send();
                 match resp {
                     Ok(r) if r.status().is_success() => "recorded — thanks, this feeds uxlint's lint-suggestion backlog".to_string(),
-                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => SIGNUP_HINT.to_string(),
+                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => credential_rejected(&cli.server),
                     Ok(r) => failure_text(r),
                     Err(e) => format!("feedback failed: {e}"),
                 }
@@ -1125,7 +1130,7 @@ optionally url/note."
                     .send();
                 match resp {
                     Ok(r) if r.status().is_success() => "recorded — this feeds uxlint's widget-recognition corpus".to_string(),
-                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => SIGNUP_HINT.to_string(),
+                    Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => credential_rejected(&cli.server),
                     Ok(r) => failure_text(r),
                     Err(e) => format!("feedback failed: {e}"),
                 }
