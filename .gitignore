@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Env / local overrides — the CLI never writes secrets into the project tree (credentials live at
+# ~/.config/uxlint/credentials, outside any repo), but keep the usual escape hatch ignored anyway.
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

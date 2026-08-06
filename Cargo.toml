@@ -1,0 +1,65 @@
+# This crate is its OWN Cargo workspace (WP41 extraction prep) — it is NOT a member of the
+# monorepo root workspace one directory up. That lets it be lifted into a standalone repo with
+# no rewrite: `cd client && cargo build` resolves entirely within this directory tree.
+[workspace]
+
+[package]
+name = "uxlint"
+version = "0.1.12"
+edition = "2021"
+
+[dependencies]
+# Drives an existing Chrome/Chromium over CDP — no Node, no Playwright.
+headless_chrome = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+base64 = "0.22"
+# RUST_LOG visibility into the CDP transport — a browser connection dying mid-audit
+# is only diagnosable from the crate's log lines.
+env_logger = "0.11"
+# The `log` facade — for our own diagnostic records (e.g. the Chrome binary/flags at audit start) that
+# should ride the same RUST_LOG filter as headless_chrome's, not the user-facing progress stream.
+log = "0.4"
+# Kill orphaned Chrome children when the driver is signalled (SIGTERM/SIGINT/SIGHUP).
+libc = "0.2"
+# OpenTelemetry TRACES ONLY (src/otel.rs) — so a hosted audit's crawl isn't one opaque span in the
+# worker's trace. Same 0.32 line + tonic transport as the server/workers, so the CLI reaches the same
+# collector; grpc-tonic needs the tokio runtime otel.rs stands up for the export. Inert unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is set.
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
+# The tonic the otlp exporter builds on — a direct dep so its metadata types (auth headers) are in
+# scope, kept in lockstep with opentelemetry-otlp's tonic in Cargo.lock (mirrors server/Cargo.toml).
+tonic = "0.14"
+# Official MCP SDK — the async stdio server that replaces the hand-rolled JSON-RPC loop.
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
+# Async runtime for the rmcp server; blocking audits/HTTP run on spawn_blocking.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+# JSON Schema derive for the MCP tool input structs (schemars reads /// docs as field descriptions).
+schemars = "1"
+# Interactive CLI prompts (arrow-key Select with type-to-filter, Text, Confirm, Password) for
+# `uxlint init` — replaces the hand-rolled numbered-list pickers. Inline prompts, not a full-screen
+# TUI, so no ratatui event loop; Select's built-in filtering matters once an org has many sites.
+inquire = "0.9.4"
+# Verifying release tarball checksums before self-updating (WP40) — same crate/version the server
+# already pulls in (server/Cargo.toml), so this adds no new dependency to the build graph.
+sha2 = "0.10"
+# The Rust mirror of the shared secret/PII redaction patterns (src/redact.rs). Console logs and
+# native-dialog messages are redacted in Rust (they never run in the page, so they can't use the
+# shared JS snippet); the corpus test exercises exactly these patterns as the tested source of truth.
+regex = "1"
+
+[dev-dependencies]
+# (reserved for test-only deps; the redaction corpus tests need only `regex`, already a runtime dep)
+
+# Vendored with transport-loop fixes: a timed-out method call no longer kills the whole browser
+# connection (see vendor/headless_chrome/src/browser/transport/mod.rs, "uxlint patch" markers).
+# Remove when upstream fixes land. Moved here (WP41) from the monorepo root's [patch.crates-io] —
+# this crate is the only consumer of headless_chrome, so the patch now lives with its dependent.
+[patch.crates-io]
+headless_chrome = { path = "vendor/headless_chrome" }

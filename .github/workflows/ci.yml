@@ -1,0 +1,46 @@
+# CI for the uxlint CLI, standalone — no web/svelte-check job (that's the server repo's concern),
+# no workspace to share with server/worker/audit-worker (this crate is its own Cargo workspace).
+#
+# Actions are pinned to a commit SHA (the tag in the trailing comment is just for humans) — a
+# moving tag like @v4 can be repointed at new code under the same name, so a SHA is the only pin
+# that can't change under us.
+#
+# NOTE: this file lives at client/.github/workflows/ci.yml inside uxlint's private monorepo (WP41
+# extraction prep) — GitHub only runs workflows from a repo's OWN top-level .github/, so this is
+# inert until client/ is lifted into its own repo, at which point this becomes ci.yml at that
+# repo's root.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (fmt + clippy + build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Same gate as `just check` in client/justfile — formatting drift fails the build.
+      - name: Format check
+        run: cargo fmt --check
+      # Any clippy warning fails the build — no fallback.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release

@@ -1,0 +1,112 @@
+# Release: build the uxlint CLI for every target that compiles, and publish the checksummed
+# tarballs as GitHub Release assets (softprops/action-gh-release) — no self-hosted bucket, no
+# custom upload token. This supersedes the private monorepo's old self-hosted-bucket release.yml
+# (see SPLIT-PLAN.md's "GitHub Releases, not the self-hosted bucket" decision): once this crate is
+# a public repo, GITHUB_TOKEN (automatic, scoped to `contents: write` for this one job) is the
+# entire auth story.
+#
+# Windows is deliberately NOT in the matrix: client/src/reaper.rs calls libc::kill/SIGKILL/SIGHUP
+# unconditionally, which doesn't compile for any windows target. Promising a Windows build here
+# would be a lie until that file grows a #[cfg(windows)] arm.
+#
+# NOTE: this file lives at client/.github/workflows/release.yml inside uxlint's private monorepo
+# (WP41 extraction prep) — GitHub only runs workflows from a repo's OWN top-level .github/, so this
+# is inert until client/ is lifted into its own repo, at which point this becomes release.yml at
+# that repo's root and `tag push` actually fires it.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Build linux on ubuntu-22.04 (glibc 2.35), NOT ubuntu-latest (24.04 = glibc 2.39): a binary
+          # links against its build-host glibc and needs that version OR NEWER at runtime. A 24.04
+          # build fails on Debian bookworm (glibc 2.36) — including our own audit-worker image — and on
+          # any user distro older than 24.04. Built on 2.35 it runs on bookworm and everything newer.
+          - platform: linux-x64
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native arm64 runner (no cross-toolchain to install/maintain); same glibc-floor reasoning.
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          # Intel macOS: cross-compiled from the arm64 runner. GitHub retired the Intel `macos-13`
+          # runner (jobs sit queued forever), so build the x86_64 target on macos-latest — Apple's
+          # SDK links both arches, and reqwest's native-tls uses Security.framework (not OpenSSL), so
+          # there's no cross-arch C dependency to satisfy.
+          - platform: macos-x64
+            target: x86_64-apple-darwin
+            os: macos-latest
+          - platform: macos-arm64
+            target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      # Filename is `uxlint-{platform}.tar.gz` (no version in the name — the version lives in the
+      # release tag/URL), matching what install.sh expects to find at
+      # releases/latest/download/uxlint-{platform}.tar.gz.
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          tar czf uxlint-${{ matrix.platform }}.tar.gz uxlint
+          # shasum (not sha256sum) — the only one guaranteed present on BOTH the ubuntu and macos
+          # runners in this matrix; macOS has no sha256sum by default.
+          shasum -a 256 uxlint-${{ matrix.platform }}.tar.gz > uxlint-${{ matrix.platform }}.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            target/${{ matrix.target }}/release/uxlint-${{ matrix.platform }}.tar.gz
+            target/${{ matrix.target }}/release/uxlint-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+      # The machine-readable CLI reference the docs site renders (see src/docs_json.rs). It's
+      # generated from THIS release's freshly-built binary, so the published reference can never
+      # drift from what the binary accepts. Platform-independent, so emit it once — from the native
+      # linux-x64 build, which runs on its own x64 runner. The server serves the latest release's
+      # copy (cached ~1 day), so /docs/cli tracks the newest uxlint without a web redeploy.
+      - name: Generate CLI reference
+        if: matrix.platform == 'linux-x64'
+        run: ./target/${{ matrix.target }}/release/uxlint docs-json > cli-reference.json
+      - name: Upload CLI reference
+        if: matrix.platform == 'linux-x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-cli-reference
+          path: cli-reference.json
+          if-no-files-found: error
+
+  # One job, after every target has built, so a partial matrix failure never publishes a release
+  # with some targets missing.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dl
+          merge-multiple: true
+      # Immutable releases (enabled org-wide) SEAL a release on publish and reject asset uploads
+      # afterward — so assets must be attached BEFORE it's finalized. Create a DRAFT holding every
+      # asset, then flip it to published: the assets are already in place when it seals.
+      # (softprops/action-gh-release creates-then-uploads, which fails the moment the release seals.)
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dl/*.tar.gz dl/*.tar.gz.sha256 dl/cli-reference.json \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --draft
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
