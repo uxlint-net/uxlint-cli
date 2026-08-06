@@ -2055,7 +2055,18 @@ function collectSnapshot() {
 	// wants to persist — a strong signal the app needs a side nav.
 	let primaryNav = { present: false, orientation: '', dests: 0, contextSwitcher: false, acquisition: [], accountItems: [], accountItemRects: [], accountItemsBottom: false, userMenu: false, hasSideNav: false };
 	try {
+		// A BREADCRUMB is never the primary nav — it says where you ARE, not where you can go. This
+		// matters most at mobile width, where it is often the only nav landmark still VISIBLE: the
+		// real nav sits behind a hamburger (`display:none` until opened), so it fails the
+		// offsetParent test below and the trail wins by default. Every consumer of primaryNav then
+		// reasons about the wrong element. On our own app that surfaced as `settings-in-primary-nav`
+		// firing on a "Settings" CRUMB, but any site whose nav is behind a toggle — i.e. most
+		// responsive sites — would have had its whole mobile nav shape read off a breadcrumb.
+		// Same selector the breadcrumb signal itself uses, so the two can't disagree about what one is.
+		const isBreadcrumb = (n) =>
+			n.matches('nav[aria-label*="breadcrumb" i], [class*="breadcrumb" i], [id*="breadcrumb" i], [aria-label*="breadcrumb" i]');
 		const navs = Array.from(document.querySelectorAll('nav, [role="navigation"]')).filter(n => {
+			if (isBreadcrumb(n)) return false;
 			const r = n.getBoundingClientRect();
 			return r.width > 4 && r.height > 4 && n.offsetParent !== null;
 		});
