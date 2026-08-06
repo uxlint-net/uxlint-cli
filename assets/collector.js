@@ -14,6 +14,9 @@
 //   • tokens / palette / css / framework / widgetLib — design tokens and computed styles.
 //   • links, nav, breadcrumbs, headings, form-field labels — structure for the IA/nav lints.
 //   • metaDescription / ogTags / iconLink — page <meta>, for SEO/preview lints.
+//   • iframes[] — each embedded frame's box + visibility + the src's HOST (never the full URL: an
+//     embed src can carry tokens/session ids in its query string, and the host alone answers
+//     "first- or third-party?").
 // All human-readable text runs through `redactSecrets` (the shared assets/redact.js patterns) before
 // it leaves this function. Redaction is BEST-EFFORT, not a guarantee — see assets/redact.js.
 
@@ -2538,6 +2541,64 @@ function collectSnapshot() {
 		frame.footer = frameExtent('footer, [role="contentinfo"]');
 	} catch (_) { /* ignore */ }
 
+	// Embedded frames — box, visibility, and the embed's HOST. Nothing else in the snapshot can see
+	// an <iframe>: they aren't captured as elements, so "is there a third-party frame here, and does
+	// it stick out past the viewport?" is unanswerable today. It is a real defect — a hidden
+	// fraud-detection frame laid out wider than the window adds a horizontal scrollbar to every page
+	// it loads on, and because it paints nothing the cause is invisible to the eye.
+	//
+	// The HOST ONLY, deliberately — never the full src. An embed URL routinely carries session ids,
+	// one-time tokens and customer identifiers in its query string, and this JSON is POSTed to our
+	// server. The host is the whole question ("ours or someone else's?"); the query string is
+	// somebody's credential and has no business leaving the page.
+	//
+	// Only the ELEMENT is read — attributes and box, never `contentDocument` — so a cross-origin
+	// frame is exactly as readable as a same-origin one and nothing here can trip a security error.
+	const iframes = [];
+	try {
+		const pageHost = location.hostname;
+		// Same site = the same registrable domain (the last two labels) — the SAME rule the crawl uses
+		// to decide what is off-site (`same_site` in worker.rs), so the two can't disagree about whose
+		// frame this is: `app.acme.com` embedding `assets.acme.com` is our own embed, not a stranger's.
+		// An IP or a bare hostname (localhost) matches exactly. It over-merges a multi-tenant eTLD
+		// (`a.co.uk` vs `b.co.uk`), which can only ever MISS a third party — the safe direction for a
+		// signal a lint accuses someone with. Decided here because `location` is the authority on what
+		// the page's origin actually is.
+		const regDomain = (h) => {
+			if (!h.includes('.') || h.includes(':') || /^[\d.]+$/.test(h)) return h; // bare host / IPv6 / IPv4
+			return h.split('.').slice(-2).join('.');
+		};
+		const pageReg = regDomain(pageHost);
+		for (const f of document.querySelectorAll('iframe')) {
+			if (iframes.length >= 60) break; // ad-stuffed pages; the trim below keeps the payload small
+			let host = '';
+			const src = f.getAttribute('src') || '';
+			// Resolve RELATIVE srcs against the page, or a first-party `/embed/x` reads as host-less
+			// and escapes first-party detection. srcdoc / about:blank / javascript: / data: frames have
+			// no host at all — inline content, first-party by construction — and stay host-less.
+			if (src && !/^(about:|javascript:|data:|blob:)/i.test(src)) {
+				try { host = new URL(src, location.href).hostname; } catch (_) { /* unparseable src */ }
+			}
+			const cs = getComputedStyle(f);
+			const r = f.getBoundingClientRect();
+			// "Visually hidden" = paints nothing, by any of the usual techniques. A 1px-thin frame
+			// counts: it is invisible to the eye yet still occupies (and can overflow) layout, and that
+			// exact combination — no pixels, full width — is the defect worth reporting.
+			const hidden = cs.display === 'none' || cs.visibility !== 'visible' ||
+				(parseFloat(cs.opacity) || 0) < 0.05 || f.hasAttribute('hidden') ||
+				f.getAttribute('aria-hidden') === 'true' || r.width <= 2 || r.height <= 2;
+			const o = { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+			if (host) o.host = host;
+			if (host && regDomain(host) !== pageReg) o.tp = true;
+			if (hidden) o.hidden = true;
+			iframes.push(o);
+		}
+		// Keep the payload bounded. When a page embeds more frames than we'll send, keep the WIDEST —
+		// width is the whole question here, so trimming by document order would be the one way to drop
+		// the offender and keep eleven ad slots.
+		if (iframes.length > 12) { iframes.sort((a, b) => b.w - a.w); iframes.length = 12; }
+	} catch (_) { /* ignore */ }
+
 	let breadcrumb = false;
 	try {
 		if (document.querySelector('nav[aria-label*="breadcrumb" i], [class*="breadcrumb" i], [id*="breadcrumb" i], [aria-label*="breadcrumb" i]')) {
@@ -2656,6 +2717,7 @@ function collectSnapshot() {
 		inPageNav,
 		pageTheme,
 		frame,
+		iframes,
 		breadcrumb,
 		vagueLinks,
 		vagueLinkRects,

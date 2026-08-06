@@ -102,8 +102,10 @@ this repo actually does:
 - **The collector is baked in and readable.** It's compiled into this
   binary (`include_str!` of `assets/collector.js`), so `uxlint --version` pins the exact capture
   code and the server can't inject anything at run time. Everything it captures is page geometry,
-  visible text, computed styles, and screenshots. It never reads your source code or your filesystem
-  beyond `uxlint.toml`. It does read a little **project provenance** and send it with the report:
+  visible text, computed styles, and screenshots. For an embedded `<iframe>` it records the src's
+  **host** only — never the full embed URL, which can carry session ids and tokens in its query
+  string. It never reads your source code or your filesystem beyond `uxlint.toml`. It does read a
+  little **project provenance** and send it with the report:
   your current git commit sha and branch name (`git rev-parse`), the machine's hostname, and, in
   GitHub Actions, the repo/PR/commit link. Set `UXLINT_RUNNER` to override the hostname.
 - **Secret & PII redaction is best-effort, not a guarantee.** Before anything is uploaded, the
