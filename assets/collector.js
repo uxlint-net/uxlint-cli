@@ -496,9 +496,64 @@ function collectSnapshot() {
 		}
 	} catch (_) { /* ignore */ }
 	let anchorIds = [];
+	let idEls = []; // the same elements anchorIds is derived from — reused by scrollOffsets below,
+	// so "is this element a fragment target?" is answered off ONE list, not two that can drift.
 	try {
-		anchorIds = Array.from(document.querySelectorAll('[id]')).map((e) => e.id).filter(Boolean).slice(0, 300);
+		idEls = Array.from(document.querySelectorAll('[id]')).filter((e) => e.id).slice(0, 300);
+		anchorIds = idEls.map((e) => e.id);
 	} catch (_) { /* ignore */ }
+
+	// Fragment-jump offsets. A same-page `href="#panels"` aligns the target with the TOP of the
+	// scrollport — i.e. UNDERNEATH a sticky/fixed bar, hiding the very heading the reader asked for —
+	// unless the offset is declared somewhere: `scroll-padding-top` on the scroller (the usual right
+	// fix, on `html`, and it covers every target at once) or `scroll-margin-top` on the target itself.
+	// Only the DECLARATIONS live here; the bar's geometry is already in the snapshot, so the rule can
+	// pair them without us deciding anything about bars.
+	const scrollOffsets = (() => {
+		const out = { padTop: 0 };
+		try {
+			// Which ids does this page actually jump to? `a.host`/`a.pathname`/`a.hash` are the RESOLVED
+			// URL, so a relative `#panels` and an absolute `/docs#panels` written on /docs both compare
+			// as same-document, while a link to another page's anchor correctly doesn't count.
+			const targeted = new Set();
+			for (const a of document.querySelectorAll('a[href]')) {
+				if (a.host !== location.host || a.pathname !== location.pathname) continue;
+				let frag = (a.hash || '').slice(1);
+				if (!frag) continue;
+				try { frag = decodeURIComponent(frag); } catch (_) { /* malformed escape — match raw */ }
+				targeted.add(frag);
+				if (targeted.size >= 300) break;
+			}
+			const targets = idEls.filter((e) => targeted.has(e.id)).slice(0, 60);
+			// The scrollport that actually moves. Normally the document; in an app shell whose body
+			// doesn't scroll it's an inner overflow container, and that's where the padding has to sit
+			// for the jump to clear the bar — reading `html` there would report a fix that does nothing.
+			let scroller = document.scrollingElement || document.documentElement;
+			if (targets.length && scroller.scrollHeight <= scroller.clientHeight + 1) {
+				for (let p = targets[0].parentElement; p && p !== document.body; p = p.parentElement) {
+					const oy = getComputedStyle(p).overflowY;
+					if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight + 1) { scroller = p; break; }
+				}
+			}
+			// `scroll-padding-top` is NOT one of the properties CSSOM resolves to used pixels, so a
+			// percentage arrives as "10%" (of the scrollport's height) and an unset one as "auto" —
+			// which behaves as 0 for this purpose. Resolve both here so the server only ever sees px.
+			const raw = (getComputedStyle(scroller).scrollPaddingTop || 'auto').trim();
+			// `px`, not `n` — the element loop below declares a function-scope `let n`, and a name that
+			// resolved to it from in here would be a temporal-dead-zone ReferenceError at capture time.
+			const px = parseFloat(raw) || 0; // "auto" → NaN → 0
+			out.padTop = Math.round(raw.endsWith('%') ? (px * (scroller.clientHeight || vh)) / 100 : px);
+			// Per-target `scroll-margin-top` — the other place the offset can be declared, and the one
+			// that has to be repeated on every target. Percentages aren't valid on scroll-margin, so
+			// the computed value is already px.
+			if (targets.length) {
+				const t = {};
+				for (const el of targets) t[el.id] = Math.round(parseFloat(getComputedStyle(el).scrollMarginTop) || 0);
+				out.targets = t;
+			}
+		} catch (_) { /* unsupported prop — report nothing declared */ }
+		return out;
+	})();
 
 	const INTERACTIVE = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY']);
 	const MEDIA = new Set(['IMG', 'VIDEO', 'SVG', 'CANVAS']);
@@ -2658,6 +2713,7 @@ function collectSnapshot() {
 		sections,
 		junkBuckets,
 		anchorIds,
+		scrollOffsets,
 		asides: asides.slice(0, 1500),
 		codeText: codeText.slice(0, 2500),
 		spinnerCount: document.querySelectorAll('.animate-spin').length,

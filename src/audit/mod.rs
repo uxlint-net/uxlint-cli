@@ -1193,6 +1193,39 @@ mod collector_tests {
             "element-text cap {cap} is too small — hero copy gets truncated (the 120 bug)"
         );
     }
+
+    /// `scrollOffsets.targets` and `anchorIds` must come from ONE `[id]` enumeration. A second
+    /// `querySelectorAll('[id]')` is how they'd silently drift — differently capped or filtered — and
+    /// then "is this element a fragment target?" would have two answers, one per consumer.
+    #[test]
+    fn fragment_targets_and_anchor_ids_share_one_id_list() {
+        let js = crate::redact::collector_js();
+        assert_eq!(
+            js.matches("querySelectorAll('[id]')").count(),
+            1,
+            "the page's ids must be enumerated exactly once (`idEls`); a second scan can diverge"
+        );
+        assert!(
+            js.contains("anchorIds = idEls.map(") && js.contains("idEls.filter("),
+            "anchorIds and the scroll-offset targets must both be derived from `idEls`"
+        );
+    }
+
+    /// `scroll-padding-top` is not resolved to used pixels by CSSOM: `getComputedStyle` hands back
+    /// the computed value, so a percentage arrives as "10%" and an undeclared one as "auto". Both
+    /// must become px here — a bare `parseFloat` would report 10 for a 76px offset, NaN for auto.
+    #[test]
+    fn scroll_padding_top_is_reported_in_pixels() {
+        let js = crate::redact::collector_js();
+        assert!(
+            js.contains("scrollPaddingTop"),
+            "the scroll container's scroll-padding-top is the primary offset declaration"
+        );
+        assert!(
+            js.contains("raw.endsWith('%')"),
+            "a percentage scroll-padding-top must be resolved against the scrollport, not sent raw"
+        );
+    }
 }
 
 #[cfg(test)]
