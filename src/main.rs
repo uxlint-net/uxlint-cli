@@ -69,8 +69,16 @@ pub(crate) struct Cli {
 enum AuthCmd {
     /// Log in via the browser — mints a token and saves it to ~/.config/uxlint/credentials
     Login {
-        /// The web app to open (defaults to UXLINT_WEB_URL)
-        #[arg(long, env = "UXLINT_WEB_URL", default_value = "http://127.0.0.1:49173")]
+        /// The web app to open (override with --web / UXLINT_WEB_URL; local dev runs it at
+        /// http://127.0.0.1:49173)
+        ///
+        /// This defaults to the HOSTED app, not a dev port. It used to default to
+        /// `http://127.0.0.1:49173`, which meant a released binary sent every real user's
+        /// `uxlint auth login` to a localhost port nothing was serving — login simply did not work
+        /// outside this repo. Same class of bug as `--server` defaulting to a domain we don't own:
+        /// a developer's convenience baked in as everyone's default. Working locally? Set
+        /// `UXLINT_WEB_URL=http://127.0.0.1:49173`.
+        #[arg(long, env = "UXLINT_WEB_URL", default_value = "https://uxlint.net")]
         web: String,
     },
     /// Forget the saved token (~/.config/uxlint/credentials)
