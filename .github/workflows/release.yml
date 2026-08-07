@@ -17,10 +17,21 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Backfill/repair path: publish the CONTAINER IMAGE for a tag that already has a GitHub Release,
+  # without re-running the build matrix. The image job repackages published tarballs rather than
+  # recompiling, so this costs one small ubuntu job instead of four (two of them macOS, which bills
+  # at 10x). Use it when the image push failed on its own, or to backfill a pre-image release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish the container image for (e.g. v0.1.16)"
+        required: true
 permissions:
   contents: write
+  packages: write
 jobs:
   build:
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
@@ -90,6 +101,7 @@ jobs:
   # One job, after every target has built, so a partial matrix failure never publishes a release
   # with some targets missing.
   publish:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -110,3 +122,87 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dl/*.tar.gz dl/*.tar.gz.sha256 dl/cli-reference.json \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --draft
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  # ── CONTAINER IMAGE ──────────────────────────────────────────────────────────────────────────────
+  # The `uxlint` binary, published as a container image so CONSUMERS CAN COPY IT INSTEAD OF
+  # DOWNLOADING IT. uxlint's own audit-worker image used to `curl` the release tarball at Docker build
+  # time; that put a website in the build path, and on 2026-08-07 it bit us — the worker's build ran
+  # the download four minutes before the v0.1.16 assets finished uploading, 404'd, and failed the
+  # deploy. A registry tag cannot be observed half-written: it resolves only once the push completes,
+  # so that race is not merely unlikely here, it is unrepresentable. The registry also verifies the
+  # layer digest itself, which retires the hand-rolled sha256 comparison on the consumer side.
+  #
+  # It REPACKAGES the published tarballs rather than recompiling — the bytes we ship in the image are
+  # byte-identical to the ones behind `install.sh`, and the job costs a minute on ubuntu rather than a
+  # second pass over the build matrix.
+  image:
+    # `always()` so the dispatch path (where build/publish are skipped) still runs; the explicit
+    # result check keeps the tag-push path strictly gated on a successful publish.
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success')
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      # Straight from the release, so the image can only ever contain bytes that were actually
+      # published. Verifies each tarball against its own .sha256 sidecar before it goes in.
+      - name: Fetch published binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p ctx && cd ctx
+          gh release download "${{ steps.tag.outputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'uxlint-linux-*' --dir .
+          sha256sum -c uxlint-linux-x64.tar.gz.sha256
+          sha256sum -c uxlint-linux-arm64.tar.gz.sha256
+          # TARGETARCH vocabulary (amd64/arm64), which is what the image Dockerfile selects on.
+          tar xzf uxlint-linux-x64.tar.gz   && mv uxlint uxlint-amd64
+          tar xzf uxlint-linux-arm64.tar.gz && mv uxlint uxlint-arm64
+          chmod +x uxlint-amd64 uxlint-arm64
+      # FROM scratch: this image is a file-delivery vehicle for `COPY --from`, never a thing to run.
+      # No base means nothing to patch and no CVE surface inherited by every consumer.
+      - name: Write image Dockerfile
+        run: |
+          cat > ctx/Dockerfile <<'EOF'
+          FROM scratch
+          ARG TARGETARCH
+          COPY uxlint-${TARGETARCH} /usr/local/bin/uxlint
+          EOF
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Both arches the audit worker can be built on. Lowercase the repo name: GHCR rejects uppercase
+      # path segments, and `github.repository` preserves the owner's casing.
+      - name: Build and push
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          docker buildx build ctx \
+            --platform linux/amd64,linux/arm64 \
+            --tag "$image:${{ steps.tag.outputs.tag }}" \
+            --push
+      # Prove the published image is actually consumable the way the audit worker consumes it,
+      # on the machine that just pushed it — a push that succeeds but yields an unusable image
+      # (wrong path, wrong arch, non-executable) would otherwise surface as a broken deploy.
+      - name: Verify it is consumable
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          # libssl3 because the CLI's reqwest links native-tls (OpenSSL) on linux — bookworm-slim has
+          # no libssl.so.3, so a bare base makes `uxlint --version` exit 127 and looks like a broken
+          # image rather than a missing runtime dep. The audit-worker's runtime gets it transitively
+          # via chromium, but this check states the dependency instead of relying on that.
+          {
+            echo "FROM $image:${{ steps.tag.outputs.tag }} AS cli"
+            echo "FROM debian:bookworm-slim"
+            echo "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3"
+            echo "COPY --from=cli /usr/local/bin/uxlint /usr/local/bin/uxlint"
+            echo "RUN /usr/local/bin/uxlint --version"
+          } > verify.Dockerfile
+          docker buildx build --platform linux/amd64 --file verify.Dockerfile --progress plain .
