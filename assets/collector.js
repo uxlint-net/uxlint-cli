@@ -11,7 +11,9 @@
 // notable data-bearing fields:
 //   • docTitle / prose / sections / asides / codeText — visible page text (redacted, length-capped).
 //   • elements[] — per-element role/label/rect/colours/text (each text field redacted + capped).
-//   • tokens / palette / css / framework / widgetLib — design tokens and computed styles.
+//   • tokens — the COLOUR custom properties your site declares on its root element, name + value
+//     (`--brand-600: rgb(208, 30, 26)`). Colour-valued only: no spacing/font/content tokens.
+//   • palette / css / framework / widgetLib — computed styles and the stack we detected.
 //   • links, nav, breadcrumbs, headings, form-field labels — structure for the IA/nav lints.
 //   • metaDescription / ogTags / iconLink — page <meta>, for SEO/preview lints.
 //   • iframes[] — each embedded frame's box + visibility + the src's HOST (never the full URL: an
@@ -23,20 +25,6 @@
 function collectSnapshot() {
 	const vw = window.innerWidth;
 	const vh = window.innerHeight;
-
-	// Design tokens straight from :root, so the palette check tracks the real theme.
-	const rootCs = getComputedStyle(document.documentElement);
-	const tokenNames = [
-		'--color-surface', '--color-surface-2', '--color-surface-3', '--color-line',
-		'--color-fg', '--color-muted', '--color-brand', '--color-brand-strong',
-		'--color-brand-soft', '--color-success', '--color-warn', '--color-danger',
-		'--color-brand-fg', '--color-success-fg', '--color-warn-fg', '--color-danger-fg'
-	];
-	const tokens = {};
-	for (const n of tokenNames) {
-		const v = rootCs.getPropertyValue(n).trim();
-		if (v) tokens[n] = v;
-	}
 
 	// Canvas normalizes any CSS colour (oklab/oklch/hsl/named/hex — Tailwind v4 uses oklab for
 	// /opacity) back to rgb(a) so we can read it uniformly.
@@ -106,6 +94,90 @@ function collectSnapshot() {
 		const p = m[1].split(/[\s,/]+/).filter(Boolean).map((x) => parseFloat(x));
 		return { r: p[0], g: p[1], b: p[2], a: p[3] === undefined ? 1 : p[3] };
 	}
+
+	// A custom property's value AS A COLOUR, or null when it isn't one — the type filter for
+	// `tokens` below. Canvas KEEPS ITS PREVIOUS fillStyle when handed something that isn't a
+	// colour, so `--spacing: 4px` would read back as whatever we primed it with (i.e. every
+	// non-colour token would land in the map as black). Prime with two different sentinels and
+	// only trust a value that reads back identically from both.
+	function colorToken(v) {
+		v = (v || '').trim();
+		if (!v || v.length > 64 || /[;{}]/.test(v)) return null;
+		let c = null;
+		if (/^okl(ab|ch)\(/i.test(v)) c = parseColor(v); // canvas won't normalize these
+		else if (cctx) {
+			try {
+				cctx.fillStyle = '#000'; cctx.fillStyle = v; const dark = cctx.fillStyle;
+				cctx.fillStyle = '#fff'; cctx.fillStyle = v; const light = cctx.fillStyle;
+				if (dark === light) c = parseColor(dark);
+			} catch (_) { return null; }
+		} else if (/^(#|rgba?\(|hsla?\()/i.test(v)) c = parseColor(v);
+		if (!c || !Number.isFinite(c.r) || !Number.isFinite(c.g) || !Number.isFinite(c.b)) return null;
+		const rgb = [c.r, c.g, c.b].map((x) => Math.max(0, Math.min(255, Math.round(x))));
+		// Emit rgb()/rgba(), never the source text: the server's colour parser reads hex and rgb
+		// only, so a raw `oklch(...)` — what Tailwind v4 emits — would arrive unreadable and the
+		// declared-brand path would stay dead for a different reason than the one we're fixing.
+		const a = Math.round((Number.isFinite(c.a) ? c.a : 1) * 100) / 100;
+		return a >= 1 ? `rgb(${rgb.join(', ')})` : `rgba(${rgb.join(', ')}, ${a})`;
+	}
+
+	// Design tokens: the COLOUR custom properties this site declares on its root element, resolved
+	// for the theme that is actually rendering. This used to read a FIXED list of uxlint's OWN token
+	// names (`--color-brand`, `--color-surface`, …), so it was `{}` on every site with a different
+	// vocabulary — which is every site but ours — and `accent_hue`'s declared-brand path never ran.
+	// We capture WHAT THE PAGE DECLARES and let the rules decide which name means "brand": that
+	// decision is then a `cargo test` away from being tuned, where a list in here is a CLI release
+	// away, every time. Colour-valued only — the non-colour half of a token set (spacing, easing,
+	// font stacks) has no consumer today and would be ~4x the bytes; widening it is one line here
+	// when a lint needs it.
+	const TOKEN_MAX = 128;
+	const tokens = (() => {
+		const out = {};
+		try {
+			const root = document.documentElement;
+			const rootCs = getComputedStyle(root);
+			const names = new Set();
+			// Computed style enumerates custom properties in current Chromium, and on its own that IS
+			// the whole vocabulary: it reports what APPLIES to the root right now, so a token declared
+			// on `html.dark` / `[data-theme="x"]` is already here, carrying the value the rendering
+			// theme resolved to. Verified both ways against real captures: deleting the fallback below
+			// changes nothing on this engine, and disabling THIS reproduces the same map through it.
+			try { for (const p of rootCs) if (p.startsWith('--')) names.add(p); } catch (_) { /* ignore */ }
+			try { for (const p of root.style) if (p.startsWith('--')) names.add(p); } catch (_) { /* ignore */ }
+			if (!names.size) {
+				// Only for an engine that DOESN'T enumerate them — we drive whatever Chrome the
+				// machine already has, not a pinned build, and computed style exposed no custom
+				// properties before Chrome 118. Names come from any rule THE ROOT ITSELF matches;
+				// `matches` answers that exactly, where a selector regex mis-reads `:where(:root)` and
+				// friends. Values still come from computed style, so a component-scoped token
+				// resolves to '' and drops out regardless.
+				let seen = 0;
+				const walk = (rules, depth) => {
+					for (const r of rules) {
+						if (seen > 4000 || names.size > 400) return;
+						if (r.cssRules && r.cssRules.length && depth < 6) walk(r.cssRules, depth + 1);
+						if (!r.style || !r.selectorText) continue;
+						seen++;
+						const own = [];
+						for (const p of r.style) if (p.startsWith('--')) own.push(p);
+						if (!own.length) continue;
+						try { if (!root.matches(r.selectorText)) continue; } catch (_) { continue; }
+						for (const p of own) names.add(p);
+					}
+				};
+				for (const sheet of document.styleSheets) {
+					try { walk(sheet.cssRules, 0); } catch (_) { /* cross-origin sheet */ }
+				}
+			}
+			let kept = 0;
+			for (const n of names) {
+				if (kept >= TOKEN_MAX) break;
+				const c = colorToken(rootCs.getPropertyValue(n));
+				if (c) { out[n.slice(0, 48)] = c; kept++; }
+			}
+		} catch (_) { /* a site's token vocabulary must never cost us the whole capture */ }
+		return out;
+	})();
 
 	// HSL-ish hue + saturation from an {r,g,b} (0-255). Used to decide whether a fill/stroke is a
 	// meaningful CATEGORY colour (a saturated, non-neutral hue) vs. structural ink (grey/near-white).
@@ -1196,8 +1268,14 @@ function collectSnapshot() {
 		const inBreadcrumb = !!(el.closest && el.closest(
 			'nav[aria-label*="breadcrumb" i], [class*="breadcrumb" i], [aria-label*="breadcrumb" i]'
 		)) || !!(el.closest && (() => { const n = el.closest('nav'); return n && n.querySelector('[aria-current="page"]'); })());
-		const cls = el.getAttribute('class') || '';
-		const isPrimary = interactive && /\bbg-brand\b/.test(cls);
+		// NOTE: there is deliberately no `isPrimary` here. It used to be `interactive &&
+		// /\bbg-brand\b/` — a test for uxlint's OWN Tailwind class, so it was false on every element
+		// of every other site, and four lints spent their lives reasoning about a constant. "Primary
+		// action" is a comparison against the PAGE's accent hue, which is an aggregate this per-
+		// element loop doesn't have; the server does (`accent_hue`), and every input it needs already
+		// rides — `interactive`, `bgA`, `bgRgb` (emitted below whenever the fill is ≥50% opaque, the
+		// same gate the derivation uses) and `palette`. So the verdict belongs there, with its
+		// chroma/hue thresholds unit-testable, not here behind a CLI release.
 
 		// Nearest already-collected ancestor.
 		let parentIdx = -1;
@@ -1352,7 +1430,6 @@ function collectSnapshot() {
 			ariaPressed: el.getAttribute('aria-pressed'),
 			ariaSelected: el.getAttribute('aria-selected'),
 			hasRing: cs.boxShadow !== 'none',
-			isPrimary,
 			// Accessible-name computation walks DESCENDANTS: a wrapper link whose text
 			// lives in child spans (a card) is NOT icon-only. Own text wins (truer to
 			// the visible label); the subtree is the fallback, like AT computes it.
