@@ -27,6 +27,9 @@ mod progress;
 mod project;
 mod reaper;
 mod redact;
+/// Test-only guard: no shipped default may point at a developer's machine or a domain we don't own.
+#[cfg(test)]
+mod shipped_defaults;
 mod site;
 mod source_map;
 mod style;
@@ -139,8 +142,10 @@ enum Cmd {
         /// prompt when given; required for a fully non-interactive `--offline` run to store a base.
         #[arg(long)]
         url: Option<String>,
-        /// Web app to open for sign-in
-        #[arg(long, env = "UXLINT_WEB_URL", default_value = "http://127.0.0.1:49173")]
+        /// Web app to open for sign-in. Defaults to the HOSTED app for the same reason `auth login
+        /// --web` does — a dev port baked in as everyone's default makes `uxlint init` unable to
+        /// sign anyone in outside this repo. Working locally? Set `UXLINT_WEB_URL`.
+        #[arg(long, env = "UXLINT_WEB_URL", default_value = "https://uxlint.net")]
         web: String,
         /// Write uxlint.toml from --org/--site without contacting the server or prompting (CI)
         #[arg(long)]
