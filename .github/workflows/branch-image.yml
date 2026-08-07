@@ -1,4 +1,4 @@
-# Bleeding-edge container image for uxlint's DEV environment.
+# Moving container-image tags that track a BRANCH — `:dev` and `:main`.
 #
 # The audit worker obtains the CLI by copying it out of a published image (see release.yml's `image`
 # job and audit-worker/Dockerfile in the uxlint monorepo). That is a deliberate improvement over
@@ -6,9 +6,15 @@
 # left dev with no way to run UNRELEASED collector changes, which is the whole point of dev: exercise
 # a capture fix against dev.uxlint.net before it's tagged.
 #
-# So this branch gets its own moving tag. Push to `dev` here, and `ghcr.io/uxlint-net/uxlint-cli:dev`
-# is rebuilt from source; the dev worker pins UXLINT_CLI_REF=dev and picks it up on its next deploy.
-# The flow mirrors the monorepo's: work on `dev`, promote to `main`, tag a release.
+# So each branch gets a moving tag named after it: push `dev` and `ghcr.io/uxlint-net/uxlint-cli:dev`
+# is rebuilt from source, push `main` and `:main` is. The dev worker pins UXLINT_CLI_REF=dev and picks
+# it up on the next deploy. The flow mirrors the monorepo's: work on `dev`, promote to `main`, tag a
+# release.
+#
+# `:main` exists for a second reason: the audit worker's UXLINT_CLI_REF used to accept a BRANCH name
+# (the image cloned and built it), so an environment configured with `main` predates the switch to
+# copying from a registry. Publishing the tag keeps that configuration working instead of failing the
+# build with "manifest unknown" — which is exactly how the prod worker broke on 2026-08-07.
 #
 # This REPLACES the old arrangement, where the worker image cloned the branch and ran `cargo build`
 # inside the Docker build. Same bleeding edge, but compiled once here instead of on every Railway
@@ -16,11 +22,11 @@
 #
 # Actions is free on standard runners for public repositories, and this repo is public, so the
 # per-push cost here is time, not credits.
-name: dev-image
+name: branch-image
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, main]
   # Manual rebuild — e.g. to repair a failed push without an empty commit.
   workflow_dispatch:
 
@@ -31,7 +37,7 @@ permissions:
 # A newer push to `dev` supersedes this one: the tag is a moving pointer, so finishing an older build
 # would race to publish a STALER image than the one already queued behind it.
 concurrency:
-  group: dev-image
+  group: branch-image-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,12 +63,12 @@ jobs:
       # difference between a ~1min incremental rebuild and a cold ~5min one on every capture tweak.
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
-          key: dev-image-${{ matrix.target }}
+          key: branch-image-${{ matrix.target }}
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: dev-${{ matrix.platform }}
+          name: branch-${{ matrix.platform }}
           path: target/${{ matrix.target }}/release/uxlint
           if-no-files-found: error
 
@@ -72,7 +78,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: dev-*
+          pattern: branch-*
           path: dl
       # download-artifact lands each one under its own directory; the image Dockerfile selects by
       # TARGETARCH, so flatten to `uxlint-<arch>` first. Executable bit does not survive the
@@ -81,8 +87,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ctx
-          mv dl/dev-amd64/uxlint ctx/uxlint-amd64
-          mv dl/dev-arm64/uxlint ctx/uxlint-arm64
+          mv dl/branch-amd64/uxlint ctx/uxlint-amd64
+          mv dl/branch-arm64/uxlint ctx/uxlint-arm64
           chmod +x ctx/uxlint-amd64 ctx/uxlint-arm64
           # Identical to release.yml's image: FROM scratch, nothing but the binary — no base to
           # patch, no CVE surface inherited by anything that copies out of it.
@@ -102,7 +108,8 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          docker buildx build ctx --platform linux/amd64,linux/arm64 --tag "$image:dev" --push
+          docker buildx build ctx --platform linux/amd64,linux/arm64 \
+            --tag "$image:${GITHUB_REF_NAME}" --push
       # Prove it's consumable the way the audit worker consumes it, on the machine that just pushed
       # it. libssl3 because the CLI links native-tls (OpenSSL) — on a bare base the binary doesn't
       # load at all and exits 127, which reads as a corrupt image rather than a missing runtime dep.
@@ -111,7 +118,7 @@ jobs:
           set -euo pipefail
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           {
-            echo "FROM $image:dev AS cli"
+            echo "FROM $image:${GITHUB_REF_NAME} AS cli"
             echo "FROM debian:bookworm-slim"
             echo "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3"
             echo "COPY --from=cli /usr/local/bin/uxlint /usr/local/bin/uxlint"

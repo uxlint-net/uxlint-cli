@@ -179,13 +179,19 @@ jobs:
           password: ${{ github.token }}
       # Both arches the audit worker can be built on. Lowercase the repo name: GHCR rejects uppercase
       # path segments, and `github.repository` preserves the owner's casing.
+      # `:latest` moves only on a real tag push, never on a dispatch — backfilling the image for an
+      # OLD release must not silently make it the newest. It exists because the audit worker's
+      # UXLINT_CLI_REF accepted `latest` before it copied from a registry, so an environment still
+      # set that way keeps working rather than failing with "manifest unknown".
       - name: Build and push
         run: |
           set -euo pipefail
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tags=(--tag "$image:${{ steps.tag.outputs.tag }}")
+          [ "${{ github.event_name }}" = "push" ] && tags+=(--tag "$image:latest")
           docker buildx build ctx \
             --platform linux/amd64,linux/arm64 \
-            --tag "$image:${{ steps.tag.outputs.tag }}" \
+            "${tags[@]}" \
             --push
       # Prove the published image is actually consumable the way the audit worker consumes it,
       # on the machine that just pushed it — a push that succeeds but yields an unusable image
