@@ -119,8 +119,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # A tag carrying a prerelease suffix (v0.1.17-rc.1) is published AS a prerelease. That is
+          # load-bearing, not cosmetic: `releases/latest` skips prereleases, so `install.sh` (which
+          # resolves releases/latest/download) keeps serving the newest STABLE build, and the image
+          # job's "is this the newest release" check likewise won't move `:latest` onto an rc. dev
+          # pins rc tags by design — they must not become what the world downloads by default.
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" dl/*.tar.gz dl/*.tar.gz.sha256 dl/cli-reference.json \
-            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --draft
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --draft $pre
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
 
   # ── CONTAINER IMAGE ──────────────────────────────────────────────────────────────────────────────
