@@ -468,6 +468,32 @@ pub(crate) fn setup_tab(browser: &Browser, args: &AuditArgs) -> Result<TabSlot> 
             browser_context_id: None,
         });
     }
+    // Turn the Network domain on for EVERY tab, unconditionally.
+    //
+    // This is not bookkeeping — it is what makes the adversity passes real. `Network.
+    // emulateNetworkConditions` (offline, and the latency injection behind --slow-network) is a
+    // Network-domain command, and with the domain disabled Chrome accepts it and does NOTHING: no
+    // error, no warning, just a page that stays online. The probe then navigates on a live
+    // connection and faithfully reports what a HEALTHY page looks like — `offline_has_content:
+    // true`, no offline message — which is precisely the shape of "this app handles offline fine".
+    // So `offline-unhandled` could not fire on any site, and `slow-network-no-feedback` measured a
+    // fast request.
+    //
+    // It used to be enabled only inside the `--header "Cookie: …"` branch below (setCookie needs
+    // it), so the ONE configuration where the offline probe worked was a credentialed audit — which
+    // is how it survived: `just dogfood` passes a session cookie, so our own runs were the only ones
+    // taking the working path. Enabling it here, beside the other tab-wide setup, decouples "we can
+    // emulate the network" from "this audit happens to carry cookies".
+    {
+        use headless_chrome::protocol::cdp::Network;
+        let _ = tab.call_method(Network::Enable {
+            max_total_buffer_size: None,
+            max_resource_buffer_size: None,
+            max_post_data_size: None,
+            enable_durable_messages: None,
+            report_direct_socket_traffic: None,
+        });
+    }
     // Identify honestly: site owners allowlist this UA instead of us playing fingerprint
     // games. Appended to the real UA, not replacing it — no disguise either way.
     if let Ok(r) = tab.evaluate("navigator.userAgent", false) {
@@ -515,14 +541,9 @@ pub(crate) fn setup_tab(browser: &Browser, args: &AuditArgs) -> Result<TabSlot> 
             }
         }
         if !cookie_pairs.is_empty() && !base_domain.is_empty() {
+            // The domain is already on (setup above) — setCookie needs it, and so does every
+            // adversity probe, which is why that enable no longer lives here.
             use headless_chrome::protocol::cdp::Network;
-            let _ = tab.call_method(Network::Enable {
-                max_total_buffer_size: None,
-                max_resource_buffer_size: None,
-                max_post_data_size: None,
-                enable_durable_messages: None,
-                report_direct_socket_traffic: None,
-            });
             for (name, value) in cookie_pairs {
                 let _ = tab.call_method(Network::SetCookie {
                     name,
