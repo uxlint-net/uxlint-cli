@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "mode": "full",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "baseBranchPatterns": ["dev"],
+  "enabledManagers": ["cargo", "github-actions"],
+  "schedule": ["before 6am on monday"],
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 3,
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo (non-major)",
+      "semanticCommits": "disabled"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "semanticCommits": "disabled"
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "schedule": ["at any time"],
+    "labels": ["security"],
+    "dependencyDashboardApproval": false
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  }
+}
