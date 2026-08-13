@@ -110,6 +110,12 @@ pub(crate) fn run_audit_ext(
         crawl_cap,
         run_goals,
     } = resolve_target(cli, args, progress)?;
+    // Tell the server this run is starting, so the web shows it in progress exactly like a hosted
+    // audit. A CLI/MCP audit used to be invisible for its whole duration — you'd kick one off from an
+    // agent, open the dashboard, and see nothing at all until the finished report appeared minutes
+    // later, which is indistinguishable from it never having started. Announce-only: it queues no
+    // work and meters nothing (the report POST meters, as always).
+    let mut local_run = LocalRun::announce(cli, args, site.as_deref());
     // Backfill credentials (hosted-door env vars, then uxlint.toml [credentials]) onto a clone.
     let args = inject_credentials(args, progress);
     let args = &args;
@@ -523,7 +529,14 @@ pub(crate) fn run_audit_ext(
     if let Some(dir) = &args.dry_run {
         return write_dry_run(&payload, std::path::Path::new(dir), progress);
     }
-    send_and_finalize(FinalizeInputs {
+    // Name the progress row this run announced, so the report closes it server-side the moment it
+    // lands (rather than the row waiting out the staleness window). Stamped here rather than threaded
+    // through `AuditRequestInputs`: it isn't part of what was captured, it's who to tell we're done.
+    let mut payload = payload;
+    if let Some(run) = &local_run {
+        payload["job_id"] = json!(run.job_id());
+    }
+    let out = send_and_finalize(FinalizeInputs {
         cli,
         args,
         progress,
@@ -538,7 +551,103 @@ pub(crate) fn run_audit_ext(
         crawl_ms,
         goals_ms,
         t_crawl,
-    })
+    });
+    // A posted report closed the job server-side; anything else leaves the guard to cancel it on the
+    // way out, so a failed audit doesn't leave a spinner running in the user's browser.
+    if out.is_ok() {
+        if let Some(run) = &mut local_run {
+            run.finish();
+        }
+    }
+    out
+}
+
+/// The `audit_jobs` row that makes THIS run visible in the web while it happens (`POST
+/// /v1/audit-jobs/local`). Best-effort throughout: an audit must never fail because its progress
+/// row couldn't be recorded, so every call here swallows its error and the audit carries on
+/// unannounced.
+///
+/// It closes itself. The report POST carries `job_id` and the server marks the job done — that's the
+/// happy path, and `finish()` records it so this guard stays quiet. Anything else (a failed crawl, a
+/// bad target, an unwind on Ctrl-C) drops the guard, which cancels the row: a failed audit clears its
+/// own spinner instead of leaving one for the server's staleness window to reap half an hour later.
+/// A SIGKILL still leaves the row behind, which is exactly what that window is for.
+struct LocalRun<'a> {
+    cli: &'a Cli,
+    job_id: String,
+    finished: bool,
+}
+
+impl<'a> LocalRun<'a> {
+    /// `None` when there is nothing to announce: no API key (nothing to authenticate with), a
+    /// `--dry-run` (which posts nothing at all, by definition), or a HOSTED run — the audit-worker
+    /// sets `UXLINT_JOB_ID`, and that job is already on the dashboard. Announcing there would put the
+    /// same audit in the list twice.
+    fn announce(cli: &'a Cli, args: &AuditArgs, site: Option<&str>) -> Option<Self> {
+        let key = cli.api_key.as_deref().filter(|k| !k.trim().is_empty())?;
+        if args.dry_run.is_some() || std::env::var("UXLINT_JOB_ID").is_ok_and(|v| !v.is_empty()) {
+            return None;
+        }
+        // Short timeout: this is a progress nicety in front of a multi-minute audit — it must never
+        // be the thing that makes one wait.
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let body = json!({ "base_url": args.base, "site": site });
+        let job_id = http
+            .post(format!("{}/v1/audit-jobs/local", cli.server))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.json::<Value>().ok())
+            .and_then(|v| v["job_id"].as_str().map(str::to_string))
+            .filter(|id| !id.is_empty())?;
+        Some(Self {
+            cli,
+            job_id,
+            finished: false,
+        })
+    }
+
+    /// The id to put on the report payload — the server closes the job when that report lands.
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// The report was posted: the server has already closed this job, so Drop must not cancel it.
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for LocalRun<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(key) = self.cli.api_key.as_deref() else {
+            return;
+        };
+        let Ok(http) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        else {
+            return;
+        };
+        // Cancel, not fail: from the server's side an audit that stopped on the user's machine is
+        // indistinguishable from one the user aborted, and `cancel_audit_job` is the endpoint that
+        // already means "this job is over, nobody finished it".
+        let _ = http
+            .post(format!(
+                "{}/v1/audit-jobs/{}/cancel",
+                self.cli.server, self.job_id
+            ))
+            .bearer_auth(key)
+            .send();
+    }
 }
 
 /// Inputs to the POST + finalize phase (some borrowed, some owned — it consumes the payload and the
