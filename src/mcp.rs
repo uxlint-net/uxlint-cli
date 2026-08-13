@@ -297,9 +297,12 @@ fn project_setup_instructions(
          # uxlint.toml — this project's identity on uxlint (check this in).\n\
          {org_line}\n\n\
          # Where this project's reports file, for good: the app's PRODUCTION hostname if it has one,\n\
-         # else <project>.local while it isn't deployed. A host that doesn't exist yet is created on\n\
-         # the first audit, so pick it deliberately — the history hangs off this name.{reuse}\n\
+         # else <project>.local while it isn't deployed. Pick it deliberately — the history hangs off\n\
+         # this name.{reuse}\n\
          site = {suggested:?}\n\n\
+         # CREATE THE SITE FIRST if it isn't one of the existing hosts above — a site is made\n\
+         # deliberately, by its owner, not as a side effect of an audit. ASK THE USER to run:\n\
+         #   uxlint site create {suggested}\n\n\
          # The default audit target (audit_url's `base` still overrides it), and the real top-level\n\
          # routes from the router/pages dir — 3-8 a visitor actually lands on; the crawl follows\n\
          # links from these. `crawl` caps pages per audit (0 = only the routes below).\n\
@@ -324,6 +327,67 @@ fn project_setup_instructions(
          Then call audit_url again: the report files under that site, and every later audit diffs \
          against it.\n"
     )
+}
+
+/// `Some(instructions)` when uxlint.toml names an org/site this account doesn't have — the audit must
+/// NOT run. Left to itself the server would mint the site on the spot (the never-orphan-a-report
+/// rule): the report lands somewhere real, but under a site nobody chose, in whatever org the
+/// fallback picked. A site is a deliberate thing its owner creates, so the agent gets the one CLI
+/// command that creates it instead of a report filed against a name that appeared by accident.
+///
+/// FAIL OPEN on anything less than a clear answer — an unreachable or signed-out `/v1/me` (`None`,
+/// or `authenticated != true`) leaves this quiet and lets the audit and the server's own guardrail
+/// decide. Pure over the payload; `org`/`site` come from the project config.
+fn missing_site_instructions(org: &str, site: &str, me: Option<&Value>) -> Option<String> {
+    let me = me?;
+    if me["authenticated"].as_bool() != Some(true) {
+        return None;
+    }
+    let orgs = me["orgs"].as_array()?;
+    let hosts_of = |o: &Value| -> Vec<String> {
+        o["sites"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s["host"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(found) = orgs.iter().find(|o| {
+        o["name"]
+            .as_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(org))
+    }) else {
+        // The org itself is wrong — creating the site can't help until that's settled, and only the
+        // user knows which of their orgs this project belongs to.
+        let yours: Vec<&str> = orgs.iter().filter_map(|o| o["name"].as_str()).collect();
+        return Some(format!(
+            "ORG NOT FOUND — the audit did NOT run. This project's uxlint.toml files reports under org {org:?}, \
+             which this account isn't a member of. ASK THE USER which of their orgs this project belongs to \
+             ({}) and set `org` in uxlint.toml to it, then call audit_url again.",
+            if yours.is_empty() { "none on this account".to_string() } else { yours.join(", ") }
+        ));
+    };
+    let hosts = hosts_of(found);
+    if hosts.iter().any(|h| h == site) {
+        return None;
+    }
+    let existing = if hosts.is_empty() {
+        format!("Org {org:?} has no sites yet.")
+    } else {
+        format!("Sites org {org:?} already has: {}.", hosts.join(", "))
+    };
+    Some(format!(
+        "SITE NOT SET UP — the audit did NOT run. This project's uxlint.toml files its reports under site \
+         {site:?} in org {org:?}, and that site doesn't exist. Creating one is a deliberate act by its \
+         owner, not a side effect of an audit — otherwise this report would land under a site name nobody \
+         chose and the project's history would start in the wrong place.\n\n\
+         ASK THE USER to create it:\n  uxlint site create {site} --org {org:?}\n\n\
+         {existing} If one of those IS this project, point `site` in uxlint.toml at it instead — that's \
+         the better fix, since a second name for the same app splits its history in two.\n\n\
+         Then call audit_url again."
+    ))
 }
 
 /// Shown when the server REFUSED a key we did send — a revoked token, not a missing one. Distinct
@@ -539,42 +603,50 @@ impl UxlintMcp {
         // public one mints a personal-org site nobody chose. Both are the same missing file, so hand
         // the agent the config to write — with the account's REAL orgs/sites in it — rather than an
         // error whose only advice is an interactive wizard it can't drive.
-        let setup_prefix = if crate::project::project_config().is_none() {
-            // No base at all is the same bind: nothing to name a site after (`run_audit` would fall
-            // back to the toml `base` that doesn't exist either).
-            let blocked = base.trim().is_empty() || crate::project::is_local_target(&base);
-            let existing_file = crate::project::find_project_toml().is_some();
-            let cli = self.cli.clone();
-            let probe_base = base.clone();
-            let text = tokio::task::spawn_blocking(move || {
-                match crate::audit::setup::fetch_me(&cli) {
-                    // A key the server REFUSED is the truer problem: telling the agent to write a
-                    // config would send it to fix the wrong thing, and the next call fails the same way.
-                    Err(_) => Err(credential_rejected(&cli.server)),
-                    Ok(me) => Ok(project_setup_instructions(
-                        &probe_base,
-                        me.as_ref(),
-                        &project_dir_name(),
-                        blocked,
-                        existing_file,
-                    )),
-                }
-            })
+        // A PINNED project has the opposite failure: it names a site, and if that site doesn't exist
+        // the server quietly creates it (no report is ever orphaned) — so a typo, or a name the user
+        // never agreed to, silently becomes where this project's history lives. Both cases need the
+        // same one `/v1/me`, so ask once and let the answer decide.
+        let project = crate::project::project_config();
+        let cli = self.cli.clone();
+        let me = tokio::task::spawn_blocking(move || crate::audit::setup::fetch_me(&cli))
             .await
             .map_err(|e| McpError::internal_error(format!("setup probe panicked: {e}"), None))?;
-            match text {
-                Err(rejected) => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(rejected)]))
+        let me = match me {
+            // A key the server REFUSED is the truer problem: setup advice would send the agent to fix
+            // the wrong thing, and the next call would fail exactly the same way.
+            Err(_) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    credential_rejected(&self.cli.server),
+                )]))
+            }
+            Ok(me) => me,
+        };
+        let setup_prefix = match &project {
+            Some(p) => {
+                if let Some(advice) = missing_site_instructions(&p.org, &p.site, me.as_ref()) {
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(advice)]));
                 }
+                None
+            }
+            None => {
+                // No base at all is the same bind as a local one: nothing to name a site after
+                // (`run_audit` would fall back to the toml `base` that doesn't exist either).
+                let blocked = base.trim().is_empty() || crate::project::is_local_target(&base);
+                let text = project_setup_instructions(
+                    &base,
+                    me.as_ref(),
+                    &project_dir_name(),
+                    blocked,
+                    crate::project::find_project_toml().is_some(),
+                );
                 // Blocked: the audit cannot produce a report, so the instructions ARE the answer.
                 // Otherwise it still runs, and they ride along as a prefix.
-                Ok(t) if blocked => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(t)]))
+                if blocked {
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
                 }
-                Ok(t) => Some(t),
+                Some(text)
             }
-        } else {
-            None
         };
         let args = AuditArgs {
             base,
@@ -1510,6 +1582,72 @@ mod setup_instructions_tests {
         assert!(!unpinned.contains("did NOT run"), "{unpinned}");
         assert!(unpinned.contains("acme.com"), "{unpinned}");
         assert!(unpinned.contains("site = \"acme.com\""), "{unpinned}");
+    }
+}
+
+#[cfg(test)]
+mod missing_site_tests {
+    use super::missing_site_instructions;
+    use serde_json::json;
+
+    fn me(orgs: serde_json::Value) -> serde_json::Value {
+        json!({ "authenticated": true, "orgs": orgs })
+    }
+
+    /// The whole point: a site is created by its owner, deliberately. Left alone the server mints one
+    /// on the spot, so a typo in uxlint.toml becomes where the project's history lives.
+    #[test]
+    fn a_site_the_account_does_not_have_stops_the_audit_and_names_the_command() {
+        let m = me(json!([{ "name": "Personal", "sites": [{ "host": "uxlint.net" }] }]));
+        let t = missing_site_instructions("Personal", "mtg-deck.local", Some(&m)).expect("blocked");
+        assert!(t.contains("did NOT run"), "{t}");
+        assert!(
+            t.contains("uxlint site create mtg-deck.local --org \"Personal\""),
+            "the exact command, ready to run: {t}"
+        );
+        // The sites that DO exist are offered — repointing at one beats minting a second name for
+        // the same app, which splits its history.
+        assert!(t.contains("uxlint.net"), "{t}");
+    }
+
+    #[test]
+    fn a_site_that_exists_is_silent() {
+        let m = me(json!([{ "name": "Personal", "sites": [{ "host": "mtg-deck.local" }] }]));
+        assert!(missing_site_instructions("Personal", "mtg-deck.local", Some(&m)).is_none());
+        // Org names are matched case-insensitively, same as `prevalidate_org` and the server.
+        assert!(missing_site_instructions("personal", "mtg-deck.local", Some(&m)).is_none());
+    }
+
+    #[test]
+    fn an_org_the_account_is_not_in_is_reported_as_the_org_problem_it_is() {
+        let m = me(json!([{ "name": "Personal", "sites": [] }, { "name": "Acme", "sites": [] }]));
+        let t = missing_site_instructions("Ghost", "x.test", Some(&m)).expect("blocked");
+        assert!(t.contains("ORG NOT FOUND"), "{t}");
+        assert!(
+            t.contains("Personal, Acme"),
+            "the real ones are listed: {t}"
+        );
+        // Creating a site can't be the advice when the org itself is wrong.
+        assert!(!t.contains("uxlint site create"), "{t}");
+    }
+
+    /// FAIL OPEN: this gate blocks an audit, so it must only fire on a clear, authenticated "no".
+    /// A server that's down or a signed-out payload leaves the audit (and the server's own
+    /// guardrail) to decide — otherwise a network blip reads as "your site doesn't exist".
+    #[test]
+    fn an_unclear_answer_never_blocks() {
+        assert!(missing_site_instructions("Personal", "a.test", None).is_none());
+        assert!(missing_site_instructions(
+            "Personal",
+            "a.test",
+            Some(&json!({"authenticated": false}))
+        )
+        .is_none());
+        assert!(
+            missing_site_instructions("Personal", "a.test", Some(&json!({"authenticated": true})))
+                .is_none(),
+            "an authenticated payload with no orgs array is still not an answer"
+        );
     }
 }
 
