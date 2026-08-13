@@ -13,7 +13,9 @@ use crate::{AuditArgs, Cli};
 mod probes;
 mod provenance;
 mod request;
-mod setup;
+// `pub(crate)` for `fetch_me`: the MCP server asks /v1/me for the account's real orgs and sites when
+// it has to tell an agent what to put in a missing uxlint.toml (`mcp::project_setup_instructions`).
+pub(crate) mod setup;
 mod test_plan;
 use test_plan::*;
 // `uxlint test list`/`walk` resolve declared tests through this same merge — re-export it.

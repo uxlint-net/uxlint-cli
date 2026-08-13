@@ -198,6 +198,134 @@ fn signup_hint(server: &str) -> String {
     crate::login::credential_help(server, crate::login::CredentialProblem::Missing, true)
 }
 
+/// The project directory's name — the site suggestion for an app that isn't deployed yet
+/// (`myapp.local`), so the agent has a concrete value to put in the file rather than a blank.
+fn project_dir_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "app".to_string())
+}
+
+/// The uxlint.toml an agent should write for a project that has none. `audit_url` returns this
+/// INSTEAD of the audit when there is nothing to file a report under (a localhost base with no
+/// declared site is a hard error deep in `resolve_target`, whose CLI-shaped "run `uxlint init`"
+/// advice an agent can't act on — `init` is an interactive wizard), and ALONGSIDE it when the audit
+/// could still run unpinned. That file is the project's IDENTITY: without it a report is auto-filed
+/// under a personal-org site named after whatever host was audited, so nothing accumulates — no
+/// history, no cross-audit delta — and none of the project's checked-in routes/excludes/personas/
+/// tests apply.
+///
+/// Values the account can settle (which orgs exist, which sites they already have) come from
+/// `/v1/me` so the agent writes a config that VALIDATES instead of guessing an org name and being
+/// bounced by `prevalidate_org` on the next call. Pure over that payload, so the wording is testable
+/// without a server.
+fn project_setup_instructions(
+    base: &str,
+    me: Option<&Value>,
+    dir: &str,
+    blocked: bool,
+    existing_file: bool,
+) -> String {
+    let orgs_json = me.and_then(|m| m["orgs"].as_array());
+    let orgs: Vec<&str> = orgs_json
+        .map(|a| a.iter().filter_map(|o| o["name"].as_str()).collect())
+        .unwrap_or_default();
+    let hosts: Vec<&str> = orgs_json
+        .map(|a| {
+            a.iter()
+                .flat_map(|o| o["sites"].as_array().map(|s| s.as_slice()).unwrap_or(&[]))
+                .filter_map(|s| s["host"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Name the real orgs rather than a placeholder: an org this account isn't a member of fails the
+    // NEXT audit before the crawl, which reads as the tool being broken twice.
+    let org_line = match orgs.as_slice() {
+        [only] => format!("org = {only:?}   # the only org on this account"),
+        [] => "org = \"…\"   # ASK THE USER which org owns this project".to_string(),
+        many => format!(
+            "org = {:?}   # ASK THE USER which of these it belongs to: {}",
+            many[0],
+            many.join(", ")
+        ),
+    };
+    // A public base already names the site; a local one can't, which is exactly why the audit
+    // couldn't run — suggest a stable `<project>.local` and say what the name is FOR.
+    let local = crate::project::is_local_target(base);
+    let host = crate::project::base_host(base);
+    let suggested = if !local && !host.is_empty() {
+        host.clone()
+    } else {
+        format!("{dir}.local")
+    };
+    let reuse = if hosts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n# This account already has: {} — reuse one of those if this project is it.",
+            hosts.join(", ")
+        )
+    };
+
+    let head = if blocked {
+        let why = if existing_file {
+            "this project's uxlint.toml declares no `org`/`site`"
+        } else {
+            "this project has no uxlint.toml"
+        };
+        format!(
+            "SETUP REQUIRED — the audit did NOT run: {why}, and a local target ({base}) has no public \
+             hostname to file a report under. The site name is the one thing that has to be checked in.\n\n"
+        )
+    } else {
+        format!(
+            "NO uxlint.toml — this project isn't pinned to a uxlint site, so the report below was \
+             auto-filed under a personal-org site for {host} and none of the project's own defaults \
+             (routes, excludes, sign-in personas, tests) applied. Pin it so audits accumulate and \
+             each one diffs against the last.\n\n"
+        )
+    };
+
+    format!(
+        "{head}\
+         CREATE uxlint.toml in the repo root and check it in. Read the codebase for what you can \
+         know (the router for `routes`, the deploy config/README for the hostname) and ASK THE USER \
+         for the rest — don't invent a value you could look up. Replace every `…`:\n\n\
+         # uxlint.toml — this project's identity on uxlint (check this in).\n\
+         {org_line}\n\n\
+         # Where this project's reports file, for good: the app's PRODUCTION hostname if it has one,\n\
+         # else <project>.local while it isn't deployed. A host that doesn't exist yet is created on\n\
+         # the first audit, so pick it deliberately — the history hangs off this name.{reuse}\n\
+         site = {suggested:?}\n\n\
+         # The default audit target (audit_url's `base` still overrides it), and the real top-level\n\
+         # routes from the router/pages dir — 3-8 a visitor actually lands on; the crawl follows\n\
+         # links from these. `crawl` caps pages per audit (0 = only the routes below).\n\
+         base = {base:?}\n\
+         routes = [\"/\"]   # …and the rest\n\
+         crawl = 12\n\n\
+         Optional — add one only when it applies, never as a guess:\n  \
+         site_type = \"saas\"          # saas | marketing | ecommerce | content | portfolio | aggregator\n  \
+         styleguide = \"/styleguide\"  # the design-system page, if this project has one\n  \
+         exclude = [\"/admin/*\"]      # routes the audit must never open (demos, fixtures, destructive tools)\n  \
+         desktop_only = [\"/editor/*\"] # desktop-primary surfaces, so mobile findings there stay info-level\n\n\
+         If the app is behind a login, add a persona — the local client replays it, so no secret \
+         reaches this tool or the transcript. Ask the user for the credential; a real secret goes in \
+         a gitignored .env as ${{VAR}}, only a throwaway dev login is ever inlined:\n\n  \
+         login_url       = \"/login\"\n  \
+         default_persona = \"user\"\n  \
+         [personas.user]\n  \
+         username = \"dev@example.com\"\n  \
+         password = \"${{DEV_PW}}\"\n\n\
+         `feedback = true` opts this project into sharing anonymized signals about which lints helped \
+         (never your app's content). It is OFF by default — ask the user before setting it.\n\n\
+         Then call audit_url again: the report files under that site, and every later audit diffs \
+         against it.\n"
+    )
+}
+
 /// Shown when the server REFUSED a key we did send — a revoked token, not a missing one. Distinct
 /// wording matters here: an agent told "uxlint isn't signed in yet" will walk the user through
 /// first-run setup they already did, when what actually happened is that their credential was
@@ -392,7 +520,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) For EACH finding you act on, call lint_feedback with a verdict — beneficial, false_positive, or harmful — so uxlint learns which rules to keep, tune, or retire. Iterate until green.\n\nSAFETY: with no test plan declared, audit_url only NAVIGATES and READS. If the project's uxlint.toml declares tests that sign in as a persona, running them may SUBMIT forms and DELETE items on the target — that's what a test does (it exercises create/delete flows on your own app). Point it only at an app you own / a throwaway env, never a site you don't control.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
+        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) For EACH finding you act on, call lint_feedback with a verdict — beneficial, false_positive, or harmful — so uxlint learns which rules to keep, tune, or retire. Iterate until green.\n\nSAFETY: with no test plan declared, audit_url only NAVIGATES and READS. If the project's uxlint.toml declares tests that sign in as a persona, running them may SUBMIT forms and DELETE items on the target — that's what a test does (it exercises create/delete flows on your own app). Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
     )]
     async fn audit_url(
         &self,
@@ -405,8 +533,51 @@ impl UxlintMcp {
                 signup_hint(&self.cli.server),
             )]));
         }
+        let base = resolve_base(a.base, self.default_base.as_deref());
+        // An unpinned project is the fresh-install failure: with no `org`/`site` checked in, a local
+        // base has no site to file under (a hard error the agent reads as "the tool is broken") and a
+        // public one mints a personal-org site nobody chose. Both are the same missing file, so hand
+        // the agent the config to write — with the account's REAL orgs/sites in it — rather than an
+        // error whose only advice is an interactive wizard it can't drive.
+        let setup_prefix = if crate::project::project_config().is_none() {
+            // No base at all is the same bind: nothing to name a site after (`run_audit` would fall
+            // back to the toml `base` that doesn't exist either).
+            let blocked = base.trim().is_empty() || crate::project::is_local_target(&base);
+            let existing_file = crate::project::find_project_toml().is_some();
+            let cli = self.cli.clone();
+            let probe_base = base.clone();
+            let text = tokio::task::spawn_blocking(move || {
+                match crate::audit::setup::fetch_me(&cli) {
+                    // A key the server REFUSED is the truer problem: telling the agent to write a
+                    // config would send it to fix the wrong thing, and the next call fails the same way.
+                    Err(_) => Err(credential_rejected(&cli.server)),
+                    Ok(me) => Ok(project_setup_instructions(
+                        &probe_base,
+                        me.as_ref(),
+                        &project_dir_name(),
+                        blocked,
+                        existing_file,
+                    )),
+                }
+            })
+            .await
+            .map_err(|e| McpError::internal_error(format!("setup probe panicked: {e}"), None))?;
+            match text {
+                Err(rejected) => {
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(rejected)]))
+                }
+                // Blocked: the audit cannot produce a report, so the instructions ARE the answer.
+                // Otherwise it still runs, and they ride along as a prefix.
+                Ok(t) if blocked => {
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(t)]))
+                }
+                Ok(t) => Some(t),
+            }
+        } else {
+            None
+        };
         let args = AuditArgs {
-            base: resolve_base(a.base, self.default_base.as_deref()),
+            base,
             routes: a.routes.unwrap_or_else(|| "/".to_string()),
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call —
@@ -751,6 +922,12 @@ impl UxlintMcp {
                 t
             }
             Err(e) => format!("audit failed: {e}"),
+        };
+        // Lead with the setup ask when the project is unpinned (`None` when it isn't): the agent
+        // should read "check this file in" before it starts fixing findings nothing will track.
+        let text = match setup_prefix {
+            Some(p) => format!("{p}{text}"),
+            None => text,
         };
         if structured.is_null() {
             Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
@@ -1241,6 +1418,98 @@ mod verdict_reason_tests {
         }
         // "it was right" carries its own signal — never gate the positive path.
         assert!(missing_verdict_reason(&LintVerdict::Beneficial, "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod setup_instructions_tests {
+    use super::project_setup_instructions;
+    use serde_json::json;
+
+    fn me(orgs: serde_json::Value) -> serde_json::Value {
+        json!({ "authenticated": true, "orgs": orgs })
+    }
+
+    /// Every flavour must carry a WRITEABLE file: the four keys that make a project auditable, plus
+    /// the base it was called with. A block that merely says "configure uxlint" is the error we
+    /// already had.
+    #[test]
+    fn the_block_is_a_config_the_agent_can_write_not_an_instruction_to_configure() {
+        for blocked in [true, false] {
+            let t =
+                project_setup_instructions("http://localhost:5173", None, "myapp", blocked, false);
+            for key in ["org = ", "site = ", "base = ", "routes = ", "uxlint.toml"] {
+                assert!(t.contains(key), "{key} missing from:\n{t}");
+            }
+            assert!(t.contains("\"http://localhost:5173\""), "{t}");
+            // An app with no hostname yet still gets a concrete name, from the project directory.
+            assert!(t.contains("\"myapp.local\""), "{t}");
+        }
+    }
+
+    /// Guessing an org name gets the NEXT audit bounced by `prevalidate_org` before the crawl, so
+    /// the block names the account's real ones — and asks when the choice isn't ours to make.
+    #[test]
+    fn orgs_come_from_the_account_and_a_choice_is_handed_to_the_user() {
+        let one = project_setup_instructions(
+            "http://localhost:3000",
+            Some(&me(json!([{ "name": "Personal" }]))),
+            "app",
+            true,
+            false,
+        );
+        assert!(one.contains("org = \"Personal\""), "{one}");
+        assert!(!one.contains("ASK THE USER which"), "{one}");
+
+        let many = project_setup_instructions(
+            "http://localhost:3000",
+            Some(&me(json!([{ "name": "Personal" }, { "name": "Acme" }]))),
+            "app",
+            true,
+            false,
+        );
+        assert!(many.contains("ASK THE USER which"), "{many}");
+        assert!(many.contains("Personal, Acme"), "{many}");
+
+        // No /v1/me (server down, signed out) — still a template, with the org left to ask about.
+        let none = project_setup_instructions("http://localhost:3000", None, "app", true, false);
+        assert!(none.contains("ASK THE USER which org"), "{none}");
+    }
+
+    /// Minting a stray site is the thing this whole block exists to prevent — offer the ones the
+    /// account already has before suggesting a new name.
+    #[test]
+    fn existing_sites_are_offered_for_reuse() {
+        let t = project_setup_instructions(
+            "http://localhost:3000",
+            Some(&me(
+                json!([{ "name": "Personal", "sites": [{ "host": "acme.com" }, { "host": "app.acme.com" }] }]),
+            )),
+            "app",
+            true,
+            false,
+        );
+        assert!(t.contains("acme.com, app.acme.com"), "{t}");
+    }
+
+    /// The two flavours must not lie about what happened: blocked means no report exists, unblocked
+    /// means one does — filed somewhere the user didn't choose.
+    #[test]
+    fn the_blocked_and_unpinned_flavours_report_what_actually_happened() {
+        let blocked = project_setup_instructions("http://localhost:5173", None, "app", true, false);
+        assert!(blocked.contains("did NOT run"), "{blocked}");
+        assert!(blocked.contains("no uxlint.toml"), "{blocked}");
+
+        // A file that exists but declares no org/site fails identically — say so, don't tell the
+        // agent to create a file it can already see.
+        let half = project_setup_instructions("http://localhost:5173", None, "app", true, true);
+        assert!(half.contains("declares no `org`/`site`"), "{half}");
+
+        // Public host: the audit ran, so name where the report landed and suggest that host.
+        let unpinned = project_setup_instructions("https://acme.com", None, "app", false, false);
+        assert!(!unpinned.contains("did NOT run"), "{unpinned}");
+        assert!(unpinned.contains("acme.com"), "{unpinned}");
+        assert!(unpinned.contains("site = \"acme.com\""), "{unpinned}");
     }
 }
 
