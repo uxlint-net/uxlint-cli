@@ -205,10 +205,18 @@ pub(crate) fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
             println!(
                 "  feedback sharing: {}",
                 if want {
-                    "on — thanks! flip it off anytime with feedback = false in uxlint.toml"
+                    "on — thanks! flip it off anytime by re-running `uxlint init`"
                 } else {
-                    "off — turn it on anytime with feedback = true in uxlint.toml"
+                    "off — turn it on anytime by re-running `uxlint init`"
                 }
+            );
+            // An MCP server decides its tool list ONCE, when it starts (`UxlintMcp::new` reads this
+            // setting), so an agent already connected will keep showing the old four tools no matter
+            // what this file now says — and nothing in its UI explains why. Say so here, since this
+            // is the moment the expectation is set.
+            println!(
+                "  your coding agent picks {} up when its uxlint MCP server next starts — reconnect it (in Claude Code: /mcp) to see the tool list change",
+                if want { "lint_feedback" } else { "the change" }
             );
         }
         std::fs::write("uxlint.toml", updated)?;
