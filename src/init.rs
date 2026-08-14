@@ -101,27 +101,38 @@ pub(crate) fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
             site_f.as_deref().unwrap_or("?")
         );
         let flagged = args.org.is_some() || args.site.is_some();
-        let (change_identity, change_creds) = if flagged {
-            (true, false)
-        } else {
-            match pick(
+        // The feedback opt-in was only ever ASKED at first setup, so a project that said no — or one
+        // set up before the flag existed — had no way to change its mind short of hand-editing the
+        // file. That's the setting most likely to be revisited (it's the one an agent asks about
+        // after a bad finding), so it belongs in this menu next to the other two.
+        let feedback_now = feedback_setting(&existing);
+        let (change_identity, change_creds, change_feedback) =
+            if flagged {
+                (true, false, false)
+            } else {
+                match pick(
                 "What do you want to update? (routes, goals, comments — everything else — is kept)",
                 &[
                     "sign-in credentials".to_string(),
                     "org & site (where reports are filed)".to_string(),
                     "credentials and org & site".to_string(),
+                    format!(
+                        "feedback sharing (currently {})",
+                        if feedback_now == Some(true) { "on" } else { "off" }
+                    ),
                     "nothing — leave it as is".to_string(),
                 ],
             )? {
-                0 => (false, true),
-                1 => (true, false),
-                2 => (true, true),
+                0 => (false, true, false),
+                1 => (true, false, false),
+                2 => (true, true, false),
+                3 => (false, false, true),
                 _ => {
                     println!("No changes made — uxlint.toml left as it is.");
                     return Ok(());
                 }
             }
-        };
+            };
 
         let mut updated = existing;
         let mut site = site_f.clone().unwrap_or_default();
@@ -182,10 +193,26 @@ pub(crate) fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
                 }
             );
         }
+        if change_feedback {
+            let want = ask_yes_no(
+                "Share feedback with uxlint? Only general, anonymized signals about which lints helped — never your app's content. Turning it on also gives your coding agent the lint_feedback tool, so it can report a bad finding while it still has the context.",
+                feedback_now.unwrap_or(false),
+            )?;
+            updated = update_feedback(&updated, want);
+            println!(
+                "  feedback sharing: {}",
+                if want {
+                    "on — thanks! flip it off anytime with feedback = false in uxlint.toml"
+                } else {
+                    "off — turn it on anytime with feedback = true in uxlint.toml"
+                }
+            );
+        }
         std::fs::write("uxlint.toml", updated)?;
-        let what = match (change_identity, change_creds) {
-            (true, true) => format!("the credentials and the identity ({identity_note})"),
-            (true, false) => format!("the identity ({identity_note})"),
+        let what = match (change_identity, change_creds, change_feedback) {
+            (true, true, _) => format!("the credentials and the identity ({identity_note})"),
+            (true, false, _) => format!("the identity ({identity_note})"),
+            (false, false, true) => "the feedback setting".to_string(),
             _ => "the credentials".to_string(),
         };
         println!(
@@ -872,6 +899,75 @@ fn update_credentials(existing: &str, creds: &Creds) -> String {
 /// comments, routes, exclude, goals, sections — untouched. A key that isn't in the file yet is
 /// inserted before the first section (top-level keys can't legally appear after one), or appended
 /// on a section-less file.
+/// The project's current `feedback` opt-in as the FILE states it: `Some(true)`/`Some(false)` when the
+/// key is written, `None` when it's absent (which behaves as off, but is worth telling apart — an
+/// absent key means nobody was ever asked, e.g. a config written by `--offline`).
+fn feedback_setting(existing: &str) -> Option<bool> {
+    existing
+        .parse::<toml::Value>()
+        .ok()?
+        .get("feedback")?
+        .as_bool()
+}
+
+/// Set the top-level `feedback` opt-in, in place. Text surgery for the same reason
+/// `update_credentials` does it: a TOML round-trip would drop every comment in a file that is mostly
+/// comments. Rewrites the existing key wherever it sits, or — when there is none — appends it with
+/// the prose that explains what is being shared, so the file still documents itself.
+fn update_feedback(existing: &str, want: bool) -> String {
+    let is_key = |l: &str| {
+        let t = l.trim_start();
+        !t.starts_with('#')
+            && t.strip_prefix("feedback")
+                .map(str::trim_start)
+                .is_some_and(|r| r.starts_with('='))
+    };
+    // The new key must land in the TOP-LEVEL region — appended after the last `[section]` it would
+    // parse as that table's key, not the project's, and read back as unset. So it goes in before the
+    // first section header (or at the end of a file that has none), with its explanatory comment.
+    let block = |want: bool| {
+        vec![
+            "# Share general, anonymized signals (which lints helped) with uxlint to improve the"
+                .to_string(),
+            "# product — never your app's content. Change it with `uxlint init`.".to_string(),
+            format!("feedback = {want}"),
+            String::new(),
+        ]
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut wrote = false;
+    let mut in_top = true;
+    for l in existing.lines() {
+        // A `feedback = …` INSIDE a section is some other table's key, not ours — leave it alone.
+        if in_top && l.trim_start().starts_with('[') {
+            if !wrote {
+                out.extend(block(want));
+                wrote = true;
+            }
+            in_top = false;
+        }
+        if in_top && is_key(l) {
+            out.push(format!("feedback = {want}"));
+            wrote = true;
+        } else {
+            out.push(l.to_string());
+        }
+    }
+    if !wrote {
+        if out.last().is_some_and(|l| !l.trim().is_empty()) {
+            out.push(String::new());
+        }
+        let mut b = block(want);
+        b.pop(); // no trailing blank at end-of-file
+        out.extend(b);
+    }
+    let mut s = out.join("\n");
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
 fn update_identity(existing: &str, org: &str, site: &str) -> String {
     // A top-level `key = …` assignment line (not a comment, not inside a section).
     let is_key = |l: &str, key: &str| {
@@ -1159,6 +1255,49 @@ audience = "anonymous"
             assert!(out.contains(kept), "lost {kept:?} from:\n{out}");
         }
         // the roles/goals sections still parse as TOML after the splice
+        toml::from_str::<toml::Value>(&out).expect("result must be valid TOML");
+    }
+
+    /// The opt-in used to be askable only at first setup, so a project that said no was stuck. These
+    /// pin the two shapes `uxlint init` now has to handle: a file that already states it, and one
+    /// that never did (written before the flag, or by `--offline`).
+    #[test]
+    fn update_feedback_adds_the_opt_in_when_the_file_has_none() {
+        assert_eq!(feedback_setting(CURATED), None);
+        let out = update_feedback(CURATED, true);
+        assert_eq!(feedback_setting(&out), Some(true));
+        assert!(
+            out.contains("never your app's content"),
+            "the file still explains what it opted into:\n{out}"
+        );
+        // The curated content survives — that's the whole reason this is text surgery.
+        for kept in ["routes = [\"/\", \"/docs\", \"/pricing\"]", "[roles.user]"] {
+            assert!(out.contains(kept), "lost {kept:?} from:\n{out}");
+        }
+        toml::from_str::<toml::Value>(&out).expect("result must be valid TOML");
+    }
+
+    #[test]
+    fn update_feedback_flips_an_existing_key_in_place_without_duplicating_it() {
+        let on = update_feedback(CURATED, true);
+        let off = update_feedback(&on, false);
+        assert_eq!(feedback_setting(&off), Some(false));
+        assert_eq!(
+            off.matches("feedback =").count(),
+            1,
+            "exactly one key:\n{off}"
+        );
+        toml::from_str::<toml::Value>(&off).expect("result must be valid TOML");
+    }
+
+    /// A `feedback` key inside some other table is not the project's opt-in — rewriting it would
+    /// corrupt that section and leave the real setting unwritten.
+    #[test]
+    fn update_feedback_ignores_a_same_named_key_inside_a_section() {
+        let src = "org = \"Personal\"\n\n[roles.user]\nfeedback = \"n/a\"\n";
+        let out = update_feedback(src, true);
+        assert!(out.contains("feedback = \"n/a\""), "{out}");
+        assert_eq!(feedback_setting(&out), Some(true));
         toml::from_str::<toml::Value>(&out).expect("result must be valid TOML");
     }
 

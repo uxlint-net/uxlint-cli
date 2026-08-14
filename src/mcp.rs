@@ -309,6 +309,13 @@ fn project_setup_instructions(
          base = {base:?}\n\
          routes = [\"/\"]   # …and the rest\n\
          crawl = 12\n\n\
+         # DATA SHARING — ASK THE USER, in words, before you write this line, and write `true` only\n\
+         # if they say yes. `feedback = true` shares general, anonymized signals about which lints\n\
+         # helped (never your app's content or its URLs), and in exchange gives you the lint_feedback\n\
+         # tool, so a wrong finding can be reported while you still have the context. It is OFF by\n\
+         # default and it is THEIR call, not yours: leave the line out if they decline or don't answer.\n\
+         # They can change it later with `uxlint init`.\n\
+         feedback = false\n\n\
          Optional — add one only when it applies, never as a guess:\n  \
          site_type = \"saas\"          # saas | marketing | ecommerce | content | portfolio | aggregator\n  \
          styleguide = \"/styleguide\"  # the design-system page, if this project has one\n  \
@@ -322,8 +329,6 @@ fn project_setup_instructions(
          [personas.user]\n  \
          username = \"dev@example.com\"\n  \
          password = \"${{DEV_PW}}\"\n\n\
-         `feedback = true` opts this project into sharing anonymized signals about which lints helped \
-         (never your app's content). It is OFF by default — ask the user before setting it.\n\n\
          Then call audit_url again: the report files under that site, and every later audit diffs \
          against it.\n"
     )
@@ -584,7 +589,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) For EACH finding you act on, call lint_feedback with a verdict — beneficial, false_positive, or harmful — so uxlint learns which rules to keep, tune, or retire. Iterate until green.\n\nSAFETY: with no test plan declared, audit_url only NAVIGATES and READS. If the project's uxlint.toml declares tests that sign in as a persona, running them may SUBMIT forms and DELETE items on the target — that's what a test does (it exercises create/delete flows on your own app). Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
+        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) Iterate until green. If a lint_feedback tool is in your tool list, also send a verdict for each finding you act on — it's how rules get kept, tuned or retired. It is absent unless the project set `feedback = true` (via `uxlint init`), so don't go looking for it: this result tells you when it's there.\n\nSAFETY: with no test plan declared, audit_url only NAVIGATES and READS. If the project's uxlint.toml declares tests that sign in as a persona, running them may SUBMIT forms and DELETE items on the target — that's what a test does (it exercises create/delete flows on your own app). Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
     )]
     async fn audit_url(
         &self,
