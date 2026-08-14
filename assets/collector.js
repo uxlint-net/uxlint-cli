@@ -958,6 +958,22 @@ function collectSnapshot() {
 					}
 				}
 			}
+			// A sticky/fixed bar covers whatever is beneath it AT THE CURRENT SCROLL POSITION, and the
+			// interaction passes leave the page scrolled (the hover walk wanders; focus scrolls things
+			// into view). So a control that is perfectly clear at rest can be hit-tested at the moment a
+			// sticky header sits over it — reported from the field as four toolbar controls "covered",
+			// with the report's own screenshot showing them plainly visible. That cover is a fact about
+			// where we were looking, not about the layout. At scrollY === 0 the same sticky bar over the
+			// same control IS a real defect, and still fires.
+			if (occluded && window.scrollY > 0) {
+				for (let a = top; a && a !== document.body; a = a.parentElement) {
+					const ap = getComputedStyle(a).position;
+					if (ap === 'sticky' || ap === 'fixed') {
+						occluded = false;
+						break;
+					}
+				}
+			}
 		}
 
 		// Reverse of occlusion: does this element FLOAT ON TOP of and cover LARGE text? A positioned
