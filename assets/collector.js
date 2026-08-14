@@ -1975,15 +1975,30 @@ function collectSnapshot() {
 			}
 		}
 		if (!paginated) {
-			// a small container whose direct children are page numbers (1, 2, 3, …)
+			// A small container whose direct children are page numbers (1, 2, 3, …). "Numeric
+			// children" ALONE is far too loose — a deck list's quantity column, a scoreboard, a
+			// calendar and a table of counts all match it, and one such page was reported from the
+			// field as "a paginated collection with more behind the pager" when the page had no pager
+			// at all. A real pager has two more properties: its numbers are CLICKABLE, and they ASCEND
+			// CONSECUTIVELY. Require both. (Clickable allows one exception — the current page is
+			// usually rendered as plain text.)
 			for (const parent of document.querySelectorAll('ul,ol,nav,div')) {
 				const kids = parent.children;
 				if (kids.length < 4 || kids.length > 40) continue;
-				let nums = 0;
+				const seq = [];
+				let clickable = 0;
 				for (const k of kids) {
-					if (/^\d{1,3}$/.test((k.textContent || '').trim())) nums++;
+					const t = (k.textContent || '').trim();
+					if (!/^\d{1,3}$/.test(t)) continue;
+					seq.push(+t);
+					if (k.matches('a,button,[role=button],[role=link]') || k.querySelector('a,button,[role=button],[role=link]')) clickable++;
 				}
-				if (nums >= 4) { paginated = true; break; }
+				if (seq.length < 4 || clickable < seq.length - 1) continue;
+				let consecutive = true;
+				for (let i = 1; i < seq.length; i++) {
+					if (seq[i] !== seq[i - 1] + 1) { consecutive = false; break; }
+				}
+				if (consecutive) { paginated = true; break; }
 			}
 		}
 	} catch (_) { /* ignore */ }
@@ -1994,13 +2009,26 @@ function collectSnapshot() {
 	let aiGenControls = 0;
 	let manualEditControls = 0;
 	try {
-		const AI_RE = /\b(generate|regenerate|auto[- ]?generate|rewrite|co[- ]?write|ai|magic)\b/i;
+		// STRONG evidence of generation: a verb that only means "the machine makes this", or a wand/
+		// robot glyph. WEAK: the bare words "ai" and "magic", which collide with ordinary product
+		// language — "magic link" sign-in, "Magic: The Gathering", a set or product name that happens
+		// to contain them. A weak match is counted ONLY on a page that also shows strong evidence, so
+		// the rule never fires on vocabulary alone. Reported from the field: three buttons on a
+		// card-game page were read as AI-generation controls on a page with no generated content
+		// anywhere, and the finding asked the author to add hand-authoring to a workflow that was
+		// already entirely by hand.
+		const AI_STRONG = /\b(generate|regenerate|auto[- ]?generate|rewrite|co[- ]?write|ai[- ]?(write|assist|generated?)|magic[- ](write|edit|fill|compose|eraser))\b/i;
+		const AI_WEAK = /\b(ai|magic)\b/i;
 		const AI_GLYPH = /[✨\u{1FA84}\u{1F916}\u{1F9E0}]/u; // ✨ 🪄 🤖 🧠
+		let strongHits = 0;
+		let weakHits = 0;
 		for (const el of document.querySelectorAll('button,a,[role=button],input[type=submit]')) {
 			const raw = (el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '');
 			const name = raw.replace(/\s+/g, ' ').trim();
-			if (AI_GLYPH.test(raw) || AI_RE.test(name)) aiGenControls++;
+			if (AI_GLYPH.test(raw) || AI_STRONG.test(name)) strongHits++;
+			else if (AI_WEAK.test(name)) weakHits++;
 		}
+		aiGenControls = strongHits + (strongHits > 0 ? weakHits : 0);
 		// Hand-authoring affordances: text fields (not search/toggle/button), contenteditable,
 		// textbox role, or an explicit Edit/rename/write-your-own control.
 		const authoring = document.querySelectorAll(
