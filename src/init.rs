@@ -194,8 +194,11 @@ pub(crate) fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
             );
         }
         if change_feedback {
-            let want = ask_yes_no(
-                "Share feedback with uxlint? Only general, anonymized signals about which lints helped — never your app's content. Turning it on also gives your coding agent the lint_feedback tool, so it can report a bad finding while it still has the context.",
+            let want = ask_choice(
+                "Feedback sharing sends general, anonymized signals about which lints helped —\nnever your app's content, URLs or findings. It also gives your coding agent the\nlint_feedback tool, so it can report a wrong finding while it still has the context.",
+                "Share feedback with uxlint?",
+                "on — share which lints helped",
+                "off — share nothing",
                 feedback_now.unwrap_or(false),
             )?;
             updated = update_feedback(&updated, want);
@@ -284,8 +287,11 @@ pub(crate) fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
     // always written EXPLICITLY — `feedback = true` or `feedback = false` — so a re-read of the file
     // never has to guess. The accessor's own absent-key default is FALSE, for projects that skip
     // this prompt entirely (--offline, or a config hand-written without the key).
-    let feedback = ask_yes_no(
-        "Help improve uxlint by sharing feedback? Shares only general, anonymized signals about which lints helped — never your app's content. You can change this anytime in uxlint.toml.",
+    let feedback = ask_choice(
+        "Help improve uxlint by sharing feedback: general, anonymized signals about which\nlints helped — never your app's content. Change it anytime with `uxlint init`.",
+        "Share feedback with uxlint?",
+        "on — share which lints helped",
+        "off — share nothing",
         true,
     )?;
 
@@ -544,8 +550,11 @@ fn capture_credentials() -> Result<Creds> {
     };
     // Where the secret lives. A checked-in test login for local dev belongs IN uxlint.toml, so the
     // config is self-contained; a real secret must not be committed and goes to .env instead.
-    let inline = ask_yes_no(
-        "Is this a throwaway login for local-dev testing, safe to commit to uxlint.toml? (No → it's a real secret, kept in .env)",
+    let inline = ask_choice(
+        "A throwaway local-dev login belongs IN uxlint.toml — that's what makes the config\nself-contained and reproducible from a clone. A real secret does not: it goes to a\ngitignored .env, and uxlint.toml gets a ${VAR} reference to it.",
+        "Is this login safe to commit?",
+        "yes — a throwaway local-dev login",
+        "no — a real secret, keep it in .env",
         true,
     )?;
     Ok(match creds {
@@ -1049,6 +1058,27 @@ fn ask_default(prompt: &str, default: &str) -> Result<String> {
 
 fn ask_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     Ok(Confirm::new(prompt).with_default(default_yes).prompt()?)
+}
+
+/// A yes/no that ALSO has to explain itself. `Confirm` renders its question on one line and then
+/// puts `(y/N)` and the cursor after it, so a question with a paragraph of context behind it wraps
+/// and the caret ends up marooned somewhere off to the right — and a mistyped character earns an
+/// "Invalid answer, try typing 'y'" scolding rather than just working. So: print the explanation as
+/// prose, then ask with the SAME arrow-key list every other question in this wizard uses. Two
+/// labelled choices, enter accepts the current setting, nothing to mistype.
+fn ask_choice(
+    explain: &str,
+    question: &str,
+    yes: &str,
+    no: &str,
+    default_yes: bool,
+) -> Result<bool> {
+    eprintln!("\n{explain}");
+    Ok(pick_default(
+        question,
+        &[yes.to_string(), no.to_string()],
+        usize::from(!default_yes),
+    )? == 0)
 }
 
 /// Arrow-key selection from a list (type to filter). Returns the chosen index so callers keep
