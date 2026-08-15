@@ -373,7 +373,7 @@ pub(crate) fn run_audit_ext(
             .store(true, std::sync::atomic::Ordering::Relaxed);
         note!(progress, "  TIMEOUT — skipping launch probes, signed-out re-checks and tests; finalizing what we captured");
     }
-    let (nf_probe, favicon_status) = {
+    let (nf_probe, favicon_status, favicon_look) = {
         let _s = crate::otel::phase("probe.not_found");
         probe_not_found_and_favicon(&tab, &args.base, deadline, progress)
     };
@@ -511,6 +511,7 @@ pub(crate) fn run_audit_ext(
         no_judge: args.no_judge,
         nf_probe: &nf_probe,
         favicon_status,
+        favicon_look: &favicon_look,
         back_probe: &back_probe,
         open_redirect: &open_redirect,
         styleguide: &styleguide_probe,
@@ -1355,6 +1356,7 @@ mod request_tests {
             no_judge: false,
             nf_probe: &Value::Null,
             favicon_status: Some(200),
+            favicon_look: &serde_json::Value::Null,
             back_probe: &Value::Null,
             open_redirect: &Value::Null,
             styleguide: &Value::Null,

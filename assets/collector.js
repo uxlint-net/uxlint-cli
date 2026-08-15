@@ -2112,12 +2112,18 @@ function collectSnapshot() {
 	}
 
 	// Head signals for shareability: search snippet, social-card tags, tab icon.
+	// `ogImage` is separate from the ogTags COUNT on purpose. og:image is the one tag that decides
+	// whether a pasted link renders as a CARD or as a line of text, and a page can carry og:type,
+	// og:title and og:description — a count of three, which passes any "has og tags?" test — while
+	// unfurling as nothing at all. That was uxlint's own home page.
 	let metaDescription = false;
 	let ogTags = 0;
+	let ogImage = false;
 	let iconLink = false;
 	try {
 		metaDescription = !!document.querySelector('meta[name="description"][content]');
 		ogTags = document.querySelectorAll('meta[property^="og:"]').length;
+		ogImage = !!document.querySelector('meta[property="og:image"][content], meta[name="twitter:image"][content]');
 		iconLink = !!document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]');
 	} catch (_) {
 		/* ignore */
@@ -2962,6 +2968,7 @@ function collectSnapshot() {
 		js,
 		metaDescription,
 		ogTags,
+		ogImage,
 		iconLink,
 		mobile,
 		dateMarkers,

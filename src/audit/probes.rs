@@ -30,18 +30,26 @@ pub(crate) const ANON_PROBE_JS: &str = r##"(() => {
 // and is a no-op (null/empty) past the browser-phase `deadline`.
 
 /// The 404 page + favicon probe: a dead URL should land on a page that offers a way back, and the
-/// tab icon is the site's face in tabs/bookmarks. Returns `(nf_probe, favicon_status)`.
+/// tab icon is the site's face in tabs, bookmarks and — the part everyone forgets — the Google
+/// result. Returns `(nf_probe, favicon_status, favicon_look)`.
+///
+/// `favicon_look` is what the icon actually IS, not merely that something answered 200: `{px, colors,
+/// flat}`, where `flat` means every visible pixel carries one colour. That distinction is the whole
+/// reason it exists. uxlint's own `/favicon.ico` was a solid indigo square for months — a placeholder
+/// nobody replaced when the mark was drawn — and it passed every check we had, because a featureless
+/// block is still a 200. It was what Google fetched, cached, and showed as our search listing.
 pub(crate) fn probe_not_found_and_favicon(
     tab: &headless_chrome::Tab,
     base: &str,
     deadline: std::time::Instant,
     progress: &(dyn Progress + Sync),
-) -> (Value, Option<i64>) {
+) -> (Value, Option<i64>, Value) {
     if std::time::Instant::now() >= deadline {
-        return (json!(null), None);
+        return (json!(null), None, json!(null));
     }
     let mut nf = json!(null);
     let mut fav: Option<i64> = None;
+    let mut look = json!(null);
     let probe_url = format!(
         "{}/uxlint-nf-probe-{}",
         base.trim_end_matches('/'),
@@ -80,6 +88,47 @@ pub(crate) fn probe_not_found_and_favicon(
             .ok()
             .and_then(|r| r.value)
             .and_then(|v| v.as_i64());
+        // What the icon LOOKS like. Drawn to a canvas and sampled: `flat` means every visible pixel
+        // is one colour — a placeholder block, not a mark. A cross-origin icon taints the canvas and
+        // `getImageData` throws; that is UNKNOWN, not flat, so it reports no verdict and no rule can
+        // fire on it. Counting stops at nine distinct colours: past that it is plainly a drawing.
+        look = tab
+            .evaluate(
+                r##"new Promise((resolve) => {
+  const link = document.querySelector('link[rel~="icon" i][href]');
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const n = Math.min(img.naturalWidth || 32, 64) || 32;
+      const c = document.createElement('canvas');
+      c.width = c.height = n;
+      const x = c.getContext('2d');
+      x.drawImage(img, 0, 0, n, n);
+      const d = x.getImageData(0, 0, n, n).data;
+      const seen = new Set();
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 8) continue;
+        seen.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]);
+        if (seen.size > 8) break;
+      }
+      resolve(JSON.stringify({ px: img.naturalWidth || 0, colors: seen.size, flat: seen.size <= 1 }));
+    } catch (_) {
+      resolve(JSON.stringify({ px: img.naturalWidth || 0 }));
+    }
+  };
+  img.onerror = () => resolve('null');
+  img.src = link ? link.href : '/favicon.ico';
+  setTimeout(() => resolve('null'), 2500);
+})"##,
+                true,
+            )
+            .ok()
+            .and_then(|r| r.value)
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            })
+            .unwrap_or(json!(null));
         note!(
             progress,
             "{}",
@@ -93,7 +142,7 @@ pub(crate) fn probe_not_found_and_favicon(
             ))
         );
     }
-    (nf, fav)
+    (nf, fav, look)
 }
 
 /// Styleguide existence probe: a design-system page is often UNLINKED (reachable by URL only, to keep

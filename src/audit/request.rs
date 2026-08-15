@@ -22,6 +22,9 @@ pub(crate) struct AuditRequestInputs<'a> {
     pub(crate) no_judge: bool,
     pub(crate) nf_probe: &'a Value,
     pub(crate) favicon_status: Option<i64>,
+    /// What the tab icon LOOKS like ({px, colors, flat}) — an icon that answers 200 can still be a
+    /// featureless placeholder block, which is what a search listing then shows.
+    pub(crate) favicon_look: &'a Value,
     pub(crate) back_probe: &'a Value,
     pub(crate) open_redirect: &'a Value,
     /// Styleguide existence probe ({path, present}) — whether a real page lives at the conventional
@@ -54,6 +57,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "no_judge": i.no_judge,
         "nf_probe": i.nf_probe,
         "favicon_status": i.favicon_status,
+        "favicon_look": i.favicon_look,
         "back_probe": i.back_probe,
         "open_redirect": i.open_redirect,
         "styleguide": i.styleguide,
