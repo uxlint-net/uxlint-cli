@@ -18,13 +18,30 @@ if [ -n "${UXLINT_BIN:-}" ] && [ -x "${UXLINT_BIN}" ]; then
 	exec "${UXLINT_BIN}" mcp "$@"
 fi
 
-# 2. Already installed (install.sh, mise, a package manager) — use it, and stay on the user's own
-#    version rather than quietly running a second copy that updates on a different schedule.
-if command -v uxlint >/dev/null 2>&1; then
-	exec uxlint mcp "$@"
+# 2. The version this plugin ships against. Everything below is keyed on it.
+data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT:-$HOME/.uxlint}}"
+manifest="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
+version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)"
+if [ -z "$version" ]; then
+	log "could not read the plugin's version from $manifest — installing the latest release instead"
 fi
 
-# 3. Otherwise install into the plugin's data directory, at the version THIS PLUGIN declares.
+# 3. Already installed (install.sh, mise, a package manager) — use it, but only if it is at least the
+#    version this plugin ships against. Deferring to an OLDER uxlint on PATH re-opens the very trap the
+#    pinning below closes: the plugin updates, the binary it actually runs does not, and /v1/me starts
+#    telling the user to upgrade something `/plugin update` cannot reach. (A mise install pinned at
+#    0.1.24 shadowed a 0.1.27 plugin exactly this way.) A NEWER one is fine — that is the user tracking
+#    releases ahead of us, and installing a second copy behind their back would be pure waste.
+if command -v uxlint >/dev/null 2>&1; then
+	have="$(uxlint --version 2>/dev/null | awk '{print $2}')"
+	newest="$(printf '%s\n%s\n' "$have" "$version" | sort -V 2>/dev/null | tail -1)"
+	if [ -z "$version" ] || [ "$have" = "$version" ] || [ "$newest" = "$have" ]; then
+		exec uxlint mcp "$@"
+	fi
+	log "uxlint ${have:-?} on PATH is older than this plugin's $version — using the pinned build instead"
+fi
+
+# 4. Otherwise install into the plugin's data directory, at the version THIS PLUGIN declares.
 #
 #    The version scoping is what makes `/plugin update` mean something. The plugin ships a launcher,
 #    not a binary, so without it the first install would pin a user to that binary forever: the plugin
@@ -34,21 +51,18 @@ fi
 #
 #    CLAUDE_PLUGIN_DATA survives plugin updates, so previous versions stay cached (they cost ~10MB
 #    each; delete the directory to reclaim it).
-data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT:-$HOME/.uxlint}}"
-manifest="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
-version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)"
-if [ -z "$version" ]; then
-	log "could not read the plugin's version from $manifest — installing the latest release instead"
-fi
 bin="$data/bin/${version:-latest}/uxlint"
 if [ ! -x "$bin" ]; then
 	log "installing uxlint ${version:-latest} for this plugin (once per version)"
 	mkdir -p "$(dirname "$bin")"
+	# NB `env`, not a bare prefix: ${version:+VAR=value} expands into COMMAND position (bash decides
+	# what is an assignment before it expands anything), so without it this died with
+	# "UXLINT_VERSION=v0.1.27: command not found" and the plugin fell through to a failed install.
 	# The same installer the docs give: detects OS/arch, verifies the published checksum, and never
 	# touches anything outside the directory it is pointed at. UXLINT_VERSION pins the exact release,
 	# so the binary and the plugin can't disagree about what version this is.
 	if ! curl -fsSL https://uxlint.net/install.sh \
-		| UXLINT_INSTALL_DIR="$(dirname "$bin")" ${version:+UXLINT_VERSION="v$version"} sh >&2; then
+		| env UXLINT_INSTALL_DIR="$(dirname "$bin")" ${version:+UXLINT_VERSION="v$version"} sh >&2; then
 		log "install failed — install it yourself with: curl -fsSL https://uxlint.net/install.sh | sh"
 		exit 1
 	fi
