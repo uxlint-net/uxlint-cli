@@ -5,6 +5,13 @@ scale, colour discipline, scan patterns, landmarks. Every finding comes with a p
 agent (or a human) can apply directly. It's designed to sit in a coding agent's loop (MCP) and be
 iterated against until green.
 
+![An agent audits a pricing page, gets a contrast error and a colour-clash finding with fixes for
+each, applies them, re-checks the rule, and re-grades the page from B to A](assets/demo.gif)
+
+*A real run, start to finish: `audit_url` → **Grade B**, a 2.39:1 contrast error and three CTAs in
+three different accent hues → the fix → `verify_fix` → **Grade A**. Every number in it came back
+from the tools; only the waiting was cut.*
+
 This is the **CLI**: a small, single static Rust binary. It drives a Chrome/Chromium you already
 have installed over the DevTools protocol (no Node, no Playwright, no headless-browser download),
 captures what a page looks and reads like, and sends that to uxlint's hosted server, which does
