@@ -455,6 +455,11 @@ fn main() -> Result<()> {
         b.init();
     }
     let mut cli = Cli::parse();
+    // An EMPTY key is no key. `UXLINT_API_KEY: ${{ secrets.UXLINT_API_KEY }}` with the secret unset
+    // is an empty string, not an absent variable — and treating that as a credential sent the whole
+    // run down the authenticated path with nothing to authenticate: a 401 from the server instead of
+    // the sign-in link (or, in CI, instead of "set this secret"). Same for a blank `--api-key ""`.
+    cli.api_key = normalise_key(cli.api_key.take());
     // A token saved by `uxlint auth login` is the fallback credential below --api-key / UXLINT_API_KEY.
     if cli.api_key.is_none() {
         cli.api_key = login::stored_credential();
@@ -599,5 +604,38 @@ fn main() -> Result<()> {
             println!("recorded — thanks, this feeds the widget-recognition corpus");
             Ok(())
         }
+    }
+}
+
+/// An EMPTY credential is no credential.
+///
+/// `UXLINT_API_KEY: ${{ secrets.UXLINT_API_KEY }}` with the secret unset is an empty STRING, not an
+/// absent variable, and clap hands it over as `Some("")`. Taking that at face value sent the run down
+/// the authenticated path with nothing to authenticate — a 401 from the server rather than the
+/// sign-in link, or in CI rather than "that secret isn't set". Same for `--api-key ""` and for a
+/// value that is nothing but whitespace.
+fn normalise_key(k: Option<String>) -> Option<String> {
+    k.filter(|k| !k.trim().is_empty())
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::normalise_key;
+
+    #[test]
+    fn an_empty_or_blank_key_is_no_key() {
+        // The CI shape that found this: a secret that isn't set expands to "", and clap reports
+        // Some(""), so every downstream check thought we were signed in.
+        assert_eq!(normalise_key(Some(String::new())), None);
+        assert_eq!(normalise_key(Some("   ".into())), None);
+        assert_eq!(normalise_key(None), None);
+    }
+
+    #[test]
+    fn a_real_key_is_left_exactly_as_given() {
+        assert_eq!(
+            normalise_key(Some("uxt_abc123".into())),
+            Some("uxt_abc123".into())
+        );
     }
 }

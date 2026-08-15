@@ -108,21 +108,59 @@ Two things that run will teach you the hard way:
 Each wants a form or a PR, and each takes minutes once the repo has a description, topics and a
 working install line (all now true):
 
-| Venue | How | Notes |
+| Venue | How | Status |
 | --- | --- | --- |
-| [Smithery](https://smithery.ai) | Connect the GitHub repo | Wants a runnable command; easiest after the npm wrapper |
-| [Glama](https://glama.ai/mcp/servers) | Crawls GitHub + accepts submissions | Ranks on repo quality — description/topics/licence now in place |
-| [PulseMCP](https://www.pulsemcp.com) | Submission form | Short description + categories |
-| [mcp.so](https://mcp.so) | Submission form | Same copy |
-| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | Follow their category conventions |
-| Cursor / VS Code / Windsurf docs | PR or form per editor | All assume a one-line command → npm wrapper first |
+| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | **PR #12229 open** (Developer Tools; agent-disclosed per their CONTRIBUTING, which fast-tracks those) |
+| [Glama](https://glama.ai/mcp/servers) | Crawls GitHub + accepts submissions | Should find us on its own now the repo is public, described and in the registry — check in a week, submit if not |
+| [Smithery](https://smithery.ai) | Connect the GitHub repo (OAuth) | **Needs you** — it's an account connect, not a form |
+| [PulseMCP](https://www.pulsemcp.com) | Submission form | **Needs you** — copy below |
+| [mcp.so](https://mcp.so) | Submission form | **Needs you** — copy below |
+| Cursor / VS Code / Windsurf docs | PR or form per editor | Not started |
 
-Listing copy to reuse verbatim:
+### Paste-ready copy
 
-> **uxlint** — Audit any website's UX the way a design-literate reviewer would: contrast, tap targets,
-> type scale, colour discipline, copy clarity, scan patterns, resilience. Every finding comes back with
-> the rule it broke, the source line, the selector, and the exact fix — so an agent can apply it and
-> re-check until green. Runs against the Chrome you already have.
+Written once, on purpose: a form under time pressure is where a product's description turns into
+"AI-powered UX analysis", which is what every neighbouring listing already says.
+
+**One line (~80 chars)**
+
+> Design review for the UI your agent just wrote — every finding comes back with the fix.
+
+**Short (~200 chars)** — the workhorse; fits Glama, PulseMCP, mcp.so
+
+> Audits any site's UX the way a design-literate reviewer would — contrast, tap targets, type scale,
+> colour discipline, scan patterns, copy — and returns the rule, the source line and the exact fix.
+
+**Long** — where there's room for a paragraph
+
+> An agent writes UI it can't see. uxlint opens the page in the Chrome you already have and reviews it
+> the way a design-literate human would: contrast, tap targets, type scale, colour discipline, scan
+> patterns, copy clarity, empty states, mobile layout. Every finding names the rule it broke, the
+> source file and line, the selector, and the exact change to make — and `verify_fix` re-checks that
+> one rule in about two seconds, so the agent can confirm its own fix landed instead of guessing.
+> Deterministic rules handle geometry and colour; an LLM judge reads the copy and the flow. The
+> capture runs locally against your own browser; grading runs server-side. macOS and Linux, x64 and
+> arm64 — no browser download, and no Node unless you install via npx.
+
+What earns its place, so an edit doesn't quietly lose it: "design review" rather than
+"accessibility" (the category is full of axe wrappers, and colour discipline / scan patterns / type
+scale are what none of them say); "comes back with the fix" in the FIRST clause, because that is the
+difference between a linter and something an agent can close a loop with; and `verify_fix` named with
+its duration, because "~2s single-rule re-check" is the detail that makes the loop believable.
+
+| Field | Value |
+| --- | --- |
+| Install | `npx -y @uxlint-net/uxlint mcp` |
+| Registry name | `io.github.uxlint-net/uxlint` |
+| Repo | https://github.com/uxlint-net/uxlint-cli |
+| Homepage | https://uxlint.net |
+| Licence | BUSL-1.1 |
+| Tools | `audit_url`, `verify_fix`, `ux_guidance`, `get_shot` |
+| Categories | developer tools, design, accessibility, testing |
+| Language / scope | Rust 🦀, local browser + hosted grading (🏠 ☁️), macOS + Linux |
+| Container | `Dockerfile` at the repo root — ships Chromium, verified to introspect AND audit |
+| Animated demo | https://raw.githubusercontent.com/uxlint-net/uxlint-cli/main/assets/demo.gif |
+| Video | https://uxlint.net/demo.webm |
 
 ## 4. Before submitting anywhere
 
@@ -134,8 +172,8 @@ Listing copy to reuse verbatim:
 - [x] npm wrapper — published as `@uxlint-net/uxlint`, with SLSA provenance via npm Trusted
       Publishing (OIDC, no token anywhere)
 - [x] Listed in the official MCP Registry
-- [ ] A 30-second demo GIF: agent writes UI → audit_url → findings → fixes → green. Every directory
-      that allows an image converts better with one, and we don't have it.
+- [x] A demo GIF — 13.6s, 1200×606, 4.0MB, in `assets/demo.gif` and on the README; a 251KB webm
+      plays on /docs/mcp. Recorded from a real run (`demo/gif/` in the server repo drives it).
 
 ---
 

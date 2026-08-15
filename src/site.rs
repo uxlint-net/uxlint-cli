@@ -83,11 +83,28 @@ pub(crate) fn create(cli: &Cli, host: &str, org: Option<&str>) -> Result<()> {
             );
             Ok(())
         }
-        None => bail!(
-            "create failed: {}",
-            resp["error"].as_str().unwrap_or("unexpected response")
-        ),
+        None => {
+            let why = resp["error"].as_str().unwrap_or("unexpected response");
+            bail!("create failed: {why}{}", scope_hint(why, cli));
+        }
     }
+}
+
+/// A refusal a signed-in person cannot act on without being told how.
+///
+/// Tokens minted before 2026-08-15 by `uxlint auth login` carry the audit scope only, while creating
+/// a site needs `settings` — so the CLI (and the MCP server) would tell someone to run this exact
+/// command and then refuse it, with the only way out in a web UI the message never mentioned. New
+/// sign-ins mint both scopes; this covers everyone holding an older token.
+fn scope_hint(why: &str, cli: &Cli) -> String {
+    if !why.contains("scope") {
+        return String::new();
+    }
+    format!(
+        "\n\nThis credential can run audits but not manage sites. Sign in again to replace it:\n  \
+         uxlint auth login\n\nOr create the site in the browser instead: {}/sites",
+        crate::login::web_base(&cli.server)
+    )
 }
 
 pub(crate) fn delete(cli: &Cli, host: &str, org: Option<&str>) -> Result<()> {
@@ -190,4 +207,28 @@ pub(crate) fn remove_user(cli: &Cli, host: &str, email: &str, org: Option<&str>)
     );
     println!("removed {email} from {host}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_scope_refusal_says_how_to_get_out_of_it() {
+        // The dead end this exists for: signed in, told by the CLI (or the MCP server) to run
+        // `uxlint site create`, refused by the very token that sign-in minted — and the only fix in a
+        // web UI the message never named.
+        let cli = Cli::parse_from(["uxlint", "--server", "https://uxlint.net", "site", "list"]);
+        let h = scope_hint("this API token lacks the 'settings' scope", &cli);
+        assert!(h.contains("uxlint auth login"), "{h}");
+        assert!(h.contains("https://uxlint.net/sites"), "{h}");
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_left_alone() {
+        // "that host is already taken" needs no lecture about scopes.
+        let cli = Cli::parse_from(["uxlint", "site", "list"]);
+        assert_eq!(scope_hint("host already in use", &cli), "");
+    }
 }
