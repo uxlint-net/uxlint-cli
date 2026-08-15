@@ -166,16 +166,11 @@ jobs:
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
             echo "NPM_TOKEN not set — skipping npm publish"; exit 0
           fi
-          cd npm
-          VERSION="${TAG#v}"
-          # The package version IS the release it downloads; set it from the tag rather than trusting
-          # the checked-in value to have been bumped.
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          # A prerelease tag (v0.1.27-rc.1) must not become `latest` for everyone running `npx uxlint`.
-          case "$VERSION" in
-            *-*) npm publish --tag next --provenance --access public ;;
-            *)   npm publish --provenance --access public ;;
-          esac
+          # Publishes BOTH names from one source — `uxlint` (the documented one-liner) and
+          # `@uxlint-net/uxlint` (our own scope; `@uxlint` belongs to a different product). The
+          # version comes from the tag rather than the checked-in value, so the launcher can never
+          # advertise a release it doesn't download.
+          ./npm/publish.sh "${TAG#v}"
 
   image:
     # `always()` so the dispatch path (where build/publish are skipped) still runs; the explicit
