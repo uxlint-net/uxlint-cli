@@ -16,7 +16,7 @@ Nearly every MCP venue assumes `npx` or `uvx` — a one-line command that fetche
 with no prior install. uxlint is a compiled Rust binary that drives your own Chrome, so it has no such
 one-liner. Everything below is a way of working with that, and the ranked options are:
 
-1. **An npm wrapper package** — `npx -y uxlint mcp`. BUILT, in `npm/`: it downloads the release build
+1. **An npm wrapper package** — `npx -y @uxlint-net/uxlint mcp`. BUILT, in `npm/`: it downloads the release build
    for your platform, verifies the checksum published beside it, caches it under `~/.cache/uxlint` and
    hands over. Progress goes to stderr, because under `uxlint mcp` stdout is the JSON-RPC channel.
    Tested end to end against the real v0.1.26 release. This is what unlocks the registry's npm path,
@@ -38,13 +38,13 @@ one-liner. Everything below is a way of working with that, and the ranked option
       repository `uxlint-net/uxlint-cli`, workflow `release.yml`.
    4. from then on a tag publishes both, signed, with nothing to steal.
 
-   **Names: both.** `just npm-publish <version>` publishes the same launcher as `uxlint` (the documented
-   one-liner — the shortest command is the one every directory and blog post prints, so it has to be
-   ours) and as `@uxlint-net/uxlint` (our own scope, since `@uxlint` belongs to a different product).
-   A name you don't hold is a name someone else can take. See "The other uxlint" below.
-2. **MCPB bundle** — a prebuilt binary attached to a GitHub release. The official registry supports
-   this natively (`registryType: mcpb`), and it is the honest shape for a compiled tool. Needs a pack
-   step in the release workflow (below).
+   **Name: `@uxlint-net/uxlint`**, scoped, because neither unscoped option was available. `@uxlint`
+   belongs to a different product with the same name (see below), and npm REFUSED the bare `uxlint`:
+   "Package name too similar to existing package ux-lint" — an abandoned 2017 linter that still holds
+   the normalized name. Our own org is the namespace we actually control.
+2. ~~**MCPB bundle**~~ — a prebuilt binary attached to a release. This was the plan while there was no
+   npm package; now that there is one, `server.json` points at npm instead. An artifact you don't have
+   to build can't be built wrong.
 3. **`install.sh` first, then configure the server** — what the docs already tell people. Works, but
    it is two steps, and a two-step install loses people in a directory listing.
 

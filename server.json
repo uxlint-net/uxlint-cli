@@ -11,10 +11,13 @@
 	"websiteUrl": "https://uxlint.net",
 	"packages": [
 		{
-			"registryType": "mcpb",
-			"identifier": "https://github.com/uxlint-net/uxlint-cli/releases/download/v0.1.26/uxlint-mcp.mcpb",
-			"fileSha256": "PLACEHOLDER_FILLED_BY_RELEASE",
-			"transport": { "type": "stdio" }
+			"registryType": "npm",
+			"identifier": "@uxlint-net/uxlint",
+			"version": "0.1.26",
+			"runtimeHint": "npx",
+			"transport": {
+				"type": "stdio"
+			}
 		}
 	]
 }

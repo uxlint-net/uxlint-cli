@@ -50,19 +50,17 @@ install: build-release
 run *args:
     cargo run -- {{args}}
 
-# Publish the npm launcher (`npx -y uxlint mcp` — the one line every MCP directory, editor snippet and
-# blog post prints) under BOTH of uxlint's names, from ONE source directory:
+# Publish the npm launcher — `npx -y @uxlint-net/uxlint mcp`, the one line every MCP directory and
+# editor snippet wants.
 #
-#   uxlint               the documented one-liner; the shortest command is the one people copy, so it
-#                        has to be ours.
-#   @uxlint-net/uxlint   our own scope. `@uxlint` belongs to a different product with the same name
-#                        (uxlint.dev), so this is the namespace we can hold — and a name you don't
-#                        hold is a name someone else can take.
+# Scoped, because neither unscoped name was available to us: `@uxlint` belongs to a different product
+# with the same name (uxlint.dev), and npm refuses the bare `uxlint` as too similar to `ux-lint`, an
+# abandoned 2017 package that still holds the normalized name. `@uxlint-net` is our own org, so it is
+# the namespace we actually control.
 #
-# Only the name and version differ between the two publishes, so they cannot drift into different
-# launchers. A prerelease goes to the `next` dist-tag under both names, so an rc never becomes what
-# `npx uxlint` hands the world. The release workflow calls this too, so there is one definition of
-# what "publish the npm package" means.
+# A prerelease goes to the `next` dist-tag, so an rc never becomes what `npx @uxlint-net/uxlint` hands
+# the world. The release workflow calls this too, so there is one definition of what "publish the npm
+# package" means.
 #
 #   just npm-publish 0.1.26              # publish
 #   DRY_RUN=1 just npm-publish 0.1.26    # show what would be published
@@ -74,7 +72,7 @@ npm-publish version:
     v="{{version}}"; v="${v#v}"
     # A prerelease must never become `latest` for everyone running `npx uxlint`.
     tag=(); case "$v" in *-*) tag=(--tag next) ;; esac
-    for name in uxlint @uxlint-net/uxlint; do
+    for name in @uxlint-net/uxlint; do
       work="$(mktemp -d)"
       cp -R npm/. "$work"/
       node -e '

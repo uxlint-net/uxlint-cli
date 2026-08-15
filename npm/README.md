@@ -1,4 +1,4 @@
-# uxlint
+# @uxlint-net/uxlint
 
 Audit any website's UX the way a design-literate reviewer would — contrast, tap targets, type scale,
 colour discipline, copy clarity, scan patterns, resilience — and get a concrete fix for every finding.
@@ -6,8 +6,8 @@ colour discipline, copy clarity, scan patterns, resilience — and get a concret
 Built to sit in a coding agent's loop: an agent writes UI it cannot see, and this is how it looks.
 
 ```sh
-npx uxlint audit --base http://localhost:5173     # audit a running site
-npx uxlint mcp                                    # run the MCP server (stdio)
+npx @uxlint-net/uxlint audit --base http://localhost:5173     # audit a running site
+npx @uxlint-net/uxlint mcp                                    # run the MCP server (stdio)
 ```
 
 ## Use it from an agent
@@ -15,7 +15,7 @@ npx uxlint mcp                                    # run the MCP server (stdio)
 Add it as an MCP server. In Claude Code:
 
 ```sh
-claude mcp add uxlint -- npx -y uxlint mcp
+claude mcp add uxlint -- npx -y @uxlint-net/uxlint mcp
 ```
 
 Or in any client that reads a JSON config:
@@ -23,7 +23,7 @@ Or in any client that reads a JSON config:
 ```json
 {
   "mcpServers": {
-    "uxlint": { "command": "npx", "args": ["-y", "uxlint", "mcp"] }
+    "uxlint": { "command": "npx", "args": ["-y", "@uxlint-net/uxlint", "mcp"] }
   }
 }
 ```
@@ -37,7 +37,7 @@ page in ~2s), `ux_guidance` (the idiomatic pattern for an area, before you chang
 A launcher, not the tool. uxlint is a single compiled Rust binary; this package downloads the build for
 your platform from the matching GitHub release, verifies the checksum published beside it, caches it
 under `~/.cache/uxlint`, and hands over. The version you install is the version you get —
-`npx uxlint@0.1.26` runs exactly that binary.
+`npx @uxlint-net/uxlint@0.1.26` runs exactly that binary.
 
 It drives a Chrome or Chromium you already have (no browser download, no Node runtime for the audit
 itself). macOS and Linux, x64 and arm64. `CHROME=/path/to/chrome` if yours lives somewhere unusual.
