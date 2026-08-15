@@ -16,11 +16,12 @@ Nearly every MCP venue assumes `npx` or `uvx` — a one-line command that fetche
 with no prior install. uxlint is a compiled Rust binary that drives your own Chrome, so it has no such
 one-liner. Everything below is a way of working with that, and the ranked options are:
 
-1. **An npm wrapper package** — `npx -y @uxlint-net/uxlint mcp`. BUILT, in `npm/`: it downloads the release build
-   for your platform, verifies the checksum published beside it, caches it under `~/.cache/uxlint` and
-   hands over. Progress goes to stderr, because under `uxlint mcp` stdout is the JSON-RPC channel.
-   Tested end to end against the real v0.1.26 release. This is what unlocks the registry's npm path,
-   the editor one-liners, Smithery and most directory forms — they all assume `npx`.
+1. **An npm wrapper package** — `npx -y @uxlint-net/uxlint mcp`. PUBLISHED, source in `npm/`: it
+   downloads the release build for your platform, verifies the checksum published beside it, caches it
+   under `~/.cache/uxlint` and hands over. Progress goes to stderr, because under `uxlint mcp` stdout
+   is the JSON-RPC channel. Verified end to end from a cold cache against the real release. This is
+   what unlocks the registry's npm path, the editor one-liners, Smithery and most directory forms —
+   they all assume `npx`.
    **Publishing is CI's job, with no token anywhere.** The release workflow publishes both names on
    every `v*` tag using npm **trusted publishing**: GitHub mints an OIDC token, npm checks it came
    from this repo and this workflow file, and generates provenance automatically — a verifiable link
@@ -75,29 +76,32 @@ Users run:
 /plugin install uxlint@uxlint
 ```
 
-Both manifests pass `claude plugin validate`. **To do:** announce it — the command above is the whole
-onboarding, so it belongs in the README, the docs site, and any launch post.
+Both manifests pass `claude plugin validate`, and the whole path is exercised: install from the real
+marketplace, `/plugin update` across three versions, each fetching its matching CLI. The command is in
+the README and on /docs/mcp. **To do:** a launch post.
 
-## 2. Official MCP Registry (modelcontextprotocol/registry) — ONE STEP LEFT
+## 2. Official MCP Registry (modelcontextprotocol/registry) — LIVE
 
-The canonical index; other directories aggregate from it. Metadata only — it points at an artifact
-hosted elsewhere.
+Listed since 2026-08-15 as **`io.github.uxlint-net/uxlint`** (status `active`, first published at
+v0.1.29). The canonical index; other directories aggregate from it. Metadata only — it points at the
+npm package, and the registry proves we own the namespace by matching `mcpName` inside that package
+against the server name. No bundle to build: the `.mcpb` route this section used to describe was
+dropped once there was an npm package, because an artifact you don't have to build can't be built
+wrong.
 
-`server.json` is written and committed (namespace `io.github.uxlint-net/uxlint`, which GitHub auth
-proves ownership of). What remains is the artifact it points at:
+`.github/workflows/publish-mcp.yml` publishes it — deliberately **manual (`workflow_dispatch`, given a
+tag already on npm) rather than tag-triggered**: the first publish claims a namespace, which should be
+a decision someone makes on purpose. Now that a run has been watched end to end, flipping it to
+`on: push: tags` is a live option.
 
-1. **Build the `.mcpb` bundle in the release workflow.** A zip containing a `manifest.json`
-   (`manifest_version`, `name`, `version`, `description`, `author`, `server`) plus the platform
-   binaries we already build. `npm install -g @anthropic-ai/mcpb && mcpb pack`.
-2. **Fill `fileSha256`** in `server.json` from the packed artifact (`openssl dgst -sha256`), and set
-   `version` and the release URL to the tag being published.
-3. **Publish**: `mcp-publisher login github-oidc && mcp-publisher publish` from a workflow with
-   `id-token: write`.
+Two things that run will teach you the hard way:
 
-`.github/workflows/publish-mcp.yml` does all three, and is deliberately **manual (`workflow_dispatch`)
-rather than tag-triggered**: the first publish claims a namespace, and that should be a decision
-someone makes on purpose, not a side effect of tagging a patch release. Flip it to `on: push: tags`
-once a first run has been watched end to end.
+- It publishes **`main`'s `server.json`**, whatever tag you pass — the tag only sets the version. So
+  the description and package identifier it announces are main's, not the tag's.
+- The registry validates **at publish time**, i.e. after the release is already public. Our first
+  attempt died on `422 expected length <= 100` for `description` (ours was 270). `tests/registry_manifest.rs`
+  now pins that limit — in chars AND bytes, since an em dash is one char but three — along with the
+  `name` ↔ `mcpName` and identifier ↔ npm-name pairings that are the ownership proof.
 
 ## 3. Directory listings — COPY READY, SUBMIT MANUALLY
 
@@ -126,8 +130,10 @@ Listing copy to reuse verbatim:
 - [x] `LICENSE`, `README` with install + MCP sections, privacy/trust written up
 - [x] Claude Code marketplace manifests, validated
 - [x] `server.json` for the official registry
-- [ ] `.mcpb` bundle attached to a release + `fileSha256` filled in
-- [x] npm wrapper (`uxlint`) — built and tested; needs the first publish + `NPM_TOKEN`
+- [x] ~~`.mcpb` bundle~~ — dropped: the registry points at the npm package instead
+- [x] npm wrapper — published as `@uxlint-net/uxlint`, with SLSA provenance via npm Trusted
+      Publishing (OIDC, no token anywhere)
+- [x] Listed in the official MCP Registry
 - [ ] A 30-second demo GIF: agent writes UI → audit_url → findings → fixes → green. Every directory
       that allows an image converts better with one, and we don't have it.
 

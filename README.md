@@ -89,13 +89,30 @@ It applies in every capture path — the crawl, goal-walk tests, and fix preview
 /plugin install uxlint@uxlint
 ```
 
-That installs the `uxlint` MCP server and, if the CLI isn't already on your PATH, fetches it once with
-the same checksum-verifying installer as above. Everything below configures the server by hand, which
-is what you want for any other client.
+That installs the `uxlint` MCP server and, if the CLI isn't already on your PATH, fetches the matching
+version once with the same checksum-verifying installer as above — so `/plugin update` updates the CLI
+underneath it too.
+
+**Any other agent** — one line, nothing installed first (the npm package fetches the binary for your
+platform, verifies the checksum published beside it, and hands over):
 
 ```sh
-claude mcp add uxlint -- uxlint mcp
+claude mcp add uxlint -- npx -y @uxlint-net/uxlint mcp
 ```
+
+Or, for a client that reads a JSON config:
+
+```json
+{ "mcpServers": { "uxlint": { "command": "npx", "args": ["-y", "@uxlint-net/uxlint", "mcp"] } } }
+```
+
+uxlint is also in the [MCP Registry](https://registry.modelcontextprotocol.io) as
+`io.github.uxlint-net/uxlint`, for clients that browse it. Already have the CLI? `uxlint mcp install`
+registers it directly, no npx wrapper.
+
+There is no token to set up first: ask your agent to audit something while signed out and it hands you
+a sign-in link that mints and saves the token for you (`UXLINT_API_KEY` is for CI, which has no
+browser).
 
 Five tools: `audit_url` (full audit, graded verdict + action plan), `verify_fix` (recheck one rule
 on one page after an edit, ~2s), `get_shot` (fetch a finding's annotated screenshot),
