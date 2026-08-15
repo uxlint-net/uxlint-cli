@@ -1,0 +1,49 @@
+{
+	"name": "uxlint",
+	"version": "0.1.26",
+	"description": "Audit any website's UX the way a design-literate reviewer would — contrast, tap targets, type scale, copy, scan patterns, resilience — with a concrete fix for every finding. Runs in the Chrome you already have; built for coding agents (MCP).",
+	"keywords": [
+		"ux",
+		"design",
+		"accessibility",
+		"a11y",
+		"audit",
+		"mcp",
+		"mcp-server",
+		"modelcontextprotocol",
+		"lighthouse",
+		"code-review"
+	],
+	"homepage": "https://uxlint.net",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/uxlint-net/uxlint-cli.git"
+	},
+	"bugs": {
+		"url": "https://github.com/uxlint-net/uxlint-cli/issues"
+	},
+	"license": "BUSL-1.1",
+	"author": {
+		"name": "uxlint",
+		"url": "https://uxlint.net"
+	},
+	"type": "commonjs",
+	"bin": {
+		"uxlint": "bin/uxlint.js"
+	},
+	"files": [
+		"bin/uxlint.js",
+		"README.md"
+	],
+	"engines": {
+		"node": ">=18"
+	},
+	"os": [
+		"darwin",
+		"linux"
+	],
+	"cpu": [
+		"x64",
+		"arm64"
+	]
+}

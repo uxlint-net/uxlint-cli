@@ -142,6 +142,41 @@ jobs:
   # It REPACKAGES the published tarballs rather than recompiling — the bytes we ship in the image are
   # byte-identical to the ones behind `install.sh`, and the job costs a minute on ubuntu rather than a
   # second pass over the build matrix.
+  # The npm face of the CLI: `npx uxlint mcp`. Publishing it from the release job keeps ONE version
+  # number true across the tag, the binary, the container image and the npm package — a launcher that
+  # drifted from the binary it fetches would make `npx uxlint@X` a lie, and /v1/me tells clients which
+  # version to run. Skips itself (rather than failing the release) when NPM_TOKEN isn't configured, so
+  # a fork or a repo without the secret still releases everything else.
+  npm:
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success')
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "lts/*"
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN not set — skipping npm publish"; exit 0
+          fi
+          cd npm
+          VERSION="${TAG#v}"
+          # The package version IS the release it downloads; set it from the tag rather than trusting
+          # the checked-in value to have been bumped.
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          # A prerelease tag (v0.1.27-rc.1) must not become `latest` for everyone running `npx uxlint`.
+          case "$VERSION" in
+            *-*) npm publish --tag next --provenance --access public ;;
+            *)   npm publish --provenance --access public ;;
+          esac
+
   image:
     # `always()` so the dispatch path (where build/publish are skipped) still runs; the explicit
     # result check keeps the tag-push path strictly gated on a successful publish.

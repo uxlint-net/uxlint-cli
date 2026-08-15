@@ -16,10 +16,16 @@ Nearly every MCP venue assumes `npx` or `uvx` — a one-line command that fetche
 with no prior install. uxlint is a compiled Rust binary that drives your own Chrome, so it has no such
 one-liner. Everything below is a way of working with that, and the ranked options are:
 
-1. **An npm wrapper package** (`npx -y @uxlint/mcp`) that downloads the right binary on first run.
-   This is the single highest-leverage piece of work here: it unlocks the registry's npm path, the
-   Cursor/VS Code one-liners, Smithery, and most directory listings, all at once. It is also how most
-   compiled MCP servers ship. **Not built yet.**
+1. **An npm wrapper package** — `npx -y uxlint mcp`. BUILT, in `npm/`: it downloads the release build
+   for your platform, verifies the checksum published beside it, caches it under `~/.cache/uxlint` and
+   hands over. Progress goes to stderr, because under `uxlint mcp` stdout is the JSON-RPC channel.
+   Tested end to end against the real v0.1.26 release. This is what unlocks the registry's npm path,
+   the editor one-liners, Smithery and most directory forms — they all assume `npx`.
+   **Left to do: the first `npm publish`** (needs the account) and an `NPM_TOKEN` repo secret, after
+   which the release workflow publishes it on every tag.
+
+   **Name:** published unscoped as `uxlint`, which was free. The `@uxlint` SCOPE is not ours — see
+   "The other uxlint" below.
 2. **MCPB bundle** — a prebuilt binary attached to a GitHub release. The official registry supports
    this natively (`registryType: mcpb`), and it is the honest shape for a compiled tool. Needs a pack
    step in the release workflow (below).
@@ -105,6 +111,25 @@ Listing copy to reuse verbatim:
 - [x] Claude Code marketplace manifests, validated
 - [x] `server.json` for the official registry
 - [ ] `.mcpb` bundle attached to a release + `fileSha256` filled in
-- [ ] npm wrapper (`@uxlint/mcp`) — unblocks most of the table above
+- [x] npm wrapper (`uxlint`) — built and tested; needs the first publish + `NPM_TOKEN`
 - [ ] A 30-second demo GIF: agent writes UI → audit_url → findings → fixes → green. Every directory
       that allows an image converts better with one, and we don't have it.
+
+---
+
+## The other uxlint
+
+**There is a live product with our name.** `uxlint.dev` — "UXLint — Just enter a URL. Find UX issues.
+75 checks in under 60 seconds" — is a direct competitor in the same category, and it owns the `@uxlint`
+npm **scope**: `@uxlint/cli` was published on 2026-03-11 by `goodwelchi <contact@goodwelchi.com>`,
+pointing at `github.com/uxlint/cli`.
+
+That is why this package is the unscoped `uxlint` (which was still free) rather than `@uxlint/mcp`.
+Worth knowing before submitting anywhere, for three reasons:
+
+1. **Directory confusion.** Both products will appear under the same name in MCP directories and search
+   results. Whoever lists first, with the better description and image, owns the name in practice.
+2. **The scope is a dead end.** Anything `@uxlint/*` on npm is theirs. Our npm identity is the bare
+   name.
+3. **It is a brand decision, not a packaging one** — trademark, domain, and whether the collision is
+   worth contesting or worth differentiating away from. Flagged here rather than decided.
