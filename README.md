@@ -98,10 +98,12 @@ It applies in every capture path — the crawl, goal-walk tests, and fix preview
 
 That installs the `uxlint` MCP server and, if the CLI isn't already on your PATH, fetches the matching
 version once with the same checksum-verifying installer as above — so `/plugin update` updates the CLI
-underneath it too.
+underneath it too. **No Node needed**: it downloads one static binary (verified against a published
+checksum) and drives the Chrome you already have.
 
-**Any other agent** — one line, nothing installed first (the npm package fetches the binary for your
-platform, verifies the checksum published beside it, and hands over):
+**Any other agent** — one line (the npm package fetches the binary for your platform, verifies the
+checksum published beside it, and hands over). This is the only route that needs **Node 18+**, for
+`npx` itself; if you'd rather not, install the binary with the line at the top and register that:
 
 ```sh
 claude mcp add uxlint -- npx -y @uxlint-net/uxlint mcp
