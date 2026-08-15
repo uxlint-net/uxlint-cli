@@ -6,6 +6,8 @@ use anyhow::{bail, Context, Result};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The web app to send someone to, for a link they can actually click. In production the Axum server
@@ -52,11 +54,24 @@ pub(crate) fn credential_help(server: &str, problem: CredentialProblem, for_agen
              them). It needs replacing; nothing is wrong with your setup."
             .to_string(),
     };
+    // The link differs by problem, and the difference matters. A refused token means an ACCOUNT
+    // exists — send them straight to the token page. A missing credential often means no account at
+    // all (the plugin installs in one click, long before anyone signs up), so they get the sign-in
+    // page, which also creates accounts, with `next` set so signing in LANDS on the token page rather
+    // than the dashboard with a hunt ahead of them. Pointing a signed-out stranger at /settings just
+    // bounces them to a login page that then forgets where they were going.
+    let (verb, url) = match problem {
+        CredentialProblem::Missing => (
+            "Sign in (or create an account)",
+            format!("{web}/login?next=%2Fsettings"),
+        ),
+        CredentialProblem::Rejected => ("Mint a replacement", format!("{web}/settings")),
+    };
     let mut out = format!(
-        "{lead}\n\nMint a new one:\n  \
-         • in a terminal:   uxlint auth login\n  \
-         • or in a browser: {web}/settings  (Access tokens → create), then save it with \
-         `uxlint auth login` or set UXLINT_API_KEY"
+        "{lead}\n\n{verb} here:\n  {url}\n  (then: Access tokens → Create)\n\n\
+         Then save the token:\n  \
+         • uxlint auth login      — opens that page and stores the token for you\n  \
+         • or set UXLINT_API_KEY=uxt_… in the environment"
     );
     if problem == CredentialProblem::Rejected {
         out.push_str(
@@ -68,8 +83,8 @@ pub(crate) fn credential_help(server: &str, problem: CredentialProblem, for_agen
         out.push_str(
             "\n\nYou can't do this yourself — opening a browser and running a terminal command are \
              the user's to do. Show them the link and the command above, then call this tool again \
-             once they confirm. If they use `uxlint auth login`, they must restart the editor \
-             afterwards so this MCP server re-reads the credential.",
+             once they confirm: the credential is re-read on every call, so there is nothing to \
+             restart.",
         );
     } else {
         out.push_str(&format!("\n\nServer: {server}"));
@@ -263,6 +278,66 @@ pub(crate) fn run_login(web: &str, server: &str) -> Result<()> {
     Ok(())
 }
 
+/// A sign-in the CALLER can't drive: start the same browser flow `run_login` runs, but return the
+/// link instead of blocking on it, and finish it on a background thread.
+///
+/// This is the MCP case. A tool call can't sit for fifteen minutes waiting for a human to find their
+/// password, and the model on the other end can't open a browser — but it CAN show a link. So we open
+/// the callback port now, hand back the URL, and let the click do the rest: whoever opens it signs in
+/// (creating an account if they need one — `/cli-login` bounces through `/login` and comes back),
+/// the web app mints a token, and it lands in the same credentials file `uxlint auth login` writes.
+/// The next tool call re-reads that file and simply works, with nothing to restart.
+///
+/// Single-flight, because the failing tool call that produces the link is exactly the call an agent
+/// retries: without this, every retry would open another port and print a different link, and the one
+/// the user finally clicked would be answering a listener nobody was waiting on.
+pub(crate) fn pending_login_url(web: &str, server: &str) -> Result<String> {
+    /// The link we handed out and a flag the waiting thread sets when it's finished with the port.
+    struct Pending {
+        url: String,
+        done: Arc<AtomicBool>,
+    }
+    static PENDING: OnceLock<Mutex<Option<Pending>>> = OnceLock::new();
+    let cell = PENDING.get_or_init(|| Mutex::new(None));
+    let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = slot.as_ref() {
+        if !p.done.load(Ordering::Relaxed) {
+            return Ok(p.url.clone());
+        }
+    }
+
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("could not open a local callback port")?;
+    let port = listener.local_addr()?.port();
+    let url = format!("{}/cli-login?port={port}", web.trim_end_matches('/'));
+    let done = Arc::new(AtomicBool::new(false));
+
+    std::thread::spawn({
+        let (done, server) = (done.clone(), server.to_string());
+        move || {
+            // Everything here goes to stderr: under `uxlint mcp` stdout is the JSON-RPC channel, and
+            // a line of chat on it makes the whole server look broken to its client.
+            match wait_for_token(&listener).and_then(|token| {
+                // VERIFY before storing, exactly as run_login does — a token we never checked would
+                // sit on disk looking valid until some later call 401s.
+                let email = whoami(&server, &token)?;
+                store_credential(&token)?;
+                Ok(email)
+            }) {
+                Ok(email) => eprintln!("uxlint: signed in as {email} — credentials saved"),
+                Err(e) => eprintln!("uxlint: sign-in didn't complete: {e}"),
+            }
+            done.store(true, Ordering::Relaxed);
+        }
+    });
+
+    *slot = Some(Pending {
+        url: url.clone(),
+        done,
+    });
+    Ok(url)
+}
+
 pub(crate) fn run_logout() -> Result<()> {
     if let Some(path) = cred_path() {
         if path.exists() {
@@ -316,10 +391,29 @@ mod tests {
         // a chat window, and a link alone is useless in CI. Every message carries both.
         for p in [CredentialProblem::Missing, CredentialProblem::Rejected] {
             let m = credential_help("https://uxlint.net", p, false);
-            assert!(m.contains("https://uxlint.net/settings"), "{m}");
+            assert!(m.contains("https://uxlint.net/"), "{m}");
             assert!(m.contains("uxlint auth login"), "{m}");
             assert!(m.contains("UXLINT_API_KEY"), "{m}");
         }
+    }
+
+    #[test]
+    fn nobody_signed_in_gets_a_sign_in_url_that_resumes_at_the_token_page() {
+        // Whoever hits this may have no ACCOUNT — the plugin installs in one click, and the first
+        // thing it does is fail this check. /settings would bounce them to a login page that then
+        // forgets where they were headed, so the link is the sign-in page with `next` set.
+        let m = credential_help("https://uxlint.net", CredentialProblem::Missing, false);
+        assert!(
+            m.contains("https://uxlint.net/login?next=%2Fsettings"),
+            "{m}"
+        );
+        assert!(m.contains("create an account"), "{m}");
+
+        // A refused token means the account already exists — sending that person to a sign-in page
+        // implies they never signed up, which is the confusion this helper exists to avoid.
+        let r = credential_help("https://uxlint.net", CredentialProblem::Rejected, false);
+        assert!(r.contains("https://uxlint.net/settings"), "{r}");
+        assert!(!r.contains("create an account"), "{r}");
     }
 
     #[test]
@@ -328,7 +422,12 @@ mod tests {
         // reports "authentication failed" and stops, and the user never sees the way out.
         let a = credential_help("https://uxlint.net", CredentialProblem::Rejected, true);
         assert!(a.contains("can't do this yourself"), "{a}");
-        assert!(a.contains("restart the editor"), "{a}");
+        assert!(a.contains("call this tool again"), "{a}");
+        // And it must NOT ask for a restart: the credential is re-read per call now, so telling an
+        // agent to have the user restart their editor invents a step that makes a working setup
+        // look broken.
+        assert!(a.contains("nothing to restart"), "{a}");
+        assert!(!a.contains("restart the editor"), "{a}");
         // The human-facing variant shouldn't carry agent instructions.
         let h = credential_help("https://uxlint.net", CredentialProblem::Rejected, false);
         assert!(!h.contains("can't do this yourself"), "{h}");
@@ -343,7 +442,26 @@ mod tests {
             CredentialProblem::Missing,
             false,
         );
-        assert!(m.contains("https://uxlint.example.com/settings"), "{m}");
+        assert!(m.contains("https://uxlint.example.com/login"), "{m}");
         assert!(!m.contains("uxlint.net"), "{m}");
+    }
+
+    #[test]
+    fn a_pending_sign_in_hands_out_one_link_not_one_per_call() {
+        // The call that produces this link is exactly the call an agent retries. A second port per
+        // retry would leave the user clicking a link whose listener nobody is waiting on — the flow
+        // would complete in the browser and the CLI would still be signed out.
+        let a = pending_login_url("https://uxlint.example.com", "https://uxlint.example.com")
+            .expect("a local callback port");
+        let b = pending_login_url("https://uxlint.example.com", "https://uxlint.example.com")
+            .expect("a local callback port");
+        assert_eq!(a, b, "a retry must reuse the live listener");
+        // It's the real cli-login flow, not the settings page — clicking it mints the token itself.
+        assert!(
+            a.starts_with("https://uxlint.example.com/cli-login?port="),
+            "{a}"
+        );
+        let port: u16 = a.rsplit('=').next().unwrap().parse().expect("a real port");
+        assert!(port > 0);
     }
 }

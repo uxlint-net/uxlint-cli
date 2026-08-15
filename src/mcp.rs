@@ -194,8 +194,32 @@ fn failure_text(r: reqwest::blocking::Response) -> String {
 /// Shown when the MCP server has no API key — the common first-run state for someone who just
 /// installed uxlint from a marketplace. A clean, agent-relayable onboarding funnel beats the raw
 /// 401 JSON the server would otherwise surface.
+///
+/// It is a LIVE link, not instructions. This process opens the callback port before answering, so one
+/// click does the whole thing: sign in (or sign up), token minted, token saved here. The alternative
+/// — "create a token in settings, then copy it into your MCP config" — is four steps across two apps
+/// with a secret carried by hand, and it's where first-run installs are lost.
 fn signup_hint(server: &str) -> String {
-    crate::login::credential_help(server, crate::login::CredentialProblem::Missing, true)
+    let web = crate::login::web_base(server);
+    let Ok(url) = crate::login::pending_login_url(&web, server) else {
+        // No local port to listen on (locked-down box, exhausted ports). The manual route still
+        // works, so fall back to it rather than turning a setup step into a dead end.
+        return crate::login::credential_help(
+            server,
+            crate::login::CredentialProblem::Missing,
+            true,
+        );
+    };
+    format!(
+        "uxlint isn't signed in yet, so it can't reach the server.\n\n\
+         Show the user this link and ask them to open it — you can't open it yourself, and they \
+         don't have to copy anything back:\n\n  {url}\n\n\
+         It signs them in (creating an account if they don't have one), mints an access token, and \
+         saves it here automatically. Then call this tool again — it picks the token up on the next \
+         call, with nothing to restart.\n\n\
+         The link is live for 15 minutes. The `port=` in it is THIS server listening for the token, \
+         not a site to visit; if it expires, calling the tool again issues a fresh one."
+    )
 }
 
 /// The project directory's name — the site suggestion for an app that isn't deployed yet
@@ -400,7 +424,28 @@ fn missing_site_instructions(org: &str, site: &str, me: Option<&Value>) -> Optio
 /// first-run setup they already did, when what actually happened is that their credential was
 /// invalidated and has to be replaced.
 fn credential_rejected(server: &str) -> String {
-    crate::login::credential_help(server, crate::login::CredentialProblem::Rejected, true)
+    let web = crate::login::web_base(server);
+    let Ok(url) = crate::login::pending_login_url(&web, server) else {
+        return crate::login::credential_help(
+            server,
+            crate::login::CredentialProblem::Rejected,
+            true,
+        );
+    };
+    // Same one-click replacement as first run — a revoked token isn't a harder problem, it's the same
+    // mint with a different explanation — but the explanation has to lead, or the agent restarts an
+    // onboarding this person finished long ago.
+    format!(
+        "uxlint's saved credential was refused by the server — it has most likely been revoked (an \
+         admin can invalidate tokens, and incident response rotates them). Nothing is wrong with \
+         the setup; the token just needs replacing, and a revoked one never comes back, so \
+         re-running as-is fails identically.\n\n\
+         Show the user this link and ask them to open it — it signs them in, mints a REPLACEMENT \
+         token, and saves it here automatically:\n\n  {url}\n\n\
+         Then call this tool again; it picks the new token up on the next call, with nothing to \
+         restart. The link is live for 15 minutes, and the `port=` in it is THIS server listening \
+         for the token, not a site to visit."
+    )
 }
 
 // ── Tool input schemas ────────────────────────────────────────────────────────
@@ -563,12 +608,20 @@ pub(crate) struct UxlintMcp {
     /// site under review without repeating the URL on every tool call. `None` when not launched with
     /// one (empty is normalised to None in `run_mcp`).
     default_base: Option<String>,
+    /// The credential was given explicitly (`--api-key` / `UXLINT_API_KEY`) rather than read from the
+    /// credentials file, so it must NOT be re-read per call. See `call_cli`.
+    key_is_explicit: bool,
 }
 
 #[tool_router(router = tool_router)]
 impl UxlintMcp {
     fn new(cli: Arc<Cli>, default_base: Option<String>) -> Self {
         let feedback_enabled = crate::project::project_feedback_enabled();
+        // Did the credential come from --api-key/UXLINT_API_KEY, or from the file `uxlint auth login`
+        // writes? main.rs falls back to the file, so "differs from the file" IS the explicit case —
+        // and only the file-sourced one may be re-read per call (see `call_cli`).
+        let key_is_explicit =
+            cli.api_key.is_some() && cli.api_key != crate::login::stored_credential();
         let mut tool_router = Self::tool_router();
         // Off by default and not exposed at all when off. `remove_route` drops the route from
         // the macro-generated router that BOTH `list_tools` and `call_tool` go through, so this one
@@ -585,7 +638,33 @@ impl UxlintMcp {
             tool_router,
             feedback_enabled,
             default_base,
+            key_is_explicit,
         }
+    }
+
+    /// The config for THIS call, with the credential re-read from the credentials file.
+    ///
+    /// An MCP server is long-lived — an editor starts it once and keeps it for the whole session —
+    /// and the sign-in link `signup_hint` hands out completes DURING that session. Resolving the key
+    /// once at startup meant the token landed on disk and the very next call still said "not signed
+    /// in", which is why the old copy had to end with "restart your editor": a setup step that reads
+    /// as "it didn't work". The same applies to a REVOKED token being replaced — the stale key would
+    /// otherwise be re-sent until the editor restarted, so the re-mint appears to have done nothing.
+    ///
+    /// An explicit `--api-key`/`UXLINT_API_KEY` is left exactly as given: that's an operator's
+    /// deliberate choice (CI, a second account) and must not be silently swapped for whatever the
+    /// file happens to hold. Only a file-sourced credential tracks the file.
+    fn call_cli(&self) -> Arc<Cli> {
+        if self.key_is_explicit {
+            return self.cli.clone();
+        }
+        let stored = crate::login::stored_credential();
+        if stored == self.cli.api_key {
+            return self.cli.clone();
+        }
+        let mut cli = (*self.cli).clone();
+        cli.api_key = stored;
+        Arc::new(cli)
     }
 
     #[tool(
@@ -597,7 +676,7 @@ impl UxlintMcp {
         meta: Meta,
         client: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if self.cli.api_key.is_none() {
+        if self.call_cli().api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 signup_hint(&self.cli.server),
             )]));
@@ -613,7 +692,7 @@ impl UxlintMcp {
         // never agreed to, silently becomes where this project's history lives. Both cases need the
         // same one `/v1/me`, so ask once and let the answer decide.
         let project = crate::project::project_config();
-        let cli = self.cli.clone();
+        let cli = self.call_cli();
         let me = tokio::task::spawn_blocking(move || crate::audit::setup::fetch_me(&cli))
             .await
             .map_err(|e| McpError::internal_error(format!("setup probe panicked: {e}"), None))?;
@@ -692,7 +771,7 @@ impl UxlintMcp {
             dry_run: None,
             no_provenance: false,
         };
-        let cli = self.cli.clone();
+        let cli = self.call_cli();
         // MCP progress notifications: rmcp 2.2.0 DOES support `notifications/progress` — a
         // client that wants them sends a `progressToken` in the tool call's `_meta`; `meta` above is
         // exactly that (rmcp hands it to any #[tool] method that asks for it, via `FromContextPart`).
@@ -780,6 +859,18 @@ impl UxlintMcp {
                 // (the synthesis layer). The agent reads "here's what to fix, by block, in
                 // priority order" before wading into the raw finding list.
                 let summary = &report["summary"];
+                // The link goes FIRST, with an instruction to relay it. Everything below this line is
+                // written for the agent — it fixes the code and the user never sees most of it — but
+                // the report itself is for the PERSON: annotated screenshots of their own pages, every
+                // finding, the score over time. Buried as a bare line halfway down a wall of findings
+                // it got summarised away, and people didn't know a report page existed at all.
+                if let Some(url) = report["report_url"].as_str().filter(|u| !u.is_empty()) {
+                    t.push_str(&format!(
+                        "REPORT: {url}\nGive the user this link — it's the full report on the web \
+                         (annotated screenshots of each finding, the whole list, and how this run \
+                         compares with their last one).\n\n"
+                    ));
+                }
                 if let Some(grade) = summary["grade"].as_str() {
                     t.push_str(&format!(
                         "Grade {grade} ({}/100) — {}\n",
@@ -788,11 +879,8 @@ impl UxlintMcp {
                     ));
                 }
                 t.push_str(&format!(
-                    "{} errors, {} warnings, {} info\nFull report: {}\n\n",
-                    report["errors"],
-                    report["warnings"],
-                    report["infos"],
-                    report["report_url"].as_str().unwrap_or("-")
+                    "{} errors, {} warnings, {} info\n\n",
+                    report["errors"], report["warnings"], report["infos"],
                 ));
                 // Cross-audit delta — the iterate-loop signal: what your last round of fixes moved.
                 // Present only when this crawl has a comparable prior crawl to diff against.
@@ -1058,12 +1146,12 @@ impl UxlintMcp {
             dry_run: None,
             no_provenance: false,
         };
-        if self.cli.api_key.is_none() {
+        if self.call_cli().api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 signup_hint(&self.cli.server),
             )]));
         }
-        let cli = self.cli.clone();
+        let cli = self.call_cli();
         let rule_for_task = rule.clone();
         let route_for_task = route.clone();
         let feedback_enabled = self.feedback_enabled;
@@ -1221,12 +1309,12 @@ impl UxlintMcp {
         &self,
         Parameters(a): Parameters<GetShotArgs>,
     ) -> Result<CallToolResult, McpError> {
-        if self.cli.api_key.is_none() {
+        if self.call_cli().api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 signup_hint(&self.cli.server),
             )]));
         }
-        let cli = self.cli.clone();
+        let cli = self.call_cli();
         let result = tokio::task::spawn_blocking(move || {
             let server = cli.server.trim_end_matches('/').to_string();
             let raw = a.screenshot_url.trim();
@@ -1328,7 +1416,7 @@ optionally url/note."
         &self,
         Parameters(a): Parameters<FeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let cli = self.cli.clone();
+        let cli = self.call_cli();
         let text = tokio::task::spawn_blocking(move || match a.kind {
             FeedbackKind::Verdict => {
                 let Some(verdict) = a.verdict else {
