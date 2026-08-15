@@ -24,17 +24,31 @@ if command -v uxlint >/dev/null 2>&1; then
 	exec uxlint mcp "$@"
 fi
 
-# 3. Otherwise install into the plugin's data directory. CLAUDE_PLUGIN_DATA survives plugin updates,
-#    so this download happens once, not on every upgrade. Fall back to the plugin root if the host
-#    is older than that variable.
+# 3. Otherwise install into the plugin's data directory, at the version THIS PLUGIN declares.
+#
+#    The version scoping is what makes `/plugin update` mean something. The plugin ships a launcher,
+#    not a binary, so without it the first install would pin a user to that binary forever: the plugin
+#    would update, the CLI underneath would not, and the server would start telling them to upgrade a
+#    thing they had no way to upgrade. Keying the path on the version means a plugin update fetches the
+#    matching CLI on next start, and an unchanged version reuses what's already there.
+#
+#    CLAUDE_PLUGIN_DATA survives plugin updates, so previous versions stay cached (they cost ~10MB
+#    each; delete the directory to reclaim it).
 data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT:-$HOME/.uxlint}}"
-bin="$data/bin/uxlint"
+manifest="${CLAUDE_PLUGIN_ROOT:-}/.claude-plugin/plugin.json"
+version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)"
+if [ -z "$version" ]; then
+	log "could not read the plugin's version from $manifest — installing the latest release instead"
+fi
+bin="$data/bin/${version:-latest}/uxlint"
 if [ ! -x "$bin" ]; then
-	log "no uxlint on PATH — installing it to $data/bin (once)"
-	mkdir -p "$data/bin"
+	log "installing uxlint ${version:-latest} for this plugin (once per version)"
+	mkdir -p "$(dirname "$bin")"
 	# The same installer the docs give: detects OS/arch, verifies the published checksum, and never
-	# touches anything outside the directory it is pointed at.
-	if ! curl -fsSL https://uxlint.net/install.sh | UXLINT_INSTALL_DIR="$data/bin" sh >&2; then
+	# touches anything outside the directory it is pointed at. UXLINT_VERSION pins the exact release,
+	# so the binary and the plugin can't disagree about what version this is.
+	if ! curl -fsSL https://uxlint.net/install.sh \
+		| UXLINT_INSTALL_DIR="$(dirname "$bin")" ${version:+UXLINT_VERSION="v$version"} sh >&2; then
 		log "install failed — install it yourself with: curl -fsSL https://uxlint.net/install.sh | sh"
 		exit 1
 	fi

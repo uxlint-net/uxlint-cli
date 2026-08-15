@@ -1,7 +1,7 @@
 {
 	"name": "@uxlint-net/uxlint",
 	"mcpName": "io.github.uxlint-net/uxlint",
-	"version": "0.1.26",
+	"version": "0.1.27",
 	"description": "Audit any website's UX the way a design-literate reviewer would — contrast, tap targets, type scale, copy, scan patterns, resilience — with a concrete fix for every finding. Runs in the Chrome you already have; built for coding agents (MCP).",
 	"keywords": [
 		"ux",
