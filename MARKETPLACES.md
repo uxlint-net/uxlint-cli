@@ -21,8 +21,16 @@ one-liner. Everything below is a way of working with that, and the ranked option
    hands over. Progress goes to stderr, because under `uxlint mcp` stdout is the JSON-RPC channel.
    Tested end to end against the real v0.1.26 release. This is what unlocks the registry's npm path,
    the editor one-liners, Smithery and most directory forms — they all assume `npx`.
-   **Left to do: the first `npm publish`** (needs the account) and an `NPM_TOKEN` repo secret, after
-   which the release workflow publishes it on every tag.
+   **Publishing is CI's job**, not a laptop's: the release workflow publishes both names on every
+   `v*` tag, signed with npm provenance (a verifiable link from the tarball back to the workflow run
+   and commit that built it — which for a launcher that downloads a binary is the whole trust story).
+   Provenance needs an OIDC token, so it only works in CI; `just npm-publish` from a laptop still
+   works as break-glass, unsigned, and says so.
+
+   **Left to do, both one-time and neither of them a publish:** create the npm org (`npm org create
+   uxlint-net`) and add the token (`gh secret set NPM_TOKEN`). After that the first publish is a tag —
+   or a `workflow_dispatch` of the release workflow against the existing v0.1.26 tag, which republishes
+   nothing else.
 
    **Names: both.** `just npm-publish <version>` publishes the same launcher as `uxlint` (the documented
    one-liner — the shortest command is the one every directory and blog post prints, so it has to be

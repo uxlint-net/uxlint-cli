@@ -151,6 +151,13 @@ jobs:
     if: always() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success')
     needs: publish
     runs-on: ubuntu-latest
+    # `--provenance` signs the package with a verifiable link back to this workflow run and this
+    # commit — the npm page then shows where the tarball came from, which for a launcher that
+    # downloads a binary is the whole trust story. It REQUIRES an OIDC token, and the workflow's
+    # top-level permissions don't grant one, so it is granted here rather than widened for every job.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
