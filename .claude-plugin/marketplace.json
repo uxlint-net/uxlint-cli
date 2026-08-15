@@ -1,0 +1,29 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+	"name": "uxlint",
+	"description": "Design taste as a service: audit a site's UX from inside your coding agent, and get a concrete fix for every finding.",
+	"owner": {
+		"name": "uxlint",
+		"url": "https://uxlint.net"
+	},
+	"plugins": [
+		{
+			"name": "uxlint",
+			"displayName": "uxlint",
+			"source": "./plugin",
+			"description": "Audit the UI you just built — contrast, tap targets, type scale, copy, scan patterns, resilience — and fix it without leaving the agent. Every finding names its rule, the source line, the selector, and the exact change to make.",
+			"homepage": "https://uxlint.net",
+			"repository": "https://github.com/uxlint-net/uxlint-cli",
+			"license": "BUSL-1.1",
+			"category": "quality",
+			"keywords": [
+				"ux",
+				"design",
+				"accessibility",
+				"audit",
+				"review",
+				"frontend"
+			]
+		}
+	]
+}

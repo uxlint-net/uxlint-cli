@@ -1,0 +1,106 @@
+# Publish uxlint to the official MCP Registry (modelcontextprotocol/registry).
+#
+# MANUAL on purpose. The first publish CLAIMS the `io.github.uxlint-net/*` namespace, and a namespace
+# claim should be a decision someone makes, not a side effect of tagging a patch. Watch one run end to
+# end, then — if you want it automatic — change the trigger to `on: push: tags: ["v*"]` and let it ride
+# the existing release flow.
+#
+# What it does, in the order the registry requires:
+#   1. packs the platform binaries from an existing release into a `.mcpb` bundle (the registry's
+#      package type for "prebuilt binary, no toolchain on the user's machine"),
+#   2. uploads that bundle to the same release,
+#   3. rewrites server.json with the tag's version, the bundle's URL and its SHA-256 — clients verify
+#      that hash before installing, so it has to describe the artifact actually published,
+#   4. publishes the metadata with GitHub OIDC, which is what proves we own the namespace.
+name: publish-mcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.26). Its assets are repacked, not rebuilt."
+        required: true
+
+permissions:
+  id-token: write # OIDC: how the registry verifies the namespace
+  contents: write # attaching the .mcpb to the release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "lts/*"
+
+      # The release already carries a verified binary per platform; repack rather than rebuild, so the
+      # bundle contains exactly the bytes people are already downloading.
+      - name: Fetch the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p bundle/server
+          for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
+            gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+              --pattern "uxlint-$p.tar.gz" --output "/tmp/$p.tar.gz"
+            mkdir -p "/tmp/x-$p" && tar xzf "/tmp/$p.tar.gz" -C "/tmp/x-$p"
+            cp "/tmp/x-$p/uxlint" "bundle/server/uxlint-$p"
+          done
+          chmod +x bundle/server/*
+
+      - name: Write the bundle manifest
+        run: |
+          VERSION="${{ inputs.tag }}"; VERSION="${VERSION#v}"
+          cat > bundle/manifest.json <<JSON
+          {
+            "manifest_version": "0.3",
+            "name": "uxlint",
+            "version": "$VERSION",
+            "description": "Audit a website's UX the way a design-literate reviewer would, with a concrete fix for every finding.",
+            "author": { "name": "uxlint", "url": "https://uxlint.net" },
+            "homepage": "https://uxlint.net",
+            "repository": { "type": "git", "url": "https://github.com/uxlint-net/uxlint-cli" },
+            "license": "BUSL-1.1",
+            "server": {
+              "type": "binary",
+              "entry_point": "server/uxlint-linux-x64",
+              "mcp_config": {
+                "command": "\${__dirname}/server/uxlint-linux-x64",
+                "args": ["mcp"],
+                "platform_overrides": {
+                  "darwin": { "command": "\${__dirname}/server/uxlint-macos-arm64", "args": ["mcp"] }
+                }
+              }
+            }
+          }
+          JSON
+
+      - name: Pack the bundle
+        run: |
+          npm install -g @anthropic-ai/mcpb
+          mcpb pack bundle uxlint-mcp.mcpb
+          echo "SHA=$(openssl dgst -sha256 -r uxlint-mcp.mcpb | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" uxlint-mcp.mcpb --repo "$GITHUB_REPOSITORY" --clobber
+
+      # server.json is committed with the LAST published version; the registry needs it to describe
+      # the artifact being published now, hash included.
+      - name: Point server.json at this release
+        run: |
+          VERSION="${{ inputs.tag }}"; VERSION="${VERSION#v}"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ inputs.tag }}/uxlint-mcp.mcpb"
+          jq --arg v "$VERSION" --arg u "$URL" --arg s "$SHA" \
+            '.version = $v | .packages[0].identifier = $u | .packages[0].fileSha256 = $s' \
+            server.json > server.tmp && mv server.tmp server.json
+          cat server.json
+
+      - name: Publish to the MCP Registry
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

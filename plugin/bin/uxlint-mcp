@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Launch uxlint's MCP server for the Claude Code plugin.
+#
+# A plugin can't ship a compiled binary for four platforms without becoming a 60MB download, and
+# requiring "install the CLI first" turns a one-click install into a support thread. So: use the
+# uxlint already on this machine if there is one, and otherwise fetch it once, into the plugin's own
+# persistent data directory, with the same checksum-verifying installer the website documents.
+#
+# Nothing here is silent. The install prints what it is doing to stderr — stdout is the JSON-RPC
+# channel and must carry nothing else — and every byte comes from the published release the install
+# script verifies. `UXLINT_BIN` overrides everything, for a local build.
+set -euo pipefail
+
+log() { printf 'uxlint: %s\n' "$*" >&2; }
+
+# 1. An explicit override wins — a developer testing a local build.
+if [ -n "${UXLINT_BIN:-}" ] && [ -x "${UXLINT_BIN}" ]; then
+	exec "${UXLINT_BIN}" mcp "$@"
+fi
+
+# 2. Already installed (install.sh, mise, a package manager) — use it, and stay on the user's own
+#    version rather than quietly running a second copy that updates on a different schedule.
+if command -v uxlint >/dev/null 2>&1; then
+	exec uxlint mcp "$@"
+fi
+
+# 3. Otherwise install into the plugin's data directory. CLAUDE_PLUGIN_DATA survives plugin updates,
+#    so this download happens once, not on every upgrade. Fall back to the plugin root if the host
+#    is older than that variable.
+data="${CLAUDE_PLUGIN_DATA:-${CLAUDE_PLUGIN_ROOT:-$HOME/.uxlint}}"
+bin="$data/bin/uxlint"
+if [ ! -x "$bin" ]; then
+	log "no uxlint on PATH — installing it to $data/bin (once)"
+	mkdir -p "$data/bin"
+	# The same installer the docs give: detects OS/arch, verifies the published checksum, and never
+	# touches anything outside the directory it is pointed at.
+	if ! curl -fsSL https://uxlint.net/install.sh | UXLINT_INSTALL_DIR="$data/bin" sh >&2; then
+		log "install failed — install it yourself with: curl -fsSL https://uxlint.net/install.sh | sh"
+		exit 1
+	fi
+fi
+
+exec "$bin" mcp "$@"

@@ -82,6 +82,17 @@ It applies in every capture path — the crawl, goal-walk tests, and fix preview
 
 ## MCP (use it from a coding agent)
 
+**Claude Code, one command:**
+
+```
+/plugin marketplace add uxlint-net/uxlint-cli
+/plugin install uxlint@uxlint
+```
+
+That installs the `uxlint` MCP server and, if the CLI isn't already on your PATH, fetches it once with
+the same checksum-verifying installer as above. Everything below configures the server by hand, which
+is what you want for any other client.
+
 ```sh
 claude mcp add uxlint -- uxlint mcp
 ```
