@@ -66,8 +66,20 @@ if [ ! -x "$bin" ]; then
 	# so the binary and the plugin can't disagree about what version this is.
 	if ! curl -fsSL https://uxlint.net/install.sh \
 		| env UXLINT_MANAGED=1 UXLINT_INSTALL_DIR="$(dirname "$bin")" ${version:+UXLINT_VERSION="v$version"} sh >&2; then
-		log "install failed — install it yourself with: curl -fsSL https://uxlint.net/install.sh | sh"
-		exit 1
+		# The pinned release may not exist YET. The marketplace serves this manifest from `main`, so
+		# the moment a version bump merges it advertises a version whose binaries are still building —
+		# a window of a few minutes per release in which a first install would simply fail. Rather
+		# than rely on nobody installing during it, fall back to the newest published release and say
+		# so. The fallback lives in its own directory and the PINNED path is tried first on every
+		# subsequent start, so this self-heals the moment the release lands.
+		log "uxlint v$version isn't published yet (a release in flight?) — using the newest release for now"
+		bin="$data/bin/fallback/uxlint"
+		mkdir -p "$(dirname "$bin")"
+		if ! curl -fsSL https://uxlint.net/install.sh \
+			| env UXLINT_MANAGED=1 UXLINT_INSTALL_DIR="$(dirname "$bin")" sh >&2; then
+			log "install failed — install it yourself with: curl -fsSL https://uxlint.net/install.sh | sh"
+			exit 1
+		fi
 	fi
 fi
 
