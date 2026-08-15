@@ -24,7 +24,7 @@ one-liner. Everything below is a way of working with that, and the ranked option
    **Left to do: the first `npm publish`** (needs the account) and an `NPM_TOKEN` repo secret, after
    which the release workflow publishes it on every tag.
 
-   **Names: both.** `npm/publish.sh` publishes the same launcher as `uxlint` (the documented
+   **Names: both.** `just npm-publish <version>` publishes the same launcher as `uxlint` (the documented
    one-liner — the shortest command is the one every directory and blog post prints, so it has to be
    ours) and as `@uxlint-net/uxlint` (our own scope, since `@uxlint` belongs to a different product).
    A name you don't hold is a name someone else can take. See "The other uxlint" below.

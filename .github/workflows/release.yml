@@ -166,11 +166,11 @@ jobs:
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
             echo "NPM_TOKEN not set — skipping npm publish"; exit 0
           fi
-          # Publishes BOTH names from one source — `uxlint` (the documented one-liner) and
-          # `@uxlint-net/uxlint` (our own scope; `@uxlint` belongs to a different product). The
-          # version comes from the tag rather than the checked-in value, so the launcher can never
+          # One definition of "publish the npm package", shared with the local `just npm-publish`:
+          # both names, from one source, version taken from the TAG so the launcher can never
           # advertise a release it doesn't download.
-          ./npm/publish.sh "${TAG#v}"
+          curl -fsSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+          just npm-publish "${TAG#v}"
 
   image:
     # `always()` so the dispatch path (where build/publish are skipped) still runs; the explicit
