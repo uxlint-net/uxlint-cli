@@ -119,16 +119,34 @@ working install line (all now true):
 
 ### Paste-ready copy
 
-**One line:** Design review for the UI your agent just wrote — every finding comes back with the fix.
+Written once, on purpose: a form under time pressure is where a product's description turns into
+"AI-powered UX analysis", which is what every neighbouring listing already says.
 
-**Short (≤200 chars):** Audits any site's UX the way a design-literate reviewer would — contrast, tap
-targets, type scale, colour discipline, scan patterns — and returns a concrete fix for every finding.
+**One line (~80 chars)**
 
-**Long:** An agent writes UI it cannot see. uxlint drives the Chrome you already have, captures what
-the page looks and reads like, and returns findings that name the rule, the source line, the selector
-and the exact change to make — plus `verify_fix`, a ~2s single-rule re-check, so the agent can confirm
-its own fix landed before moving on. Deterministic rules for geometry and colour; an LLM judge for
-copy and flow. macOS and Linux, x64 and arm64.
+> Design review for the UI your agent just wrote — every finding comes back with the fix.
+
+**Short (~200 chars)** — the workhorse; fits Glama, PulseMCP, mcp.so
+
+> Audits any site's UX the way a design-literate reviewer would — contrast, tap targets, type scale,
+> colour discipline, scan patterns, copy — and returns the rule, the source line and the exact fix.
+
+**Long** — where there's room for a paragraph
+
+> An agent writes UI it can't see. uxlint opens the page in the Chrome you already have and reviews it
+> the way a design-literate human would: contrast, tap targets, type scale, colour discipline, scan
+> patterns, copy clarity, empty states, mobile layout. Every finding names the rule it broke, the
+> source file and line, the selector, and the exact change to make — and `verify_fix` re-checks that
+> one rule in about two seconds, so the agent can confirm its own fix landed instead of guessing.
+> Deterministic rules handle geometry and colour; an LLM judge reads the copy and the flow. The
+> capture runs locally against your own browser; grading runs server-side. macOS and Linux, x64 and
+> arm64 — no browser download, and no Node unless you install via npx.
+
+What earns its place, so an edit doesn't quietly lose it: "design review" rather than
+"accessibility" (the category is full of axe wrappers, and colour discipline / scan patterns / type
+scale are what none of them say); "comes back with the fix" in the FIRST clause, because that is the
+difference between a linter and something an agent can close a loop with; and `verify_fix` named with
+its duration, because "~2s single-rule re-check" is the detail that makes the loop believable.
 
 | Field | Value |
 | --- | --- |
@@ -139,15 +157,10 @@ copy and flow. macOS and Linux, x64 and arm64.
 | Licence | BUSL-1.1 |
 | Tools | `audit_url`, `verify_fix`, `ux_guidance`, `get_shot` |
 | Categories | developer tools, design, accessibility, testing |
+| Language / scope | Rust 🦀, local browser + hosted grading (🏠 ☁️), macOS + Linux |
+| Container | `Dockerfile` at the repo root — ships Chromium, verified to introspect AND audit |
 | Animated demo | https://raw.githubusercontent.com/uxlint-net/uxlint-cli/main/assets/demo.gif |
 | Video | https://uxlint.net/demo.webm |
-
-Listing copy to reuse verbatim:
-
-> **uxlint** — Audit any website's UX the way a design-literate reviewer would: contrast, tap targets,
-> type scale, colour discipline, copy clarity, scan patterns, resilience. Every finding comes back with
-> the rule it broke, the source line, the selector, and the exact fix — so an agent can apply it and
-> re-check until green. Runs against the Chrome you already have.
 
 ## 4. Before submitting anywhere
 
