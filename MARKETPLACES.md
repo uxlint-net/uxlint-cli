@@ -108,14 +108,39 @@ Two things that run will teach you the hard way:
 Each wants a form or a PR, and each takes minutes once the repo has a description, topics and a
 working install line (all now true):
 
-| Venue | How | Notes |
+| Venue | How | Status |
 | --- | --- | --- |
-| [Smithery](https://smithery.ai) | Connect the GitHub repo | Wants a runnable command; easiest after the npm wrapper |
-| [Glama](https://glama.ai/mcp/servers) | Crawls GitHub + accepts submissions | Ranks on repo quality — description/topics/licence now in place |
-| [PulseMCP](https://www.pulsemcp.com) | Submission form | Short description + categories |
-| [mcp.so](https://mcp.so) | Submission form | Same copy |
-| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | Follow their category conventions |
-| Cursor / VS Code / Windsurf docs | PR or form per editor | All assume a one-line command → npm wrapper first |
+| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | **PR #12229 open** (Developer Tools; agent-disclosed per their CONTRIBUTING, which fast-tracks those) |
+| [Glama](https://glama.ai/mcp/servers) | Crawls GitHub + accepts submissions | Should find us on its own now the repo is public, described and in the registry — check in a week, submit if not |
+| [Smithery](https://smithery.ai) | Connect the GitHub repo (OAuth) | **Needs you** — it's an account connect, not a form |
+| [PulseMCP](https://www.pulsemcp.com) | Submission form | **Needs you** — copy below |
+| [mcp.so](https://mcp.so) | Submission form | **Needs you** — copy below |
+| Cursor / VS Code / Windsurf docs | PR or form per editor | Not started |
+
+### Paste-ready copy
+
+**One line:** Design review for the UI your agent just wrote — every finding comes back with the fix.
+
+**Short (≤200 chars):** Audits any site's UX the way a design-literate reviewer would — contrast, tap
+targets, type scale, colour discipline, scan patterns — and returns a concrete fix for every finding.
+
+**Long:** An agent writes UI it cannot see. uxlint drives the Chrome you already have, captures what
+the page looks and reads like, and returns findings that name the rule, the source line, the selector
+and the exact change to make — plus `verify_fix`, a ~2s single-rule re-check, so the agent can confirm
+its own fix landed before moving on. Deterministic rules for geometry and colour; an LLM judge for
+copy and flow. macOS and Linux, x64 and arm64.
+
+| Field | Value |
+| --- | --- |
+| Install | `npx -y @uxlint-net/uxlint mcp` |
+| Registry name | `io.github.uxlint-net/uxlint` |
+| Repo | https://github.com/uxlint-net/uxlint-cli |
+| Homepage | https://uxlint.net |
+| Licence | BUSL-1.1 |
+| Tools | `audit_url`, `verify_fix`, `ux_guidance`, `get_shot` |
+| Categories | developer tools, design, accessibility, testing |
+| Animated demo | https://raw.githubusercontent.com/uxlint-net/uxlint-cli/main/assets/demo.gif |
+| Video | https://uxlint.net/demo.webm |
 
 Listing copy to reuse verbatim:
 
@@ -134,8 +159,8 @@ Listing copy to reuse verbatim:
 - [x] npm wrapper — published as `@uxlint-net/uxlint`, with SLSA provenance via npm Trusted
       Publishing (OIDC, no token anywhere)
 - [x] Listed in the official MCP Registry
-- [ ] A 30-second demo GIF: agent writes UI → audit_url → findings → fixes → green. Every directory
-      that allows an image converts better with one, and we don't have it.
+- [x] A demo GIF — 13.6s, 1200×606, 4.0MB, in `assets/demo.gif` and on the README; a 251KB webm
+      plays on /docs/mcp. Recorded from a real run (`demo/gif/` in the server repo drives it).
 
 ---
 
