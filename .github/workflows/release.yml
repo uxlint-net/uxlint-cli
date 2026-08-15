@@ -147,32 +147,41 @@ jobs:
   # drifted from the binary it fetches would make `npx uxlint@X` a lie, and /v1/me tells clients which
   # version to run. Skips itself (rather than failing the release) when NPM_TOKEN isn't configured, so
   # a fork or a repo without the secret still releases everything else.
+  # The npm face of the CLI: `npx uxlint mcp`. Published from CI with npm TRUSTED PUBLISHING — OIDC,
+  # no token. npm's own UI now warns against automation tokens, and it is right to: a publish token in
+  # repo secrets is a long-lived credential that anyone who can run a workflow can spend. With trusted
+  # publishing there is nothing to steal — npm checks that the request came from THIS repo and THIS
+  # workflow file, and mints provenance automatically.
+  #
+  # Bootstrap (once per package, because npm can only configure trust on a package that exists):
+  #   1. `just npm-publish <version>` locally, signed in — the only manual publish there will ever be
+  #   2. on npmjs.com → each package → Settings → Trusted Publishing → GitHub Actions:
+  #        repository `uxlint-net/uxlint-cli`, workflow `release.yml`
+  #   3. from then on, a tag publishes both packages and no secret exists to leak
   npm:
     if: always() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success')
     needs: publish
     runs-on: ubuntu-latest
-    # `--provenance` signs the package with a verifiable link back to this workflow run and this
-    # commit — the npm page then shows where the tarball came from, which for a launcher that
-    # downloads a binary is the whole trust story. It REQUIRES an OIDC token, and the workflow's
-    # top-level permissions don't grant one, so it is granted here rather than widened for every job.
     permissions:
-      id-token: write
+      id-token: write # the OIDC token trusted publishing authenticates with
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # Node 24 for npm >= 11.5.1, which is the floor for OIDC publishing. Asserted rather than
+      # assumed: an older npm doesn't fall back to something weaker, it just fails to authenticate,
+      # and the error doesn't say why.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "lts/*"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - name: Publish to npm
+      - name: Publish to npm (trusted publishing)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "NPM_TOKEN not set — skipping npm publish"; exit 0
-          fi
+          npm --version
+          node -e 'const [a,b,c]=require("child_process").execSync("npm --version").toString().trim().split(".").map(Number);
+            if (a<11 || (a===11 && (b<5 || (b===5 && c<1)))) { console.error("npm >= 11.5.1 required for OIDC publishing"); process.exit(1); }'
           # One definition of "publish the npm package", shared with the local `just npm-publish`:
           # both names, from one source, version taken from the TAG so the launcher can never
           # advertise a release it doesn't download.

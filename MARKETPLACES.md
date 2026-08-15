@@ -21,16 +21,22 @@ one-liner. Everything below is a way of working with that, and the ranked option
    hands over. Progress goes to stderr, because under `uxlint mcp` stdout is the JSON-RPC channel.
    Tested end to end against the real v0.1.26 release. This is what unlocks the registry's npm path,
    the editor one-liners, Smithery and most directory forms — they all assume `npx`.
-   **Publishing is CI's job**, not a laptop's: the release workflow publishes both names on every
-   `v*` tag, signed with npm provenance (a verifiable link from the tarball back to the workflow run
-   and commit that built it — which for a launcher that downloads a binary is the whole trust story).
-   Provenance needs an OIDC token, so it only works in CI; `just npm-publish` from a laptop still
-   works as break-glass, unsigned, and says so.
+   **Publishing is CI's job, with no token anywhere.** The release workflow publishes both names on
+   every `v*` tag using npm **trusted publishing**: GitHub mints an OIDC token, npm checks it came
+   from this repo and this workflow file, and generates provenance automatically — a verifiable link
+   from the tarball back to the run and commit that produced it, which for a launcher whose job is to
+   download a binary is the whole trust story. There is no `NPM_TOKEN` to leak, and npm's own UI now
+   warns against automation tokens for exactly that reason.
 
-   **Left to do, both one-time and neither of them a publish:** create the npm org (`npm org create
-   uxlint-net`) and add the token (`gh secret set NPM_TOKEN`). After that the first publish is a tag —
-   or a `workflow_dispatch` of the release workflow against the existing v0.1.26 tag, which republishes
-   nothing else.
+   **Bootstrap, once per package** (npm can only enable trust on a package that already exists):
+
+   1. create the org at <https://www.npmjs.com/org/create> — name `uxlint-net`, free "unlimited public
+      packages" plan (web-only; there is no `npm org create` command). Not needed for the unscoped
+      `uxlint`, only for the scoped twin.
+   2. `npm login` then `just npm-publish 0.1.26` — the only manual publish there will ever be.
+   3. on npmjs.com, for EACH package → Settings → Trusted Publishing → GitHub Actions:
+      repository `uxlint-net/uxlint-cli`, workflow `release.yml`.
+   4. from then on a tag publishes both, signed, with nothing to steal.
 
    **Names: both.** `just npm-publish <version>` publishes the same launcher as `uxlint` (the documented
    one-liner — the shortest command is the one every directory and blog post prints, so it has to be

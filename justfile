@@ -84,16 +84,15 @@ npm-publish version:
         fs.writeFileSync(p, JSON.stringify(j, null, "\t") + "\n");
       ' "$work/package.json" "$name" "$v"
       echo "→ publishing $name@$v" >&2
-      # Provenance signs the package with a verifiable link back to the workflow run that built it,
-      # and npm only issues that attestation inside a supported CI with an OIDC token. Asking for it
-      # from a laptop doesn't degrade — it FAILS — so it is requested only where it can be granted.
-      # CI is the normal path; a local publish is the break-glass one, and says so.
-      prov=(); [ -n "${CI:-}" ] && prov=(--provenance)
-      [ -n "${CI:-}" ] || echo "   (local publish: no provenance — CI publishes signed)" >&2
+      # No --provenance flag: under trusted publishing npm mints the attestation itself, and asking
+      # for it explicitly from a laptop FAILS rather than degrading (the signature needs an OIDC
+      # token only CI can get). CI is the normal path. A local run is the break-glass one — and the
+      # bootstrap one, since npm can only enable trusted publishing on a package that already exists.
+      [ -n "${CI:-}" ] || echo "   (local publish: unsigned — CI publishes with provenance)" >&2
       if [ -n "${DRY_RUN:-}" ]; then
-        (cd "$work" && npm publish --dry-run --access public "${prov[@]}" "${tag[@]}")
+        (cd "$work" && npm publish --dry-run --access public "${tag[@]}")
       else
-        (cd "$work" && npm publish --access public "${prov[@]}" "${tag[@]}")
+        (cd "$work" && npm publish --access public "${tag[@]}")
       fi
       rm -rf "$work"
     done
