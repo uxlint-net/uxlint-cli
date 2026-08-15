@@ -50,6 +50,31 @@ install: build-release
 run *args:
     cargo run -- {{args}}
 
+# Set the version everywhere it is claimed: the crate, the npm launcher, and the Claude Code plugin.
+#
+# Three files, one number, and each copy does real work at install time — the npm launcher downloads
+# `releases/download/v<its own version>/…`, and the plugin launcher installs exactly the version its
+# manifest names (that pin is what makes `/plugin update` update the CLI underneath). Editing them by
+# hand is how one gets left behind, so don't: `tests/version_pins.rs` fails when they disagree, and
+# this recipe is the way to make them agree.
+#
+#   just set-version 0.1.27
+[doc('Set the version in Cargo.toml, npm/package.json and the plugin manifest (they must match).')]
+[group('release')]
+set-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{version}}"; v="${v#v}"
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: $v" >&2; exit 1; }
+    # Cargo.toml: the FIRST `version =` only — that's [package]; a dependency's pin must not move.
+    sed -i "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
+    for f in npm/package.json plugin/.claude-plugin/plugin.json; do
+      sed -i "0,/\"version\": \".*\"/s//\"version\": \"$v\"/" "$f"
+    done
+    cargo update -p uxlint --precise "$v" >/dev/null 2>&1 || cargo check --quiet >/dev/null  # refresh Cargo.lock
+    echo "version → $v (Cargo.toml, npm/package.json, plugin manifest)"
+    cargo test --quiet --test version_pins
+
 # Publish the npm launcher — `npx -y @uxlint-net/uxlint mcp`, the one line every MCP directory and
 # editor snippet wants.
 #
