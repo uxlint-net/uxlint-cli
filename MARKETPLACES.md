@@ -117,22 +117,26 @@ working install line (all now true):
 | [mcp.so](https://mcp.so) | Submission form | **Needs you** — copy below |
 | Cursor / VS Code / Windsurf docs | PR or form per editor | Not started |
 
-### The licence grade is not fixable, and that's fine
+### The licence: BUSL → Apache-2.0 (2026-08-19)
 
-Glama grades us **F — license not found**. Not a malformed LICENSE file: GitHub's detector recognises
-exactly thirteen licences (AGPL-3.0, Apache-2.0, BSD-2/3-Clause, BSL-1.0 — that's *Boost* — CC0-1.0,
-EPL-2.0, GPL-2/3, LGPL-2.1, MIT, MPL-2.0, Unlicense) and no source-available one is among them, so
-`GET /repos/…` returns `NOASSERTION` for BUSL-1.1, SSPL and Elastic v2 alike. Every directory reading
-GitHub's licence field inherits that.
+Glama graded us **F — license not found**, and the diagnosis stands: GitHub's detector recognises
+exactly thirteen licences and no source-available one is among them, so its API returns
+`NOASSERTION` for BUSL-1.1, SSPL and Elastic v2 alike. Nothing in a repo changes that.
 
-So the only two fixes are: change the licence (no — it's a commercial decision worth more than one
-axis of one score), or get the directory to read declared package metadata instead. `Cargo.toml` and
-`npm/package.json` both declare `license = "BUSL-1.1"` precisely so a machine can learn it from us;
-asking Glama to fall back to that is a reasonable request and improves their product for every
-source-available server they index.
+We relicensed anyway — but NOT for the grade, which gates nothing (awesome-mcp-servers' check wants a
+Glama link and badge, and passed with the F showing). The reasons that hold on their own:
 
-Don't spend time on this again. The grades that move are quality (their container check) and
-maintenance (commit cadence).
+* the restriction was protecting the wrong asset. The rules, thresholds and judge are server-side and
+  private; this repo is a client that is inert without them. A competitor needs the part we don't
+  publish.
+* a non-OSI licence is friction exactly where we want none — the component people install, read and
+  vendor, and the one that corporate dependency policies and packaging channels filter on.
+* BUSL already named Apache-2.0 as its Change License for 2030-01-01. We arrived early rather than
+  changing direction.
+
+Clean to do: all 64 commits were one author, so there were no consents to gather. Releases up to
+v0.1.30 remain BUSL-1.1 as published; v0.1.31 onward are Apache-2.0. The F resolves on Glama's next
+crawl as a side effect, which is the right order of causes.
 
 ### Paste-ready copy
 
@@ -171,7 +175,7 @@ its duration, because "~2s single-rule re-check" is the detail that makes the lo
 | Registry name | `io.github.uxlint-net/uxlint` |
 | Repo | https://github.com/uxlint-net/uxlint-cli |
 | Homepage | https://uxlint.net |
-| Licence | BUSL-1.1 |
+| Licence | Apache-2.0 |
 | Tools | `audit_url`, `verify_fix`, `ux_guidance`, `get_shot` |
 | Categories | developer tools, design, accessibility, testing |
 | Language / scope | Rust 🦀, local browser + hosted grading (🏠 ☁️), macOS + Linux |

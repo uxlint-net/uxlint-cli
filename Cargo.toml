@@ -5,13 +5,10 @@
 
 [package]
 name = "uxlint"
-version = "0.1.30"
+version = "0.1.31"
 edition = "2021"
-# Machine-readable provenance. The licence in particular: GitHub's detector only knows the
-# choosealicense.com set, so a BUSL repo reports NOASSERTION and every tool that reads GitHub
-# concludes "no license" — declaring the SPDX id here is the one place a machine can learn it from us
-# rather than infer it from a text file it can't parse.
-license = "BUSL-1.1"
+# Machine-readable provenance, so a tool never has to infer any of it from a text file.
+license = "Apache-2.0"
 description = "Design review for the UI your agent just wrote — audits a site's UX and returns a concrete fix for every finding."
 repository = "https://github.com/uxlint-net/uxlint-cli"
 homepage = "https://uxlint.net"

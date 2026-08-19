@@ -201,7 +201,15 @@ uxlint server to talk to (the hosted one at `https://uxlint.net` by default, or 
 
 ## License
 
-Business Source License 1.1 (see `LICENSE`): source-available, converts to Apache-2.0 on the
-Change Date in the license file. In short: read it, audit it, build it from source, run it against
-your own or your clients' sites, contribute patches back. The one thing it restricts is standing
-up a competing hosted "audit my site" service on top of this code.
+Apache License 2.0 (see `LICENSE`). Read it, audit it, fork it, build it from source, ship it
+inside your own tooling — no conditions beyond the usual attribution and patent terms.
+
+This used to be the Business Source License, which converted to Apache-2.0 on a Change Date in
+2030; we've simply arrived early. The restriction it carried — no competing hosted "audit my site"
+service built on this code — was protecting the wrong thing: what's valuable is the rules, the
+calibrated thresholds and the judge, and those are server-side and not in this repo. What IS here is
+a client that needs a uxlint server to be worth anything, and a client is exactly the piece that
+should be frictionless to install, read and vendor.
+
+Releases up to and including **v0.1.30** were published under BUSL-1.1; **v0.1.31 onward** are
+Apache-2.0.

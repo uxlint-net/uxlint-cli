@@ -1,11 +1,11 @@
 {
 	"name": "uxlint",
 	"description": "Audit the UI you just built and fix it without leaving the agent — contrast, tap targets, type scale, copy, scan patterns, resilience — with the exact change to make for every finding.",
-	"version": "0.1.30",
+	"version": "0.1.31",
 	"author": { "name": "uxlint", "url": "https://uxlint.net" },
 	"homepage": "https://uxlint.net",
 	"repository": "https://github.com/uxlint-net/uxlint-cli",
-	"license": "BUSL-1.1",
+	"license": "Apache-2.0",
 	"keywords": ["ux", "design", "accessibility", "audit", "review", "frontend"],
 	"mcpServers": {
 		"uxlint": {
