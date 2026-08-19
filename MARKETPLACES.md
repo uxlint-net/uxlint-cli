@@ -117,6 +117,23 @@ working install line (all now true):
 | [mcp.so](https://mcp.so) | Submission form | **Needs you** — copy below |
 | Cursor / VS Code / Windsurf docs | PR or form per editor | Not started |
 
+### The licence grade is not fixable, and that's fine
+
+Glama grades us **F — license not found**. Not a malformed LICENSE file: GitHub's detector recognises
+exactly thirteen licences (AGPL-3.0, Apache-2.0, BSD-2/3-Clause, BSL-1.0 — that's *Boost* — CC0-1.0,
+EPL-2.0, GPL-2/3, LGPL-2.1, MIT, MPL-2.0, Unlicense) and no source-available one is among them, so
+`GET /repos/…` returns `NOASSERTION` for BUSL-1.1, SSPL and Elastic v2 alike. Every directory reading
+GitHub's licence field inherits that.
+
+So the only two fixes are: change the licence (no — it's a commercial decision worth more than one
+axis of one score), or get the directory to read declared package metadata instead. `Cargo.toml` and
+`npm/package.json` both declare `license = "BUSL-1.1"` precisely so a machine can learn it from us;
+asking Glama to fall back to that is a reasonable request and improves their product for every
+source-available server they index.
+
+Don't spend time on this again. The grades that move are quality (their container check) and
+maintenance (commit cadence).
+
 ### Paste-ready copy
 
 Written once, on purpose: a form under time pressure is where a product's description turns into
