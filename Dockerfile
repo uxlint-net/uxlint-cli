@@ -9,7 +9,8 @@
 # demo of nothing. Note what a container CAN'T reach: `--base http://localhost:5173` means localhost
 # INSIDE the container, so auditing an app on your own machine needs `--network host` (Linux) or
 # `host.docker.internal`. Public URLs work as-is.
-ARG UXLINT_VERSION=latest
+# Empty means the newest release. Set it to pin: --build-arg UXLINT_VERSION=v0.1.30
+ARG UXLINT_VERSION=
 
 FROM debian:bookworm-slim AS runtime
 ARG UXLINT_VERSION
@@ -25,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # source, so the binary in here is byte-identical to the one on your laptop.
 RUN curl -fsSL https://uxlint.net/install.sh \
     | env UXLINT_MANAGED=1 UXLINT_INSTALL_DIR=/usr/local/bin \
-      ${UXLINT_VERSION:+UXLINT_VERSION=$([ "$UXLINT_VERSION" = latest ] || echo "$UXLINT_VERSION")} sh \
+      ${UXLINT_VERSION:+UXLINT_VERSION=$UXLINT_VERSION} sh \
     && uxlint --version
 
 # headless_chrome finds the browser through CHROME; Debian puts it at /usr/bin/chromium.

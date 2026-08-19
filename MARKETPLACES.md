@@ -110,8 +110,8 @@ working install line (all now true):
 
 | Venue | How | Status |
 | --- | --- | --- |
-| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | **PR #12229 open** (Developer Tools; agent-disclosed per their CONTRIBUTING, which fast-tracks those) |
-| [Glama](https://glama.ai/mcp/servers) | Crawls GitHub + accepts submissions | Should find us on its own now the repo is public, described and in the registry — check in a week, submit if not |
+| [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) | PR adding one line | **PR #12229 open**, both bot requirements met (Glama listing + score badge). Agent-disclosed per their CONTRIBUTING, which fast-tracks those |
+| [Glama](https://glama.ai/mcp/servers) | Submit + a Dockerfile added on Glama | **LISTED** — https://glama.ai/mcp/servers/uxlint-net/uxlint-cli (id `bsva28107h`). Their gate is what made us build the container image; a listing here is a prerequisite for the awesome list |
 | [Smithery](https://smithery.ai) | Connect the GitHub repo (OAuth) | **Needs you** — it's an account connect, not a form |
 | [PulseMCP](https://www.pulsemcp.com) | Submission form | **Needs you** — copy below |
 | [mcp.so](https://mcp.so) | Submission form | **Needs you** — copy below |

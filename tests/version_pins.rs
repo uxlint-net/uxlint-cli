@@ -54,6 +54,14 @@ fn every_manifest_claims_the_crate_version() {
 /// `path_uxlint` optionally puts a `uxlint` of that version on PATH, to exercise the branch that
 /// decides between it and the pinned build.
 fn run_launcher(plugin_version: &str, path_uxlint: Option<&str>) -> (bool, String, String) {
+    run_launcher_opt(plugin_version, path_uxlint, false)
+}
+
+fn run_launcher_opt(
+    plugin_version: &str,
+    path_uxlint: Option<&str>,
+    pinned_missing: bool,
+) -> (bool, String, String) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -65,6 +73,7 @@ fn run_launcher(plugin_version: &str, path_uxlint: Option<&str>) -> (bool, Strin
                 .map(|v| format!("-path{v}"))
                 .unwrap_or_default()
                 .as_str()
+            + if pinned_missing { "-nopin" } else { "" }
     ));
     let _ = fs::remove_dir_all(&tmp);
     let (root, data, fakebin) = (tmp.join("root"), tmp.join("data"), tmp.join("bin"));
@@ -82,9 +91,19 @@ fn run_launcher(plugin_version: &str, path_uxlint: Option<&str>) -> (bool, Strin
         fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
     };
     // Stands in for the release download: writes a `uxlint` that reports where it came from.
+    // `pinned_missing` makes the installer refuse a PINNED version and accept an unpinned one — what
+    // the release channel looks like in the minutes between a version bump merging and its binaries
+    // finishing their build.
+    let refuse = if pinned_missing {
+        "if [ -n \"${UXLINT_VERSION:-}\" ]; then echo 'no such release' >&2; exit 1; fi\n"
+    } else {
+        ""
+    };
     exe(
         &fakebin.join("curl"),
-        "#!/usr/bin/env bash\ncat <<'INSTALLER'\nmkdir -p \"$UXLINT_INSTALL_DIR\"\nprintf '#!/usr/bin/env bash\\necho ran=pinned version=%s args=\"$*\"\\n' \"$UXLINT_VERSION\" > \"$UXLINT_INSTALL_DIR/uxlint\"\nchmod +x \"$UXLINT_INSTALL_DIR/uxlint\"\nINSTALLER\n",
+        &format!(
+            "#!/usr/bin/env bash\ncat <<'INSTALLER'\n{refuse}mkdir -p \"$UXLINT_INSTALL_DIR\"\nprintf '#!/usr/bin/env bash\\necho ran=%s version=%s args=\"$*\"\\n' \"$([ -n \"${{UXLINT_VERSION:-}}\" ] && echo pinned || echo fallback)\" \"${{UXLINT_VERSION:-latest}}\" > \"$UXLINT_INSTALL_DIR/uxlint\"\nchmod +x \"$UXLINT_INSTALL_DIR/uxlint\"\nINSTALLER\n"
+        ),
     );
     if let Some(v) = path_uxlint {
         exe(
@@ -150,5 +169,26 @@ fn a_stale_uxlint_on_path_does_not_shadow_the_pinned_build() {
     assert!(
         out.contains("ran=path"),
         "a newer PATH build should be used as-is: {out}{err}"
+    );
+}
+
+#[test]
+fn a_version_whose_release_isnt_published_yet_still_starts() {
+    // The marketplace serves the plugin manifest from `main`, so the moment a version bump merges it
+    // advertises a version whose binaries are still building — a few minutes per release in which a
+    // first install would otherwise just fail. It falls back to the newest release and says so; the
+    // pinned path is tried first on every later start, so it self-heals when the release lands.
+    let (ok, out, err) = run_launcher_opt("9.9.9", None, true);
+    assert!(
+        ok,
+        "the launcher must not die when the pin isn't published: {err}"
+    );
+    assert!(
+        out.contains("ran=fallback"),
+        "it should fall back to the newest release: {out}{err}"
+    );
+    assert!(
+        err.contains("isn't published yet"),
+        "and say plainly that it did: {err}"
     );
 }
