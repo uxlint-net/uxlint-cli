@@ -85,6 +85,23 @@ pub(crate) fn detect_auth_block(tab: &headless_chrome::Tab, requested_route: &st
         || (pw && !loginish(&requested))
 }
 
+/// How long to wait before re-capturing a page that rendered nothing. Long enough for a framework's
+/// auth check to return and its redirect to run; short enough that a genuinely blank page costs
+/// almost nothing (it is one retry, not a poll).
+pub(crate) const RECAPTURE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Did the collector come back with a page that hasn't drawn yet?
+///
+/// A real page always has elements — even a 404 has a heading. Zero means we photographed a single-
+/// page app mid-boot, which is worse than useless: the lints see an empty document and report a page
+/// as audited when nothing was there.
+pub(crate) fn capture_looks_unrendered(snap: &Value) -> bool {
+    let count = snap["count"]
+        .as_u64()
+        .unwrap_or_else(|| snap["elements"].as_array().map_or(0, |a| a.len() as u64));
+    count == 0
+}
+
 /// Cap on how long any single navigation may block before it's skipped — a hung route
 /// (SSE, never-settling fetch, redirect loop) must not stall the whole audit.
 pub(crate) const NAV_TIMEOUT_SECS: u64 = 25;
@@ -1271,6 +1288,29 @@ pub(crate) fn audit_route(
         return Ok(None);
     };
     let mut snapshot: Value = serde_json::from_str(&snap_json)?;
+    // An EMPTY capture is never a real page — it's a single-page app photographed before it rendered.
+    // The settle budget is ~700ms, and a framework that boots, checks auth over the network and then
+    // client-side redirects can blow straight through that: we recorded worldbuilding.dev/dashboard
+    // with ZERO elements and auth_blocked=false, i.e. "audited, found nothing" about a page that had
+    // not drawn yet and was about to bounce to /login. One retry costs a second and a half on a page
+    // that was worthless anyway, and it lets the auth check below see where the app actually went.
+    if capture_looks_unrendered(&snapshot) {
+        std::thread::sleep(RECAPTURE_DELAY);
+        if let Ok(Some(Value::String(again))) = tab.evaluate(ctx.collector, false).map(|r| r.value)
+        {
+            if let Ok(v2) = serde_json::from_str::<Value>(&again) {
+                if !capture_looks_unrendered(&v2) {
+                    note!(
+                        ctx.progress,
+                        "  {} {route} … nothing rendered at first, re-captured after {}ms",
+                        ctx.name,
+                        RECAPTURE_DELAY.as_millis()
+                    );
+                    snapshot = v2;
+                }
+            }
+        }
+    }
     // Layout skeleton for the archetype lint — a compact geometry-based map of the page's semantic
     // layout. Best-effort: a page that trips the extractor simply gets no skeleton.
     if let Ok(Some(Value::String(skel))) = tab.evaluate(LAYOUT_SKELETON_JS, false).map(|r| r.value)
@@ -1768,5 +1808,29 @@ mod partial_state_progress_tests {
             ps.dirty.swap(false, std::sync::atomic::Ordering::Relaxed),
             "note_walk_done must mark dirty"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_retry_tests {
+    use super::capture_looks_unrendered;
+    use serde_json::json;
+
+    #[test]
+    fn a_page_with_no_elements_is_not_a_page() {
+        // The shape that produced "audited, no findings" for an app that hadn't drawn yet.
+        assert!(capture_looks_unrendered(
+            &json!({"count": 0, "elements": []})
+        ));
+        assert!(capture_looks_unrendered(&json!({"elements": []})));
+    }
+
+    #[test]
+    fn anything_that_rendered_is_left_alone() {
+        // Even one element means the page drew something; re-capturing would just cost time.
+        assert!(!capture_looks_unrendered(&json!({"count": 1})));
+        assert!(!capture_looks_unrendered(
+            &json!({"elements": [{"tag": "h1"}]})
+        ));
     }
 }
