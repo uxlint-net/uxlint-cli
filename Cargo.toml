@@ -5,7 +5,7 @@
 
 [package]
 name = "uxlint"
-version = "0.1.32"
+version = "0.1.33"
 edition = "2021"
 # Machine-readable provenance, so a tool never has to infer any of it from a text file.
 license = "Apache-2.0"

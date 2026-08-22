@@ -377,9 +377,16 @@ pub(crate) struct AuditArgs {
     /// Check a SINGLE rule and turn the exit code into a pass/fail for it: 0 = clear, 1 = still
     /// fires. Scopes the printed output to just that rule and skips the goal-walk tests (they're
     /// irrelevant to one lint). This is the tight "did my fix land?" loop — pair with
-    /// `--routes /pricing --crawl 0` to check one page in ~2s. e.g. `--rule contrast`.
+    /// `--routes /pricing --crawl 0` to check a single page instead of the whole site.
+    /// e.g. `--rule contrast`.
     #[arg(long)]
     pub(crate) rule: Option<String>,
+    /// Limit FIX PREVIEWS to one rule, without narrowing what the audit reports. `verify_fix` uses
+    /// it: the check still names every other deterministic finding on the page (its regression
+    /// guard), but only the rule you asked about is worth re-screenshotting — previews are the
+    /// audit's bottleneck, and doing all of them turned a re-check into a 43-second wait.
+    #[arg(skip)]
+    pub(crate) preview_rule: Option<String>,
     /// Declare the site type (e.g. "saas") — overrides uxlint.toml site_type. Drives
     /// type-specific lints like pricing-page-missing.
     #[arg(long = "site-type")]

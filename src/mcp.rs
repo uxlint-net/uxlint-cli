@@ -753,7 +753,13 @@ impl UxlintMcp {
             slow_network: false,
             timeout: None,
             fix_plan: false,
-            no_previews: true,
+            // Previews ON, same as a hand-run audit. They cost real time — measured at 13.7s → 42.8s
+            // on a one-page audit — and the AGENT reads text, so this looks like pure overhead from
+            // the tool's side. It isn't: the report we hand the user is the artifact they open, and a
+            // finding with a before/after crop is the fastest way for either of them to see what it
+            // means. An audit whose report looks different depending on who ran it is the kind of
+            // inconsistency nobody remembers when the screenshots are missing months later.
+            no_previews: false,
             // Judge/tests default ON (an agent auditing its own UI wants the full picture),
             // but both are switchable so the fast deterministic pass I reach for is one call.
             no_judge: !a.judge.unwrap_or(true),
@@ -761,6 +767,8 @@ impl UxlintMcp {
             // parallel; `tests:false` forces them off entirely for speed.
             no_tests: !a.tests.unwrap_or(true),
             rule: None,
+            preview_rule: None, // a full audit previews every finding
+
             site_type: None,
             org: None,
             site: None,
@@ -1106,7 +1114,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "After editing to fix a finding, re-check ONE rule on ONE page — the fast (~2s) 'did my fix land?' loop, no full re-audit. Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url."
+        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url."
     )]
     async fn verify_fix(
         &self,
@@ -1127,13 +1135,22 @@ impl UxlintMcp {
             states: a.states.unwrap_or(false),
             crawl: 1,
             rule: None,
+            // Crops scoped to the rule under test; the audit still reports everything it finds on
+            // the page, which is what makes the regression guard work.
+            preview_rule: Some(rule.clone()),
+
             parallel: None,
             probe_errors: false,
             resilience: false,
             slow_network: false,
             timeout: None,
             fix_plan: false,
-            no_previews: true,
+            // Previews here too: a re-check writes a report like any other audit, and a report whose
+            // screenshots depend on which tool produced it is a trap for whoever opens it later.
+            // It costs seconds the tight fix loop used to save (measured 14s → 29s on a page with
+            // seven contrast instances), which is why `preview_rule` scopes the crops to the rule
+            // under test. The stale "~2s" the description used to promise was never true anyway.
+            no_previews: false,
             no_judge: true,
             no_tests: true,
             site_type: None,
