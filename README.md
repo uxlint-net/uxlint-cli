@@ -124,7 +124,7 @@ a sign-in link that mints and saves the token for you (`UXLINT_API_KEY` is for C
 browser).
 
 Five tools: `audit_url` (full audit, graded verdict + action plan), `verify_fix` (recheck one rule
-on one page after an edit, ~2s), `get_shot` (fetch a finding's annotated screenshot),
+on one page after an edit), `get_shot` (fetch a finding's annotated screenshot),
 `ux_guidance` (best-practice guidance to read *before* building UI), and `lint_feedback` — opt-in
 and off by default (§ Privacy) — one tool for three kinds of signal: whether a finding was useful,
 a lint uxlint is missing, or a component library it didn't recognise. The agent audits, reads the

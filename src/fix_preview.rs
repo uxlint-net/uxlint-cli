@@ -478,6 +478,16 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
             .unwrap_or(&[])
         {
             let rule = f["rule"].as_str().unwrap_or("");
+            // A single-rule run (`--rule`, and every `verify_fix` call) previews THAT rule only.
+            // Screenshots are the audit's bottleneck, and re-capturing the whole page's findings to
+            // answer "did my contrast fix land?" turned a 2s check into 43s — twenty times slower on
+            // the loop an agent runs after every edit. The rule you asked about still gets its crop,
+            // which is the one anybody looks at.
+            if let Some(only) = args.preview_rule.as_deref().or(args.rule.as_deref()) {
+                if !only.is_empty() && rule != only {
+                    continue;
+                }
+            }
             if let Some(fx) = make_fix(route, vp, rule, &f["rect"], f.get("marks"), f.get("sel")) {
                 if seen_keys.insert(fx.key.clone()) {
                     fixes.push(fx);
