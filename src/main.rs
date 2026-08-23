@@ -117,6 +117,13 @@ enum Cmd {
         /// it falls back to uxlint.toml's `base`.
         #[arg(long)]
         base: Option<String>,
+        /// Offer the uxlint-staff tools (`get_feedback` — the lint-feedback trend digest). Off by
+        /// default, and purely a VISIBILITY switch: the server checks the admin role on every call,
+        /// so passing this on an ordinary account just yields a tool that answers "admin only".
+        /// Kept out of the default tool list because a tool nobody can call is noise in everyone
+        /// else's, and it advertises a staff surface to accounts that have no business seeing it.
+        #[arg(long, env = "UXLINT_ADMIN_TOOLS")]
+        admin: bool,
     },
     /// Re-audit a past report's site and show what changed: fixed, new/regressed, still open
     Diff {
@@ -542,8 +549,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mcp { action, base } => match action {
-            None => run_mcp(&cli, base.clone()),
+        Cmd::Mcp {
+            action,
+            base,
+            admin,
+        } => match action {
+            None => run_mcp(&cli, base.clone(), *admin),
             Some(McpCmd::Install { tool, name }) => mcp_install::install(tool.as_deref(), name),
             Some(McpCmd::Uninstall { tool, name }) => mcp_install::uninstall(tool.as_deref(), name),
         },
