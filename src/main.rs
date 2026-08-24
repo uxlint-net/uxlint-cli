@@ -117,12 +117,25 @@ enum Cmd {
         /// it falls back to uxlint.toml's `base`.
         #[arg(long)]
         base: Option<String>,
-        /// Offer the uxlint-staff tools (`get_feedback` — the lint-feedback trend digest). Off by
-        /// default, and purely a VISIBILITY switch: the server checks the admin role on every call,
-        /// so passing this on an ordinary account just yields a tool that answers "admin only".
+        /// Offer the uxlint-staff tools (`get_feedback` — the lint-feedback trend digest — and
+        /// `archive_feedback`, which closes what you triaged). Off by default, and purely a
+        /// VISIBILITY switch: the server checks the admin role on every call, so passing this on an
+        /// ordinary account just yields a tool that answers "admin only".
         /// Kept out of the default tool list because a tool nobody can call is noise in everyone
         /// else's, and it advertises a staff surface to accounts that have no business seeing it.
-        #[arg(long, env = "UXLINT_ADMIN_TOOLS")]
+        ///
+        /// FalseyValueParser, not clap's default bool, so the documented env form actually works:
+        /// a plain `env = ...` on a flag accepts only `true`/`false` and makes the whole CLI exit
+        /// with "invalid value '1'" — `UXLINT_ADMIN_TOOLS=1` (what every doc and MCP config writes)
+        /// killed the server at startup rather than turning a tool on. It also reads an EMPTY value
+        /// as off, for the same reason `normalise_key` does: an unset CI secret expands to "", and
+        /// that must mean "not set", not a parse error.
+        #[arg(
+            long,
+            env = "UXLINT_ADMIN_TOOLS",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::FalseyValueParser::new(),
+        )]
         admin: bool,
     },
     /// Re-audit a past report's site and show what changed: fixed, new/regressed, still open
@@ -654,6 +667,65 @@ mod key_tests {
         assert_eq!(
             normalise_key(Some("uxt_abc123".into())),
             Some("uxt_abc123".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_switch_tests {
+    use clap::Parser;
+    use std::sync::Mutex;
+
+    /// The env var is process-global and clap reads the real environment, so the cases take turns.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    /// Parse `uxlint mcp` with `UXLINT_ADMIN_TOOLS` set to `value` — the exact path an MCP config
+    /// takes — and report whether the staff tools would be offered (`Err` = the CLI refused to
+    /// start at all).
+    fn admin_from_env(value: &str) -> Result<bool, String> {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("UXLINT_ADMIN_TOOLS", value);
+        let parsed = super::Cli::try_parse_from(["uxlint", "mcp"]);
+        std::env::remove_var("UXLINT_ADMIN_TOOLS");
+        match parsed {
+            Ok(super::Cli {
+                cmd: super::Cmd::Mcp { admin, .. },
+                ..
+            }) => Ok(admin),
+            Ok(_) => panic!("`uxlint mcp` parsed as something else"),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// `UXLINT_ADMIN_TOOLS=1` is the form CLAUDE.md, the tool descriptions and every MCP config
+    /// write — and a bare `env = ...` on a bool flag accepts only `true`/`false`, so `=1` didn't
+    /// merely fail to offer `get_feedback`/`archive_feedback`: the CLI exited with
+    /// "invalid value '1' for --admin" and the MCP server never started.
+    #[test]
+    fn the_documented_env_form_turns_the_staff_tools_on() {
+        for on in ["1", "true", "yes", "on"] {
+            assert_eq!(admin_from_env(on), Ok(true), "{on} must enable --admin");
+        }
+    }
+
+    #[test]
+    fn off_and_an_unset_ci_secret_leave_them_hidden() {
+        // "" is what an unset `UXLINT_ADMIN_TOOLS: ${{ secrets.… }}` expands to: absent, not a
+        // parse error — the same rule `normalise_key` applies to an empty API key.
+        for off in ["0", "false", "no", "off", ""] {
+            assert_eq!(admin_from_env(off), Ok(false), "{off:?} must leave it off");
+        }
+    }
+
+    /// The flag half of the same switch, so a refactor can't quietly cost us the CLI form.
+    #[test]
+    fn the_flag_still_works_on_its_own() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("UXLINT_ADMIN_TOOLS");
+        let cli = super::Cli::try_parse_from(["uxlint", "mcp", "--admin"]).expect("parses");
+        assert!(
+            matches!(cli.cmd, super::Cmd::Mcp { admin: true, .. }),
+            "`uxlint mcp --admin` sets it"
         );
     }
 }
