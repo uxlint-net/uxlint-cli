@@ -581,6 +581,56 @@ struct GetShotArgs {
     screenshot_url: String,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct GetFeedbackArgs {
+    /// How far back to look, and the size of the window it is compared against: `7d`, `14d`
+    /// (default), `30d`, `90d`, or `all`.
+    #[serde(default)]
+    window: Option<String>,
+    /// A `cursor` from a previous call — returns only what has changed since then, still measured
+    /// against the same-length window before it. This is how you keep a running watch without
+    /// re-reading everything you have already triaged.
+    #[serde(default)]
+    since: Option<String>,
+    /// One rule name, for its full pushback prose and the elements it hit. Omit for the digest.
+    #[serde(default)]
+    rule: Option<String>,
+    /// How many rules the digest lists (default 10, max 50). Whatever it hides is counted in the
+    /// footer, never dropped silently.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Show complaints that have already been archived as well — the audit view for "what is the
+    /// archive currently hiding?", and the way to find an entry that was recorded wrongly.
+    #[serde(default)]
+    include_archived: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ArchiveFeedbackArgs {
+    /// The rule whose complaints you have dealt with.
+    rule: String,
+    /// The exact reason text as `get_feedback` printed it — closes just that complaint. Omit to close
+    /// EVERY complaint on the rule, which is a much bigger claim: only do it when you have read them.
+    #[serde(default)]
+    reason: Option<String>,
+    /// What was done: `fixed` (the rule was wrong and now isn't), `wont_fix` (the rule is right on
+    /// that element after all), `retired` (the rule is gone).
+    #[serde(default)]
+    outcome: Option<String>,
+    /// What you actually did — which guard you added and where, or why the rule is right after all.
+    /// Required, and held to a real sentence: in aggregate these notes are the changelog of why each
+    /// lint looks the way it does.
+    #[serde(default)]
+    note: Option<String>,
+    /// Close complaints up to this instant (default: now). Anything filed later stays live.
+    #[serde(default)]
+    through: Option<String>,
+    /// Undo instead: remove the archive entries for this rule (and `reason`, if given), putting those
+    /// complaints back in the digest.
+    #[serde(default)]
+    revert: Option<bool>,
+}
+
 /// Resolve the base URL for a tool call: an explicit per-call `base` wins (a blank one is treated as
 /// absent), then the server's launch `--base` (`default_base`), then empty — and an empty base lets
 /// `run_audit` fall back to the uxlint.toml `base`. Shared by audit_url and verify_fix so the
@@ -615,7 +665,7 @@ pub(crate) struct UxlintMcp {
 
 #[tool_router(router = tool_router)]
 impl UxlintMcp {
-    fn new(cli: Arc<Cli>, default_base: Option<String>) -> Self {
+    fn new(cli: Arc<Cli>, default_base: Option<String>, admin_tools: bool) -> Self {
         let feedback_enabled = crate::project::project_feedback_enabled();
         // Did the credential come from --api-key/UXLINT_API_KEY, or from the file `uxlint auth login`
         // writes? main.rs falls back to the file, so "differs from the file" IS the explicit case —
@@ -632,6 +682,12 @@ impl UxlintMcp {
             // NOT the fn name — a stale "feedback" here would silently no-op and EXPOSE the tool to a
             // project that never opted in.
             tool_router.remove_route("lint_feedback");
+        }
+        // Same mechanism, different switch: the staff digest is absent from `list_tools` AND
+        // rejected by `call_tool` on any launch that didn't ask for it.
+        if !admin_tools {
+            tool_router.remove_route("get_feedback");
+            tool_router.remove_route("archive_feedback");
         }
         Self {
             cli,
@@ -1389,6 +1445,161 @@ impl UxlintMcp {
         }
     }
 
+    // uxlint STAFF only, and absent from the router unless the server was launched with `--admin`
+    // (`UXLINT_ADMIN_TOOLS=1`) — the same `remove_route` mechanism `lint_feedback` uses, so the tool
+    // is hidden from `list_tools` AND rejected by `call_tool` with no second enforcement point. The
+    // flag is only about VISIBILITY: the server checks the admin role on every call, so a
+    // non-staff account that passes the flag gets a tool that politely says no.
+    #[tool(
+        name = "get_feedback",
+        description = "uxlint STAFF: read what has CHANGED in the lint feedback other agents and users are filing on uxlint's own rules — not the whole log.\n\nReturns a ranked digest for a window compared against the window before it: rules that started drawing pushback, rules drawing MORE of it, rules that went quiet after a guard shipped, each with this window's deduped reasons (the same sentence from five agents is one bug with a count of five), plus any new lint suggestions. Harmful verdicts — where acting on one of our findings made a real site worse — are always shown in full, first, whatever the limit.\n\nUSE IT: at the start of a lint-tuning session, to decide where the hour goes; after shipping a guard, to confirm the pushback actually stopped.\n\nARGS: `window` (7d / 14d default / 30d / all) · `rule=<name>` for one rule's full prose and the elements it hit · `limit` for how many rules the digest lists (what it hides is counted, never dropped silently) · `since=<cursor from a previous response>` for only what has changed since — the digest ends with the cursor to use next · `include_archived=true` to also see complaints already closed by archive_feedback.\n\nNOTE the counts say a rule is disputed; only the reasons say what to change. A complaint older than the rule's last edit may already be answered — the digest's footer names the command that checks. And when you HAVE dealt with one, call archive_feedback: that is the only thing that closes a feedback row, and anything you leave open comes back at you next window as if it were new."
+    )]
+    async fn get_feedback(
+        &self,
+        Parameters(a): Parameters<GetFeedbackArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.call_cli().api_key.is_none() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                signup_hint(&self.cli.server),
+            )]));
+        }
+        let cli = self.call_cli();
+        let result = tokio::task::spawn_blocking(move || {
+            let server = cli.server.trim_end_matches('/').to_string();
+            let mut q: Vec<String> = Vec::new();
+            let mut add = |k: &str, v: Option<&str>| {
+                if let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) {
+                    q.push(format!("{k}={}", pct(v)));
+                }
+            };
+            add("window", a.window.as_deref());
+            add("since", a.since.as_deref());
+            add("rule", a.rule.as_deref());
+            let limit = a.limit.map(|n| n.to_string());
+            add("limit", limit.as_deref());
+            if a.include_archived.unwrap_or(false) {
+                q.push("include_archived=true".to_string());
+            }
+            let query = if q.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", q.join("&"))
+            };
+            let resp = reqwest::blocking::Client::new()
+                .get(format!("{server}/v1/lints/feedback/trends{query}"))
+                .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
+                .send();
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: Value = r
+                        .json()
+                        .map_err(|e| format!("could not read the digest: {e}"))?;
+                    // The server renders the page (one ranking, one place); the structured arrays
+                    // ride in the same body for anything that needs to compute on them. Falling
+                    // back to the raw JSON keeps an older/newer server readable rather than blank.
+                    Ok(v["report"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| serde_json::to_string_pretty(&v).unwrap_or_default()))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    Err(credential_rejected(&cli.server))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => Err(format!(
+                    "the lint-feedback digest is uxlint staff only — {server} says this account \
+                     doesn't have the admin role. Nothing is wrong with your setup; this tool is \
+                     simply not for this account."
+                )),
+                Ok(r) => Err(failure_text(r)),
+                Err(e) => Err(format!("could not reach {server}: {e}")),
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("get_feedback task panicked: {e}"), None))?;
+        // Both arms are text for the agent to read — a refusal it can act on beats a protocol error.
+        let text = match result {
+            Ok(t) | Err(t) => t,
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    // The write half of the staff loop, behind the same `--admin` switch as `get_feedback`.
+    #[tool(
+        name = "archive_feedback",
+        description = "uxlint STAFF: close a lint complaint you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes a feedback row. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT complaint; omitting `reason` closes every complaint on the rule, which is a much bigger claim — only do it when you have read them all. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
+    )]
+    async fn archive_feedback(
+        &self,
+        Parameters(a): Parameters<ArchiveFeedbackArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.call_cli().api_key.is_none() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                signup_hint(&self.cli.server),
+            )]));
+        }
+        let cli = self.call_cli();
+        let result = tokio::task::spawn_blocking(move || {
+            let server = cli.server.trim_end_matches('/').to_string();
+            let revert = a.revert.unwrap_or(false);
+            let body = json!({
+                "rule": a.rule,
+                "reason": a.reason.unwrap_or_default(),
+                "outcome": a.outcome.unwrap_or_default(),
+                "note": a.note.unwrap_or_default(),
+                "through": a.through.unwrap_or_default(),
+                "revert": revert,
+            });
+            let resp = reqwest::blocking::Client::new()
+                .post(format!("{server}/v1/lints/feedback/archive"))
+                .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
+                .json(&body)
+                .send();
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: Value = r
+                        .json()
+                        .map_err(|e| format!("could not read the response: {e}"))?;
+                    if revert {
+                        return Ok(format!(
+                            "reverted {} archive entr{} on {} — those complaints are back in the digest.",
+                            v["reverted"].as_i64().unwrap_or(0),
+                            if v["reverted"].as_i64() == Some(1) { "y" } else { "ies" },
+                            v["rule"].as_str().unwrap_or("?")
+                        ));
+                    }
+                    // Report the COUNT back: a caller that meant to close one reason and closed the
+                    // whole rule finds out here, not by the digest quietly going empty.
+                    Ok(format!(
+                        "archived {} verdict{} on {} as {} ({} scope). Anything filed after now stays \
+                         live — including this same complaint if it comes back.",
+                        v["archived"].as_i64().unwrap_or(0),
+                        if v["archived"].as_i64() == Some(1) { "" } else { "s" },
+                        v["rule"].as_str().unwrap_or("?"),
+                        v["outcome"].as_str().unwrap_or("?"),
+                        v["scope"].as_str().unwrap_or("?"),
+                    ))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    Err(credential_rejected(&cli.server))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => Err(format!(
+                    "archiving lint feedback is uxlint staff only — {server} says this account \
+                     doesn't have the admin role."
+                )),
+                Ok(r) => Err(failure_text(r)),
+                Err(e) => Err(format!("could not reach {server}: {e}")),
+            }
+        })
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("archive_feedback task panicked: {e}"), None)
+        })?;
+        let text = match result {
+            Ok(t) | Err(t) => t,
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
     #[tool(
         description = "Best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
     )]
@@ -1536,7 +1747,7 @@ Loop until green."));
 // Newline-delimited JSON-RPC over stdio, via the official rmcp async server. One tool set:
 // audit_url and friends. This is how a coding agent gets design taste: call the tool, read the
 // findings, apply the fixes, call again until green.
-pub(crate) fn run_mcp(cli: &Cli, base: Option<String>) -> anyhow::Result<()> {
+pub(crate) fn run_mcp(cli: &Cli, base: Option<String>, admin_tools: bool) -> anyhow::Result<()> {
     let cli = Arc::new(cli.clone());
     // A blank `--base ""` is the same as not passing one (fall through to per-call / uxlint.toml).
     let base = base.filter(|b| !b.trim().is_empty());
@@ -1544,7 +1755,9 @@ pub(crate) fn run_mcp(cli: &Cli, base: Option<String>) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let service = UxlintMcp::new(cli, base).serve(stdio()).await?;
+        let service = UxlintMcp::new(cli, base, admin_tools)
+            .serve(stdio())
+            .await?;
         service.waiting().await?;
         Ok::<_, anyhow::Error>(())
     })
@@ -1788,5 +2001,82 @@ mod resolve_base_tests {
         // run_audit reads an empty base as "use uxlint.toml's base".
         assert_eq!(resolve_base(None, None), "");
         assert_eq!(resolve_base(Some(String::new()), None), "");
+    }
+}
+
+#[cfg(test)]
+mod admin_tool_tests {
+    use super::UxlintMcp;
+    use crate::Cli;
+    use clap::Parser;
+    use std::sync::Arc;
+
+    fn router_offers(tool: &str, admin: bool) -> bool {
+        let cli = Arc::new(Cli::parse_from(["uxlint", "mcp"]));
+        UxlintMcp::new(cli, None, admin).tool_router.has_route(tool)
+    }
+
+    /// The staff digest reads OTHER accounts' pushback, so it is not part of the tool set an ordinary
+    /// project gets. `remove_route` is the single enforcement point — it hides the tool from
+    /// `list_tools` and rejects `call_tool` — so this pins the switch that drives it. (The server
+    /// still checks the admin role on every call; this only decides whether the tool is offered.)
+    #[test]
+    fn the_staff_digest_is_absent_unless_the_launch_asked_for_it() {
+        for tool in ["get_feedback", "archive_feedback"] {
+            assert!(
+                !router_offers(tool, false),
+                "a default launch must not advertise {tool}"
+            );
+            assert!(
+                router_offers(tool, true),
+                "`uxlint mcp --admin` (UXLINT_ADMIN_TOOLS=1) offers {tool}"
+            );
+        }
+    }
+
+    /// Every argument these tools' descriptions tell an agent to pass must actually be IN the schema.
+    /// A missing one is not an error at any layer: the arg is dropped on the floor, the call succeeds,
+    /// and the answer is quietly the default. `include_archived` shipped that way for exactly one
+    /// build, which is what this test is here to stop happening twice.
+    #[test]
+    fn the_staff_tools_accept_every_argument_they_advertise() {
+        let cli = Arc::new(Cli::parse_from(["uxlint", "mcp"]));
+        let tools = UxlintMcp::new(cli, None, true).tool_router.list_all();
+        for (name, args) in [
+            (
+                "get_feedback",
+                &["window", "since", "rule", "limit", "include_archived"][..],
+            ),
+            (
+                "archive_feedback",
+                &["rule", "reason", "outcome", "note", "through", "revert"][..],
+            ),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            let schema = serde_json::to_string(&tool.input_schema).expect("schema serializes");
+            for arg in args {
+                assert!(
+                    schema.contains(&format!("\"{arg}\"")),
+                    "{name} advertises `{arg}` but its schema doesn't accept it: {schema}"
+                );
+            }
+        }
+    }
+
+    /// The switch is about ONE tool. A stale name in `remove_route` fails silently (it just doesn't
+    /// match), so the way that bug shows up is the wrong tool disappearing — pin the rest as present.
+    #[test]
+    fn the_everyday_tools_are_untouched_by_the_switch() {
+        for tool in ["audit_url", "verify_fix", "get_shot", "ux_guidance"] {
+            for admin in [false, true] {
+                assert!(
+                    router_offers(tool, admin),
+                    "{tool} must survive admin={admin}"
+                );
+            }
+        }
     }
 }

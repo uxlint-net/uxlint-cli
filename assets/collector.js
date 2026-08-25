@@ -719,6 +719,38 @@ function collectSnapshot() {
 		return out;
 	})();
 
+	// A dialog is a BEHAVIOUR, not a word. `widgetGuess` used to call anything fixed/absolute whose
+	// class or id contained "modal", "dialog" or "drawer" a dialog — so the day a design-token rename
+	// put "drawer" into an always-visible sidebar's utility classes, an <aside> that never opens or
+	// closes began reporting as a role-less modal (from the field, 2026-08-23). Announcing a dialog
+	// that never opens is worse for a screen-reader user than announcing nothing at all.
+	//
+	// Two corroborations, both cheap. A LANDMARK is never a dialog: `aside` already carries the right
+	// role, and no author writes their modal as the page's complementary region. And the NAME has to
+	// be backed by something that DISMISSES the thing, which every real modal has and persistent
+	// chrome doesn't.
+	const DIALOG_NAME = /\b(modal|dialog|drawer)\b/i;
+	const DIALOG_LANDMARK = /^(?:ASIDE|NAV|HEADER|FOOTER|MAIN)$/;
+	function looksLikeDialog(tagName, name, width, dismissible) {
+		return width > 200 && dismissible && DIALOG_NAME.test(name) && !DIALOG_LANDMARK.test(tagName);
+	}
+	// What "dismissible" means in the DOM: a labelled close control, a framework's dismiss attribute,
+	// a declared aria-modal, or the unlabelled ✕ button that is how most modals actually spell it.
+	const DISMISS_SEL = '[aria-label*="close" i],[aria-label*="dismiss" i],[title*="close" i],[data-dismiss],[data-close],[data-modal-close]';
+	const DISMISS_GLYPH = /^[\u00D7\u2715\u2716\u2717\u2718\u274C\u2A2F]$/;
+	function hasDismissControl(el) {
+		try {
+			if (el.hasAttribute('aria-modal') || el.hasAttribute('data-modal')) return true;
+			if (el.querySelector && el.querySelector(DISMISS_SEL)) return true;
+			let n = 0;
+			for (const b of el.querySelectorAll('button,[role="button"],a')) {
+				if (++n > 30) break;
+				if (DISMISS_GLYPH.test((b.textContent || '').trim())) return true;
+			}
+		} catch (_) { /* ignore */ }
+		return false;
+	}
+
 	const INTERACTIVE = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY']);
 	const MEDIA = new Set(['IMG', 'VIDEO', 'SVG', 'CANVAS']);
 	const els = [];
@@ -1257,7 +1289,7 @@ function collectSnapshot() {
 					if (hit(/\b(accordion|collapse|expander)\b/i)) return 'accordion';
 					if (hit(/\bmenu-?item\b/i)) return 'menuitem';
 				} else if (cs.position === 'fixed' || cs.position === 'absolute') {
-					if (hit(/\b(modal|dialog|drawer)\b/i) && rect.width > 200) return 'dialog';
+					if (looksLikeDialog(el.tagName, name, rect.width, hasDismissControl(el))) return 'dialog';
 					if (hit(/\btooltip\b/i)) return 'tooltip';
 				}
 			} catch (_) { /* ignore */ }
