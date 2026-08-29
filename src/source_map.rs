@@ -27,6 +27,49 @@ const SKIP_DIR: &[&str] = &[
     "__pycache__",
 ];
 
+/// Directories that hold TESTS, not the UI. A fix never belongs in one, so a hint that points there
+/// costs a file open and buys nothing.
+const TEST_DIR: &[&str] = &[
+    "test",
+    "tests",
+    "__tests__",
+    "spec",
+    "specs",
+    "e2e",
+    "cypress",
+    "playwright",
+    "fixture",
+    "fixtures",
+    "mocks",
+    "__mocks__",
+    "stories",
+    "__snapshots__",
+    "testdata",
+];
+
+/// Filename infixes that say the same thing about a single file: `Button.spec.ts`, `nav.test.tsx`,
+/// `Card.stories.svelte`, `login.cy.js`.
+const TEST_INFIX: &[&str] = &[".spec.", ".test.", ".stories.", ".cy.", "_test.", "-test."];
+
+/// Is this a test/spec/fixture/story file rather than shipping UI?
+///
+/// Reported from the field: five findings in one report pointed at `.spec.ts` files under an e2e
+/// directory — a contrast finding on a code block, a routing finding at a test fixture. The needle
+/// really was in those files, because a spec asserts on the very copy the page renders, and a spec
+/// sorts early. But the fix never lives there, so following the hint is a wasted open every time,
+/// and a hint that is confidently wrong is worse than no hint at all.
+fn is_test_path(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    if rel
+        .split('/')
+        .any(|seg| TEST_DIR.contains(&seg.to_ascii_lowercase().as_str()))
+    {
+        return true;
+    }
+    let file = rel.rsplit('/').next().unwrap_or(&rel).to_ascii_lowercase();
+    TEST_INFIX.iter().any(|inf| file.contains(inf))
+}
+
 /// Collapse runs of whitespace to a single space — source formatting shouldn't defeat a match.
 fn squeeze(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -114,6 +157,12 @@ fn collect(root: &Path) -> Vec<(String, Vec<String>)> {
                         .unwrap_or(&p)
                         .to_string_lossy()
                         .to_string();
+                    // Tests are not where a UI fix goes — not for the `file:line` hint, and not for
+                    // the DRY advisory either: a panel cluster repeated across specs and stories is
+                    // noise, not a component waiting to be extracted.
+                    if is_test_path(&rel) {
+                        continue;
+                    }
                     out.push((rel, content.lines().map(squeeze).collect()));
                 }
             }
@@ -303,6 +352,41 @@ mod tests {
             .iter()
             .map(|(f, c)| (f.to_string(), c.lines().map(squeeze).collect()))
             .collect()
+    }
+
+    #[test]
+    fn a_spec_file_is_never_the_source_of_a_ui_fix() {
+        // THE field report: five hints landed in e2e specs, including a contrast finding on a code
+        // block. A spec asserts on the very copy the page renders, so the needle IS there — and it
+        // sorts early, so it won.
+        for rel in [
+            "e2e/checkout.spec.ts",
+            "tests/nav.test.tsx",
+            "src/components/Button.stories.svelte",
+            "cypress/e2e/login.cy.js",
+            "__tests__/Card.tsx",
+            "src/fixtures/report.html",
+            "app/__mocks__/api.ts",
+            "web/src/lib/__snapshots__/Panel.svelte",
+        ] {
+            assert!(is_test_path(rel), "{rel} must be treated as a test file");
+        }
+    }
+
+    #[test]
+    fn shipping_ui_is_not_mistaken_for_a_test() {
+        // The guard must not eat the files a fix actually lands in — including the near-misses that
+        // a sloppy substring match would swallow.
+        for rel in [
+            "src/routes/+page.svelte",
+            "web/src/lib/components/Panel.svelte",
+            "app/features/checkout/Cart.tsx",
+            "src/lib/protest-banner.html",
+            "src/latest.js",
+            "components/Contest.vue",
+        ] {
+            assert!(!is_test_path(rel), "{rel} is shipping UI, not a test");
+        }
     }
 
     #[test]
