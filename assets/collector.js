@@ -731,6 +731,13 @@ function collectSnapshot() {
 	// chrome doesn't.
 	const DIALOG_NAME = /\b(modal|dialog|drawer)\b/i;
 	const DIALOG_LANDMARK = /^(?:ASIDE|NAV|HEADER|FOOTER|MAIN)$/;
+	// Is the point we are about to hit-test even INSIDE the boxes that clip this element? A control
+	// scrolled out of an overflow container still has viewport coordinates — they just land wherever
+	// the container's neighbours paint. Takes the clipping rects as plain data so it can be exercised
+	// without a DOM, like the two predicates below it.
+	function pointClippedOut(cx, cy, clips) {
+		return clips.some((c) => cx < c.left || cx > c.right || cy < c.top || cy > c.bottom);
+	}
 	// Is this element's own subtree COLLAPSED — inside a closed <details>, or under a
 	// content-visibility:hidden ancestor a custom disclosure uses for the same effect? Takes the
 	// ancestor chain as plain data (tag, open, content-visibility) so it can be exercised without a
@@ -996,6 +1003,26 @@ function collectSnapshot() {
 						break;
 					}
 				}
+			}
+			// A control SCROLLED OUT of an overflow container is not covered — it is out of view in a
+			// thing you scroll, and the hit test is answering a question about a point the control
+			// does not occupy. Reported from the field: a sidebar built as a flex column with a
+			// pinned header, an overflow-y-auto middle and a pinned footer reported EVERY nav link
+			// below the fold of that middle band as occluded — their rects resolve to coordinates
+			// the pinned footer paints, so elementFromPoint duly returned the footer. Dozens of
+			// instances from one sidebar, on a layout that is completely standard. So: if the centre
+			// we probed lies outside any ancestor that clips this element, the probe is INCONCLUSIVE
+			// (the same reasoning as a null `top` above), not evidence of a cover.
+			if (occluded) {
+				const clips = [];
+				for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+					const ao = getComputedStyle(a);
+					if (/(auto|scroll|hidden|clip)/.test(ao.overflowX + ' ' + ao.overflowY)) {
+						const ar = a.getBoundingClientRect();
+						clips.push({ left: ar.left, top: ar.top, right: ar.right, bottom: ar.bottom });
+					}
+				}
+				if (pointClippedOut(cx, cy, clips)) occluded = false;
 			}
 			// A control inside a CLOSED disclosure is not covered — it is UNDISCLOSED, which is the
 			// entire point of a disclosure, and the <summary> beside it is a visible control that
