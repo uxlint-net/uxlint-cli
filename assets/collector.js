@@ -731,6 +731,20 @@ function collectSnapshot() {
 	// chrome doesn't.
 	const DIALOG_NAME = /\b(modal|dialog|drawer)\b/i;
 	const DIALOG_LANDMARK = /^(?:ASIDE|NAV|HEADER|FOOTER|MAIN)$/;
+	// Is this nav destination a SECOND-TIER item rather than one of the nav's top-level
+	// destinations? Takes the ancestor chain (link → nav root, innermost first) as plain data so it
+	// can be exercised without a DOM, like the predicates around it.
+	function navSubItem(chain) {
+		let lists = 0;
+		for (const a of chain) {
+			// A disclosure group: a <details>, or the classic accordion item — a wrapper holding a
+			// toggle with aria-expanded plus the list it opens.
+			if (a.tag === 'DETAILS' || a.disclosure) return true;
+			if (a.tag === 'UL' || a.tag === 'OL' || a.tag === 'MENU') lists++;
+		}
+		// A list nested inside another list is a sub-nav: one list is the nav, two is a tier below it.
+		return lists >= 2;
+	}
 	// Is the point we are about to hit-test even INSIDE the boxes that clip this element? A control
 	// scrolled out of an overflow container still has viewport coordinates — they just land wherever
 	// the container's neighbours paint. Takes the clipping rects as plain data so it can be exercised
@@ -2421,7 +2435,7 @@ function collectSnapshot() {
 	// orientation: 'side' (taller than wide, or column flex) vs 'top' (wider than tall).
 	// contextSwitcher: a workspace/org/project picker (a select or a labelled switcher) that
 	// wants to persist — a strong signal the app needs a side nav.
-	let primaryNav = { present: false, orientation: '', dests: 0, contextSwitcher: false, acquisition: [], accountItems: [], accountItemRects: [], accountItemsBottom: false, userMenu: false, hasSideNav: false };
+	let primaryNav = { present: false, orientation: '', dests: 0, topDests: 0, contextSwitcher: false, acquisition: [], accountItems: [], accountItemRects: [], accountItemsBottom: false, userMenu: false, hasSideNav: false };
 	try {
 		// A BREADCRUMB is never the primary nav — it says where you ARE, not where you can go. This
 		// matters most at mobile width, where it is often the only nav landmark still VISIBLE: the
@@ -2463,6 +2477,28 @@ function collectSnapshot() {
 			const col = cs.display.includes('flex') && cs.flexDirection.startsWith('column');
 			const orientation = (col || r.height > r.width * 1.5) ? 'side' : 'top';
 			const dests = destsOf(best);
+			// TOP-TIER destinations: the choice a user actually faces at this level. Reported from
+			// the field — a sidebar counted 19 "primary" destinations and drew a choice-overload
+			// finding, when the top-level product destinations were within 7±2 and the tail was the
+			// sub-nav for the section the user is already inside, rendered as a disclosure that is
+			// collapsed everywhere else. Grouping like that is the fix this rule RECOMMENDS, so
+			// counting it as overload penalises the shape we are asking for. `dests` keeps every
+			// destination (the account/acquisition/switcher passes below want them all); the tier
+			// count is what the overload rules read.
+			const navSubChain = (e) => {
+				const chain = [];
+				for (let a = e.parentElement; a && a !== best; a = a.parentElement) {
+					const toggles = Array.from(a.querySelectorAll(':scope > [aria-expanded], :scope > * > [aria-expanded]'));
+					chain.push({
+						tag: a.tagName,
+						// The item's OWN toggle doesn't demote it: `<li><a aria-expanded>Admin</a><ul>…`
+						// makes Admin a top-level destination that opens a tier, not a member of one.
+						disclosure: toggles.some((t) => t !== e && !t.contains(e)),
+					});
+				}
+				return chain;
+			};
+			const topDests = dests.filter((e) => !navSubItem(navSubChain(e)));
 			// Acquisition affordances that should VANISH once signed in.
 			const ACQ = /\b(sign ?up|log ?in|sign ?in|register|get started|start free|try free|book a demo|request a demo|pricing|see plans|buy now)\b/i;
 			// An acquisition affordance is a link to a PUBLIC marketing page (/pricing, /signup,
@@ -2670,7 +2706,7 @@ function collectSnapshot() {
 					}
 				}
 			} catch (_) { /* ignore */ }
-			primaryNav = { present: true, orientation, dests: dests.length, contextSwitcher, switcherOptions, switcherRect, switcherHasCreate, acquisition, accountItems, accountItemRects, accountItemsBottom, userMenu, hasSideNav, userTargetRect, userTargetSynthetic, userIdentityRect, userIsLink, userHasAvatar, userLabelGeneric };
+			primaryNav = { present: true, orientation, dests: dests.length, topDests: topDests.length, contextSwitcher, switcherOptions, switcherRect, switcherHasCreate, acquisition, accountItems, accountItemRects, accountItemsBottom, userMenu, hasSideNav, userTargetRect, userTargetSynthetic, userIdentityRect, userIsLink, userHasAvatar, userLabelGeneric };
 		}
 	} catch (_) { /* ignore */ }
 
