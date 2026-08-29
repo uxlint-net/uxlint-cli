@@ -731,6 +731,34 @@ function collectSnapshot() {
 	// chrome doesn't.
 	const DIALOG_NAME = /\b(modal|dialog|drawer)\b/i;
 	const DIALOG_LANDMARK = /^(?:ASIDE|NAV|HEADER|FOOTER|MAIN)$/;
+	// Is this nav destination a SECOND-TIER item rather than one of the nav's top-level
+	// destinations? Takes the ancestor chain (link → nav root, innermost first) as plain data so it
+	// can be exercised without a DOM, like the predicates around it.
+	function navSubItem(chain) {
+		let lists = 0;
+		for (const a of chain) {
+			// A disclosure group: a <details>, or the classic accordion item — a wrapper holding a
+			// toggle with aria-expanded plus the list it opens.
+			if (a.tag === 'DETAILS' || a.disclosure) return true;
+			if (a.tag === 'UL' || a.tag === 'OL' || a.tag === 'MENU') lists++;
+		}
+		// A list nested inside another list is a sub-nav: one list is the nav, two is a tier below it.
+		return lists >= 2;
+	}
+	// Is the point we are about to hit-test even INSIDE the boxes that clip this element? A control
+	// scrolled out of an overflow container still has viewport coordinates — they just land wherever
+	// the container's neighbours paint. Takes the clipping rects as plain data so it can be exercised
+	// without a DOM, like the two predicates below it.
+	function pointClippedOut(cx, cy, clips) {
+		return clips.some((c) => cx < c.left || cx > c.right || cy < c.top || cy > c.bottom);
+	}
+	// Is this element's own subtree COLLAPSED — inside a closed <details>, or under a
+	// content-visibility:hidden ancestor a custom disclosure uses for the same effect? Takes the
+	// ancestor chain as plain data (tag, open, content-visibility) so it can be exercised without a
+	// DOM, like `looksLikeDialog` above it.
+	function hiddenByDisclosure(chain) {
+		return chain.some((a) => (a.tag === 'DETAILS' && !a.open) || a.cv === 'hidden');
+	}
 	function looksLikeDialog(tagName, name, width, dismissible) {
 		return width > 200 && dismissible && DIALOG_NAME.test(name) && !DIALOG_LANDMARK.test(tagName);
 	}
@@ -989,6 +1017,41 @@ function collectSnapshot() {
 						break;
 					}
 				}
+			}
+			// A control SCROLLED OUT of an overflow container is not covered — it is out of view in a
+			// thing you scroll, and the hit test is answering a question about a point the control
+			// does not occupy. Reported from the field: a sidebar built as a flex column with a
+			// pinned header, an overflow-y-auto middle and a pinned footer reported EVERY nav link
+			// below the fold of that middle band as occluded — their rects resolve to coordinates
+			// the pinned footer paints, so elementFromPoint duly returned the footer. Dozens of
+			// instances from one sidebar, on a layout that is completely standard. So: if the centre
+			// we probed lies outside any ancestor that clips this element, the probe is INCONCLUSIVE
+			// (the same reasoning as a null `top` above), not evidence of a cover.
+			if (occluded) {
+				const clips = [];
+				for (let a = el.parentElement; a && a !== document.body; a = a.parentElement) {
+					const ao = getComputedStyle(a);
+					if (/(auto|scroll|hidden|clip)/.test(ao.overflowX + ' ' + ao.overflowY)) {
+						const ar = a.getBoundingClientRect();
+						clips.push({ left: ar.left, top: ar.top, right: ar.right, bottom: ar.bottom });
+					}
+				}
+				if (pointClippedOut(cx, cy, clips)) occluded = false;
+			}
+			// A control inside a CLOSED disclosure is not covered — it is UNDISCLOSED, which is the
+			// entire point of a disclosure, and the <summary> beside it is a visible control that
+			// opens it. Reported from the field: a pinned "on this page" jump list rendered as a
+			// closed details/summary had every link flagged as covered by the paragraph that owns
+			// that space. The collapsed subtree keeps its geometry (Chrome display-locks a closed
+			// details rather than removing its boxes), so the hit test reads a box that is not
+			// painted, and "fixing" the stacking there would mean nothing. The OPEN state is where
+			// a genuine cover would matter, and the interaction pass captures that separately.
+			if (occluded) {
+				const chain = [];
+				for (let a = el; a && a !== document.body; a = a.parentElement) {
+					chain.push({ tag: a.tagName, open: a.hasAttribute('open'), cv: getComputedStyle(a).contentVisibility });
+				}
+				if (hiddenByDisclosure(chain)) occluded = false;
 			}
 			// A sticky/fixed bar covers whatever is beneath it AT THE CURRENT SCROLL POSITION, and the
 			// interaction passes leave the page scrolled (the hover walk wanders; focus scrolls things
@@ -2372,7 +2435,7 @@ function collectSnapshot() {
 	// orientation: 'side' (taller than wide, or column flex) vs 'top' (wider than tall).
 	// contextSwitcher: a workspace/org/project picker (a select or a labelled switcher) that
 	// wants to persist — a strong signal the app needs a side nav.
-	let primaryNav = { present: false, orientation: '', dests: 0, contextSwitcher: false, acquisition: [], accountItems: [], accountItemRects: [], accountItemsBottom: false, userMenu: false, hasSideNav: false };
+	let primaryNav = { present: false, orientation: '', dests: 0, topDests: 0, contextSwitcher: false, acquisition: [], accountItems: [], accountItemRects: [], accountItemsBottom: false, userMenu: false, hasSideNav: false };
 	try {
 		// A BREADCRUMB is never the primary nav — it says where you ARE, not where you can go. This
 		// matters most at mobile width, where it is often the only nav landmark still VISIBLE: the
@@ -2414,6 +2477,28 @@ function collectSnapshot() {
 			const col = cs.display.includes('flex') && cs.flexDirection.startsWith('column');
 			const orientation = (col || r.height > r.width * 1.5) ? 'side' : 'top';
 			const dests = destsOf(best);
+			// TOP-TIER destinations: the choice a user actually faces at this level. Reported from
+			// the field — a sidebar counted 19 "primary" destinations and drew a choice-overload
+			// finding, when the top-level product destinations were within 7±2 and the tail was the
+			// sub-nav for the section the user is already inside, rendered as a disclosure that is
+			// collapsed everywhere else. Grouping like that is the fix this rule RECOMMENDS, so
+			// counting it as overload penalises the shape we are asking for. `dests` keeps every
+			// destination (the account/acquisition/switcher passes below want them all); the tier
+			// count is what the overload rules read.
+			const navSubChain = (e) => {
+				const chain = [];
+				for (let a = e.parentElement; a && a !== best; a = a.parentElement) {
+					const toggles = Array.from(a.querySelectorAll(':scope > [aria-expanded], :scope > * > [aria-expanded]'));
+					chain.push({
+						tag: a.tagName,
+						// The item's OWN toggle doesn't demote it: `<li><a aria-expanded>Admin</a><ul>…`
+						// makes Admin a top-level destination that opens a tier, not a member of one.
+						disclosure: toggles.some((t) => t !== e && !t.contains(e)),
+					});
+				}
+				return chain;
+			};
+			const topDests = dests.filter((e) => !navSubItem(navSubChain(e)));
 			// Acquisition affordances that should VANISH once signed in.
 			const ACQ = /\b(sign ?up|log ?in|sign ?in|register|get started|start free|try free|book a demo|request a demo|pricing|see plans|buy now)\b/i;
 			// An acquisition affordance is a link to a PUBLIC marketing page (/pricing, /signup,
@@ -2621,7 +2706,7 @@ function collectSnapshot() {
 					}
 				}
 			} catch (_) { /* ignore */ }
-			primaryNav = { present: true, orientation, dests: dests.length, contextSwitcher, switcherOptions, switcherRect, switcherHasCreate, acquisition, accountItems, accountItemRects, accountItemsBottom, userMenu, hasSideNav, userTargetRect, userTargetSynthetic, userIdentityRect, userIsLink, userHasAvatar, userLabelGeneric };
+			primaryNav = { present: true, orientation, dests: dests.length, topDests: topDests.length, contextSwitcher, switcherOptions, switcherRect, switcherHasCreate, acquisition, accountItems, accountItemRects, accountItemsBottom, userMenu, hasSideNav, userTargetRect, userTargetSynthetic, userIdentityRect, userIsLink, userHasAvatar, userLabelGeneric };
 		}
 	} catch (_) { /* ignore */ }
 

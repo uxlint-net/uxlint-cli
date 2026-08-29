@@ -663,6 +663,24 @@ pub(crate) struct UxlintMcp {
     key_is_explicit: bool,
 }
 
+/// The text of a PASSING verify — and the scope of the claim it is making.
+///
+/// Reported from the field: `verify_fix` said a rule was cleared with zero hits on the page it
+/// loaded, and a full audit immediately afterwards fired it again, listing MORE components than
+/// before. It was a site-scoped rule (`styleguide-coverage`, whose input is the whole site's
+/// component inventory), which a single-route pass cannot settle either way. The reply was not
+/// wrong about the page; it was wrong about what the page proves. A confident "cleared" that a
+/// full pass contradicts is worse than no answer, because it ends the fix loop early — so the
+/// verdict now names its own scope, every time, rather than only when other findings happen to
+/// give `others_line` something to say.
+fn cleared_text(rule: &str, route: &str, others: &str) -> String {
+    format!(
+        "✓ {rule} is CLEAR on {route} — verified for THIS PAGE (one route, deterministic pass). \
+A rule whose input is the whole SITE (a component inventory, the link graph, cross-page \
+consistency) cannot be settled by one page — re-run audit_url for those.{others}"
+    )
+}
+
 #[tool_router(router = tool_router)]
 impl UxlintMcp {
     fn new(cli: Arc<Cli>, default_base: Option<String>, admin_tools: bool) -> Self {
@@ -1170,7 +1188,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url."
+        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url. SCOPE: a clear verdict covers the ONE page it loads. A rule whose input is the whole site — a component inventory, the link graph, cross-page consistency — can pass here and still fire in a full audit, so confirm those with audit_url before calling them done."
     )]
     async fn verify_fix(
         &self,
@@ -1297,7 +1315,9 @@ impl UxlintMcp {
                         .collect();
                     structured = json!({
                         "report_url": report["report_url"], "report_id": report_id,
-                        "rule": rule, "route": route, "cleared": hits == 0 && !withheld, "hits": hits, "withheld": withheld,
+                        // `scope` is the caveat in machine-readable form: `cleared` is a claim about
+                        // this PAGE, and a site-scoped rule needs a full audit to be settled.
+                        "rule": rule, "route": route, "cleared": hits == 0 && !withheld, "scope": "page", "hits": hits, "withheld": withheld,
                         "remaining": remaining, "other_findings": others_json,
                     });
                     // One compact line naming the other rules still on the page (worst first, capped).
@@ -1339,10 +1359,7 @@ impl UxlintMcp {
                         }
                         // Cleared — but name any OTHER findings still on the page so this isn't read
                         // as "the page is done." That's the whack-a-mole guard.
-                        format!(
-                            "✓ {rule} is CLEAR on {route} — fix verified.{}",
-                            others_line("Heads-up:")
-                        )
+                        cleared_text(&rule, &route, &others_line("Heads-up:"))
                     } else {
                         let mut m = format!("▲ {rule} STILL FIRES on {route} ({hits} occurrence(s)) — the fix hasn't landed yet.");
                         for rf in &remaining {
@@ -2078,5 +2095,42 @@ mod admin_tool_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cleared_text_tests {
+    use super::cleared_text;
+
+    #[test]
+    fn a_pass_names_the_scope_of_what_it_checked() {
+        // THE report: a site-scoped rule "cleared" on one page, then fired again in the full pass —
+        // and the agent had already stopped fixing. The verdict must carry its own scope even on the
+        // happy path, where there is no other finding to hang the "re-run audit_url" advice on.
+        let t = cleared_text("styleguide-coverage", "/styleguide", "");
+        assert!(
+            t.starts_with("✓ styleguide-coverage is CLEAR on /styleguide"),
+            "{t}"
+        );
+        assert!(t.contains("THIS PAGE"), "{t}");
+        assert!(
+            t.contains("audit_url"),
+            "the way to settle a site-scoped rule must be named: {t}"
+        );
+    }
+
+    #[test]
+    fn the_regression_guard_still_rides_along() {
+        // The other half of a pass: whatever else is on the page is appended verbatim, so naming the
+        // scope has not displaced the whack-a-mole guard.
+        let t = cleared_text(
+            "contrast",
+            "/",
+            "\nHeads-up: 2 other deterministic finding(s)",
+        );
+        assert!(
+            t.contains("Heads-up: 2 other deterministic finding(s)"),
+            "{t}"
+        );
     }
 }
