@@ -731,6 +731,13 @@ function collectSnapshot() {
 	// chrome doesn't.
 	const DIALOG_NAME = /\b(modal|dialog|drawer)\b/i;
 	const DIALOG_LANDMARK = /^(?:ASIDE|NAV|HEADER|FOOTER|MAIN)$/;
+	// Is this element's own subtree COLLAPSED — inside a closed <details>, or under a
+	// content-visibility:hidden ancestor a custom disclosure uses for the same effect? Takes the
+	// ancestor chain as plain data (tag, open, content-visibility) so it can be exercised without a
+	// DOM, like `looksLikeDialog` above it.
+	function hiddenByDisclosure(chain) {
+		return chain.some((a) => (a.tag === 'DETAILS' && !a.open) || a.cv === 'hidden');
+	}
 	function looksLikeDialog(tagName, name, width, dismissible) {
 		return width > 200 && dismissible && DIALOG_NAME.test(name) && !DIALOG_LANDMARK.test(tagName);
 	}
@@ -989,6 +996,21 @@ function collectSnapshot() {
 						break;
 					}
 				}
+			}
+			// A control inside a CLOSED disclosure is not covered — it is UNDISCLOSED, which is the
+			// entire point of a disclosure, and the <summary> beside it is a visible control that
+			// opens it. Reported from the field: a pinned "on this page" jump list rendered as a
+			// closed details/summary had every link flagged as covered by the paragraph that owns
+			// that space. The collapsed subtree keeps its geometry (Chrome display-locks a closed
+			// details rather than removing its boxes), so the hit test reads a box that is not
+			// painted, and "fixing" the stacking there would mean nothing. The OPEN state is where
+			// a genuine cover would matter, and the interaction pass captures that separately.
+			if (occluded) {
+				const chain = [];
+				for (let a = el; a && a !== document.body; a = a.parentElement) {
+					chain.push({ tag: a.tagName, open: a.hasAttribute('open'), cv: getComputedStyle(a).contentVisibility });
+				}
+				if (hiddenByDisclosure(chain)) occluded = false;
 			}
 			// A sticky/fixed bar covers whatever is beneath it AT THE CURRENT SCROLL POSITION, and the
 			// interaction passes leave the page scrolled (the hover walk wanders; focus scrolls things
