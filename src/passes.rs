@@ -1101,7 +1101,9 @@ pub(crate) const DANGEROUS_WORDS: &[&str] = &[
     // Session
     "logout",
     "signout",
-    // Persist
+    // Persist — Add/Create can write immediately even when no form is involved.
+    "add",
+    "create",
     "save",
     "apply",
     "update",
@@ -1132,7 +1134,7 @@ pub(crate) const OPENERS_JS: &str = r##"(() => {
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8 || r.bottom < 0 || r.top > innerHeight) continue;
     if (el.closest('form') && (el.getAttribute('type') || 'submit') === 'submit') continue;
-    const label = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    const label = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
     window.__uxr2.push(el);
     out.push({ i: window.__uxr2.length - 1, label, expanded: el.getAttribute('aria-expanded') });
     if (out.length >= 8) break;
@@ -1775,6 +1777,8 @@ mod danger_tests {
             "Reset to defaults",
             "Disconnect GitHub",
             "Save changes",
+            "Add participant",
+            "Create project",
             "Sign out",
             "Log out",
             "Publish to production",
@@ -1806,6 +1810,35 @@ mod danger_tests {
         ] {
             assert!(!is_dangerous_label(label), "should be probed: {label}");
         }
+    }
+
+    #[test]
+    fn discovery_checks_action_words_beyond_the_label_preview() {
+        let script = format!(
+            r#"const label = 'For the selected workspace and all its members, permanently delete account';
+const el = {{ disabled: false, textContent: label, closest: () => null,
+  getAttribute: () => null, getBoundingClientRect: () => ({{width:100,height:40,bottom:40,top:0}}) }};
+global.window = {{}}; global.innerHeight = 900;
+global.document = {{querySelectorAll: () => [el]}};
+process.stdout.write({});"#,
+            super::OPENERS_JS
+        );
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let candidates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let label = candidates[0]["label"].as_str().unwrap();
+        assert!(label.len() > 40);
+        assert!(
+            is_dangerous_label(label),
+            "the complete name must reach the guard"
+        );
     }
 
     #[test]

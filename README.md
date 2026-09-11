@@ -89,11 +89,11 @@ It applies in every capture path — the crawl, goal-walk tests, and fix preview
 
 ## Does it change anything? (`--allow-mutation`)
 
-**No, unless you ask.** An audit navigates and reads. It clicks controls that look like OPENERS — a
-menu, a disclosure, a dialog trigger — because what a click reveals is half of what there is to judge,
-and it will not click a control whose accessible name reads as an action: *delete, remove, accept,
-leave, revoke, cancel, transfer, pay, publish, submit, save*, and their relatives, matched as whole
-words anywhere in the label.
+Interaction audits navigate, read, and click candidate menu, disclosure, and dialog controls.
+Discovery skips controls whose accessible name contains a recognised action verb: *delete, remove, accept,
+leave, revoke, cancel, transfer, pay, publish, submit, add, create, save*, and their relatives, matched as whole
+words anywhere in the label. A label cannot prove what its click handler does, so run interaction
+audits against an environment you control with disposable data.
 
 Two probes do write, and both need **`--allow-mutation`** on top of `--states`:
 
