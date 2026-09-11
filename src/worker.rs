@@ -1460,13 +1460,24 @@ pub(crate) fn audit_route(
         let tpf = std::time::Instant::now();
         let forms = forms_pass(tab, &url); // Tab-through: order + trap (sequential, must be complete)
         add_ms(&shared.t_forms, tpf);
-        // Destructive + feedback probes LAST inside the interaction block (they mutate the page):
-        // the feedback probe FIRST (it clicks a constructive action — Add/Create/Save), then the
-        // destructive probe (which deletes through confirm dialogs). uxlint IS a tester — a test run
-        // exercises create-and-delete to check the action-feedback and confirm-or-undo contracts.
-        // Only reaches these controls on an AUTHED view of the user's own app (an anonymous crawl of
-        // a third-party URL hits the login wall first), so it never touches data you don't own.
-        {
+        // The two MUTATING probes, last inside the interaction block: the feedback probe (it clicks a
+        // constructive action — Add/Create/Save) and then the destructive one (it deletes, clicking
+        // THROUGH the confirm dialog). Both are real writes against a real app.
+        //
+        // They need `--allow-mutation`, not merely `--states`. That separation is the fix for a field
+        // report of 2026-08-31: a run with tests explicitly disabled and only the states flag set
+        // removed two seated participants from a live record and fired an accept-invitation five
+        // times, creating and deleting an anonymous account. It took a log investigation to find, and
+        // it silently invalidated every later audit of that record — while the tool's own description
+        // promised that without a declared test plan an audit only navigates and reads.
+        //
+        // The old reasoning was "uxlint IS a tester, and it only reaches these controls on an authed
+        // view of the user's own app". Both halves are true and neither is consent: the person who
+        // typed `--states` asked to see hover and focus states, and being entitled to delete a row is
+        // not the same as having asked to. `destructive-no-confirm`, `undo-missing` and
+        // `action-no-feedback` are the rules that go quiet without the flag — a fair price, and the
+        // report says which rules were withheld and why.
+        if ctx.args.allow_mutation {
             ix["feedback"] = feedback_pass(tab, &url);
             let d = destructive_pass(tab, &url);
             ix["destructive"] = d["destructive"].clone();

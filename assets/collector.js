@@ -479,6 +479,15 @@ function collectSnapshot() {
 		return st;
 	})();
 
+	// Is this media element fed by a LIVE STREAM rather than a file? `srcObject` is how a MediaStream
+	// is attached, and a stream-fed element carries no `src`/<source> — checked both ways because a
+	// framework may clear `srcObject` between renders while the element is still stream-driven.
+	function isLiveCapture(m) {
+		if (m.srcObject) return true;
+		const hasFile = !!(m.getAttribute('src') || m.querySelector('source[src]'));
+		return !hasFile && m.readyState > 0;
+	}
+
 	// Mobile & perceived-performance page signals (Wave 4).
 	let mobile = { viewportMeta: '', zoomBlocked: false, fontFaceNoDisplay: 0, autoplayNoControl: 0 };
 	try {
@@ -499,7 +508,17 @@ function collectSnapshot() {
 			} catch (_) { /* cross-origin sheet */ }
 		}
 		// Autoplaying media with no pause control — motion the user can't stop.
+		//
+		// A LIVE CAPTURE STREAM is not that, and must not be counted. A camera self-view in a video
+		// call is motion the user started deliberately and already governs with the call's own mute
+		// and camera controls; the advice this rule gives — add playback controls, honour
+		// prefers-reduced-motion — would make the feature worse, since a frozen self-view is a broken
+		// self-view. Reported from the field on 2026-08-31. The tell is the SOURCE: stream-fed media
+		// is assigned through `srcObject` (a MediaStream from getUserMedia or a peer connection) and
+		// has no file behind it, whereas the decorative autoplaying hero this rule exists for always
+		// has a `src` or a <source>.
 		for (const m of document.querySelectorAll('video[autoplay], audio[autoplay]')) {
+			if (isLiveCapture(m)) continue;
 			if (!m.hasAttribute('controls')) mobile.autoplayNoControl++;
 		}
 	} catch (_) { /* ignore */ }
@@ -579,7 +598,7 @@ function collectSnapshot() {
 				if (sections.length >= 60) break;
 				const t = redactSecrets((el.innerText || '').trim());
 				if (!t) continue;
-				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false };
+				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false, card: false };
 				sections.push(cur);
 				headingEls.push(el);
 			} else if (cur && (tag === 'PROGRESS' || tag === 'METER' || el.matches('[role="progressbar"],[role="meter"]'))) {
@@ -600,6 +619,54 @@ function collectSnapshot() {
 			}
 		}
 		for (const sec of sections) sec.gist = sec.gist.trim();
+	} catch (_) { /* ignore */ }
+
+	// Is a heading a section PROMISE, or just the LABEL on one repeated item? A card title in a grid
+	// ("Ada Lovelace" over a profession and a ruleset chip) promises nothing — the card beside it says
+	// what the shape holds. The server used to infer this from a RUN of short same-level headings,
+	// which is data-dependent and breaks on exactly the grid that motivated it: give most cards a bio
+	// paragraph and one card none, and the lone bio-less card is no longer part of a run of short
+	// siblings, so it gets reported as a broken promise. Repetition is STRUCTURAL, so read it that way.
+	function repeatedItemHeading(el, root) {
+		// The heading sits inside an <li>, or inside an ancestor that is one of >= 3 same-signature
+		// rendered siblings LAID OUT SIDE BY SIDE (the tag + first-class signature `collectionMax`
+		// already trusts). Four levels up is enough for title -> header -> card without reaching the
+		// page's own layout wrapper.
+		//
+		// Repetition alone is NOT enough, and this is the whole subtlety: <main> holds N same-tag
+		// <section>s on plenty of honest documents, and each of those headings IS a promise. What
+		// separates a card grid from a stack of chapters is geometry — a grid puts peers beside each
+		// other, a document stacks them full width. So a peer only counts when it shares a row with us
+		// (vertical overlap, different left edge). Stacked full-width repeats stay eligible, which is
+		// the conservative direction: those are the ones with real prose under them anyway.
+		const sigOf = (k) => k.tagName + '.' + ((k.getAttribute('class') || '').trim().split(/\s+/)[0] || '');
+		const box = (k) => k.getBoundingClientRect();
+		let node = el;
+		for (let up = 0; up < 4 && node && node !== root; up++) {
+			if (node.tagName === 'LI') return true;
+			const parent = node.parentElement;
+			if (!parent) return false;
+			const mine = sigOf(node);
+			const r = box(node);
+			let same = 0;
+			let beside = 0;
+			for (const k of parent.children) {
+				if (!k.getClientRects().length) continue; // an unrendered template row is not a peer
+				if (sigOf(k) !== mine) continue;
+				same++;
+				if (k === node) continue;
+				const kr = box(k);
+				if (kr.top < r.bottom && kr.bottom > r.top && Math.abs(kr.left - r.left) > 4) beside++;
+			}
+			if (same >= 3 && beside >= 1) return true;
+			node = parent;
+		}
+		return false;
+	}
+	try {
+		for (let i = 0; i < headingEls.length; i++) {
+			sections[i].card = repeatedItemHeading(headingEls[i], document.body);
+		}
 	} catch (_) { /* ignore */ }
 
 	// Structural scope signal (no keywords): a content <select> that DUPLICATES a shell/nav switcher
@@ -790,10 +857,26 @@ function collectSnapshot() {
 	// Propagated in document order (querySelectorAll returns parents before children), so a child
 	// inherits its ancestor's tag without a per-element parent walk.
 	const floatingSet = new WeakSet();
+	// NON-SHIPPING subtrees: `data-uxlint-ignore` excludes elements from this table and palette.
+	// Page summaries, interaction probes and screenshots remain separate; use `uxlint-hide` when
+	// the subtree should disappear from every capture surface.
+	// Reported from the field on 2026-08-26 — an audit pointed at a local dev server sees UI no user
+	// will ever meet (a debug panel, an environment banner, a bypass-login block behind a dev flag).
+	// Those are usually styled in warning colours and sit high on the page, so they don't merely add
+	// findings nobody can act on: the page's dominant accent hue gets measured off an amber debug
+	// panel, and its status text trips the false-affordance checks. Excluding at the element table
+	// prevents those element findings and palette contributions. Same WeakSet trick as
+	// `floatingSet` above: document order means a child sees its ancestor's tag without a parent walk.
+	const ignoredSet = new WeakSet();
+	let motionEls = 0; // elements with a non-zero animation/transition duration
 	const nodes = document.body.querySelectorAll('*');
 	let n = 0;
 	for (const el of nodes) {
 		if (n >= 4000) break;
+		if (el.hasAttribute('data-uxlint-ignore') || (el.parentElement !== null && ignoredSet.has(el.parentElement))) {
+			ignoredSet.add(el);
+			continue;
+		}
 		const cs = getComputedStyle(el);
 		// `cs.display`/`cs.visibility` are the element's OWN styles — they stay "block"/"visible" even
 		// when an ANCESTOR is display:none, so a heading inside a responsive `lg:hidden` bar looked
@@ -801,6 +884,12 @@ function collectSnapshot() {
 		// empty for anything not rendered (own or inherited display:none); fixed/sticky still have rects.
 		if (cs.display === 'none' || cs.visibility === 'hidden' || el.getClientRects().length === 0)
 			continue;
+		// Does this element MOVE? Counted here because `cs` is already in hand — a second pass over
+		// every element just to read two properties would be the expensive way to ask. Feeds
+		// `reduced-motion-ignored` together with the stylesheet scan below: many animating elements
+		// and not one `prefers-reduced-motion` rule in the whole CSSOM is a site that ignores the
+		// preference outright.
+		if (parseFloat(cs.animationDuration) > 0.01 || parseFloat(cs.transitionDuration) > 0.01) motionEls++;
 		const inFloating =
 			cs.position === 'fixed' ||
 			cs.position === 'sticky' ||
@@ -1615,6 +1704,10 @@ function collectSnapshot() {
 	// (each item is/contains a link or button). A flat pile of entities that go nowhere is
 	// an IA dead-end — feeds flat-app-structure.
 	let collectionDrillable = false;
+	// The biggest collection is an append-only LOG (chronological, and named as one) — read in order,
+	// never searched for one item. Feeds `searchability`, which otherwise tells a session activity log
+	// to add a search box.
+	let collectionLog = false;
 	try {
 		let bestParent = null;
 		for (const parent of document.querySelectorAll('*')) {
@@ -1655,6 +1748,52 @@ function collectSnapshot() {
 				if (isLink) linked++;
 			}
 			collectionDrillable = items.length > 0 && linked / items.length >= 0.5;
+			// Is this pile an append-only LOG rather than a collection you go looking in? Reported
+			// from the field on 2026-08-14: a running list of the choices the user had just made this
+			// session, told to add a search box. A log is read in the order it happened — the ordering
+			// IS the information — and it is filled one entry per action, never browsed for one item.
+			//
+			// Two signals must agree, because either alone is far too loose. STRUCTURE: most items
+			// carry a timestamp and those timestamps run monotonically (a blog index is dated too, but
+			// so is an orders table you very much do want to search). LABEL: the pile is named as a
+			// log — by the container's own accessible name or the heading immediately above it. An
+			// orders list or an article index is dated and ascending but is not called an activity log.
+			try {
+				const stamp = (k) => {
+					const t = k.querySelector('time[datetime]');
+					if (t) return Date.parse(t.getAttribute('datetime'));
+					const m = (k.textContent || '').match(/\b\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?\b|\b\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?\b/i);
+					if (!m) return NaN;
+					if (/^\d{4}-/.test(m[0])) return Date.parse(m[0]);
+					// A clock time is not a date. Its position in the label says nothing about
+					// chronology; parse seconds since midnight so shuffled rows stay shuffled.
+					const clock = m[0].match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?$/i);
+					if (!clock) return NaN;
+					let hours = Number(clock[1]);
+					const minutes = Number(clock[2]), seconds = Number(clock[3] || 0);
+					if (minutes > 59 || seconds > 59 || hours > (clock[4] ? 12 : 23) || (clock[4] && hours < 1)) return NaN;
+					if (clock[4]) hours = hours % 12 + (clock[4].toLowerCase() === 'pm' ? 12 : 0);
+					return hours * 3600 + minutes * 60 + seconds;
+				};
+				const stamps = items.map(stamp).filter((v) => !Number.isNaN(v));
+				const monotonic = stamps.length >= 4 && (
+					stamps.every((v, i) => i === 0 || v >= stamps[i - 1]) ||
+					stamps.every((v, i) => i === 0 || v <= stamps[i - 1]));
+				if (monotonic && stamps.length >= items.length * 0.6) {
+					// The list's TITLE is whatever heading precedes it — not something an ancestor
+					// query finds reliably, because the heading usually sits OUTSIDE the panel that
+					// wraps the table (`<h2>Activity</h2><div class=panel><table>`), so `closest()`
+					// lands on the panel and sees nothing.
+					let heading = '';
+					for (const h of document.querySelectorAll('h1,h2,h3,h4')) {
+						if (h.compareDocumentPosition(bestParent) & Node.DOCUMENT_POSITION_FOLLOWING) heading = h.textContent || '';
+					}
+					const named = ((bestParent.getAttribute('aria-label') || '') + ' ' +
+						(bestParent.closest('[aria-label]')?.getAttribute('aria-label') || '') + ' ' +
+						heading).toLowerCase();
+					if (/\b(activity|activities|history|log|logs|timeline|audit trail|changelog|feed)\b/.test(named)) collectionLog = true;
+				}
+			} catch (_) { /* ignore */ }
 			// Anchor previews at the TOP of the collection — where a search box / pager belongs and
 			// the first rows are visible — not the full (possibly page-tall) list.
 			const cr = bestParent.getBoundingClientRect();
@@ -1830,6 +1969,11 @@ function collectSnapshot() {
 	// word-bounded so "employee" doesn't match), or short copy that plainly says the collection is
 	// empty ("No sites yet", "You don't have any…", "Nothing here yet"). Feeds empty-state-no-cta.
 	let emptyState = false;
+	// The empty block's own COPY (capped). What a zero-data screen SAYS decides whether being empty is
+	// bad news or good news: "No sites yet" is a list the user wants to fill, "No banned IPs found" is
+	// a moderation queue nobody wants an entry in. Only the block's text can tell those apart, so ship
+	// it. Feeds empty-state-no-cta's desired-emptiness guard.
+	let emptyStateText = '';
 	// The empty block STRANDED at the top of a tall viewport: a small panel anchored high with a
 	// big void beneath it and clearly more emptiness below than above — the "pinned to the top"
 	// look. A vertically-centred (balanced) empty state, or an inline section-empty with content
@@ -1853,6 +1997,7 @@ function collectSnapshot() {
 				if (el.tagName === 'H1' || el.querySelector('h1')) continue;
 				if (EMPTY_CLS.test(cls) || el.hasAttribute('data-empty') || EMPTY_TXT.test(txt)) {
 					emptyState = true;
+					if (!emptyStateText) emptyStateText = redactSecrets(txt).slice(0, 200);
 					try {
 						const r = el.getBoundingClientRect();
 						const vh = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -2047,6 +2192,35 @@ function collectSnapshot() {
 				/copy/i.test((c.getAttribute('aria-label') || '') + ' ' + (c.textContent || '') + ' ' + (c.className || ''))
 			);
 			if (!hasCopy) { secretNoCopy = true; break; }
+		}
+	} catch (_) { /* ignore */ }
+
+	// Does the site honour `prefers-reduced-motion` AT ALL? Reported from the field on 2026-08-29:
+	// ~58 component files full of spinners, pulses and sliding panels, one narrow guard around
+	// scroll-behavior, and nothing flagged it across ~25 audited routes.
+	//
+	// Asked of the CSSOM rather than by loading the page a second time under an emulated preference:
+	// the question "is there a reduced-motion rule anywhere in this site's CSS" is answerable from
+	// one pass, and a second navigation per route would roughly double the crawl for one check. We
+	// count the media blocks (nested ones included — a `@media (prefers-reduced-motion: reduce)`
+	// inside a layer or a container query still counts) and, crucially, how many sheets we could NOT
+	// read: a cross-origin stylesheet throws on `.cssRules`, and absence you cannot see is not
+	// evidence of absence. The Rust lint refuses to fire when any sheet was unreadable.
+	let reducedMotionRules = 0;
+	let sheetsUnreadable = 0;
+	try {
+		const scan = (rules) => {
+			for (const r of rules) {
+				if (r.media && /prefers-reduced-motion/i.test(r.media.mediaText || '')) reducedMotionRules++;
+				else if (r.conditionText && /prefers-reduced-motion/i.test(r.conditionText)) reducedMotionRules++;
+				if (r.cssRules) scan(r.cssRules);
+			}
+		};
+		for (const sheet of document.styleSheets) {
+			let rules = null;
+			try { rules = sheet.cssRules; } catch (_) { /* cross-origin */ }
+			if (!rules) { sheetsUnreadable++; continue; }
+			scan(rules);
 		}
 	} catch (_) { /* ignore */ }
 
@@ -3104,6 +3278,7 @@ function collectSnapshot() {
 		entityIndexRoot,
 		hasCreate,
 		emptyState,
+		emptyStateText,
 		svgOffCenterLabels,
 		svgUnbalanced,
 		svgUntokenized,
@@ -3113,6 +3288,10 @@ function collectSnapshot() {
 		secretNoCopy,
 		collectionKind,
 		collectionSel,
+		collectionLog,
+		motionEls,
+		reducedMotionRules,
+		sheetsUnreadable,
 		collectionDrillable,
 		paginated,
 		aiGenControls,

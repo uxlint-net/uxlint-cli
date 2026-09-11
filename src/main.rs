@@ -354,6 +354,17 @@ pub(crate) struct AuditArgs {
     /// Also drive interaction states (hover + keyboard focus) on desktop pages
     #[arg(long)]
     pub(crate) states: bool,
+    /// Allow the interaction pass to WRITE: click constructive actions (Add/Create/Save) and
+    /// destructive ones (Delete/Remove) through their confirm dialogs. Throwaway environments only.
+    ///
+    /// Off by default, and separate from `--states` on purpose. Reported from the field on
+    /// 2026-08-31: a run with tests explicitly disabled and only `--states` set removed two seated
+    /// participants from a live record and fired an accept-invitation five times, creating and then
+    /// deleting an anonymous account — while the tool's own description promised that without a
+    /// declared test plan an audit only navigates and reads. Reading a page and rehearsing its
+    /// delete flow are different acts and now take different consent.
+    #[arg(long = "allow-mutation")]
+    pub(crate) allow_mutation: bool,
     /// Fault-injection: fail the page's data (XHR/fetch) requests and check the error UX
     #[arg(long)]
     pub(crate) probe_errors: bool,

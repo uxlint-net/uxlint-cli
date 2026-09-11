@@ -518,6 +518,7 @@ pub(crate) fn run_audit_ext(
         bot_blocked_routes: &bot_blocked_routes,
         labels: &args.labels,
         timed_out,
+        crawl: args.crawl,
         timeout_detail: timeout_detail.as_ref(),
         provenance: &provenance,
         theme: theme.as_ref(),
@@ -1363,6 +1364,7 @@ mod request_tests {
             bot_blocked_routes: &[],
             labels: &[],
             timed_out: false,
+            crawl: 8,
             timeout_detail: None,
             provenance: prov,
             theme: None,
@@ -1394,6 +1396,28 @@ mod request_tests {
         assert!(body.get("timed_out").is_some());
         // The styleguide existence probe rides under its stable key (drives styleguide-missing).
         assert!(body.get("styleguide").is_some());
+        // The crawl budget rides too: the server withholds link-graph findings when the graph it has
+        // is the RUN's rather than the site's, and zero-vs-absent is the whole distinction.
+        assert_eq!(body["crawl"], 8);
+    }
+
+    #[test]
+    fn a_zero_crawl_budget_is_sent_as_zero_not_omitted() {
+        // Reported from the field on 2026-08-31: a run scoped to explicit seeds with the crawl budget
+        // at zero reported a page as an orphan, when no page that might link to it was ever loaded.
+        // The server can only stand the rule down if it can TELL — and "absent" (an old client) has
+        // to stay distinguishable from "zero", or every legacy capture would silence the rule.
+        let prov = AuditProvenance {
+            git_sha: None,
+            git_branch: None,
+            runner: String::new(),
+            change_url: None,
+        };
+        let mut inputs = sample_inputs(&prov);
+        inputs.crawl = 0;
+        let body = build_audit_request(&inputs);
+        assert_eq!(body["crawl"], 0);
+        assert!(body.get("crawl").is_some_and(|v| !v.is_null()));
     }
 
     #[test]

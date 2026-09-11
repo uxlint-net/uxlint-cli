@@ -33,6 +33,13 @@ pub(crate) struct AuditRequestInputs<'a> {
     pub(crate) bot_blocked_routes: &'a [String],
     pub(crate) labels: &'a [String],
     pub(crate) timed_out: bool,
+    /// The CRAWL BUDGET this run used — how many pages beyond the seed routes the client was allowed
+    /// to discover. Zero means the audit only ever saw the routes it was handed, which the server
+    /// needs in order to know that its link graph is the RUN's, not the site's: a page nothing in the
+    /// seed set links to is not thereby an orphan, because no page that might link to it was ever
+    /// loaded. Reported from the field on 2026-08-31. Sent always; `None` on the server means a
+    /// client too old to say, which is treated as "don't know" rather than "zero".
+    pub(crate) crawl: usize,
     pub(crate) timeout_detail: Option<&'a Value>,
     pub(crate) provenance: &'a AuditProvenance,
     pub(crate) theme: Option<&'a Value>,
@@ -64,6 +71,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "bot_blocked_routes": i.bot_blocked_routes,
         "labels": i.labels,
         "timed_out": i.timed_out,
+        "crawl": i.crawl,
         "timeout_detail": i.timeout_detail,
         // The CLI/collector version behind this capture. Always sent (NOT suppressed by
         // --no-provenance): it's not identifying provenance, it's the tool version, and the server

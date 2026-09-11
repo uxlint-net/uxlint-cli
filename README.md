@@ -87,6 +87,30 @@ stylesheet that hides it (`.uxlint-hide { display: none !important; }`) is injec
 browser, before the page's own scripts run. Style your element however you like the rest of the time.
 It applies in every capture path — the crawl, goal-walk tests, and fix previews.
 
+## Does it change anything? (`--allow-mutation`)
+
+**No, unless you ask.** An audit navigates and reads. It clicks controls that look like OPENERS — a
+menu, a disclosure, a dialog trigger — because what a click reveals is half of what there is to judge,
+and it will not click a control whose accessible name reads as an action: *delete, remove, accept,
+leave, revoke, cancel, transfer, pay, publish, submit, save*, and their relatives, matched as whole
+words anywhere in the label.
+
+Two probes do write, and both need **`--allow-mutation`** on top of `--states`:
+
+- the **action-feedback** probe clicks a constructive action (Add / Create / Save) to check the page
+  says something happened;
+- the **destructive** probe clicks Delete / Remove *and clicks through the confirm dialog*, to check
+  the contract that a destructive action either confirms first or offers undo.
+
+They power `action-no-feedback`, `destructive-no-confirm` and `undo-missing`, and those three rules
+stay quiet without the flag. **Throwaway environments only.** Being signed in as a user who is allowed
+to delete a row is not the same as having asked us to, and this flag is where you say so.
+
+`uxlint mcp` never sets it, and cannot be asked to.
+
+The other way an audit writes is one you wrote yourself: a declared `[[tests]]` walk signs in as a
+persona and exercises real flows, which is what a test does.
+
 ## MCP (use it from a coding agent)
 
 **Claude Code, one command:**
