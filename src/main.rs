@@ -14,6 +14,7 @@ use serde_json::json;
 
 mod audit;
 mod commands;
+mod design_memory;
 mod docs_json;
 mod fix_preview;
 mod guidance;
@@ -333,6 +334,9 @@ pub(crate) struct AuditArgs {
     /// Comma-separated routes
     #[arg(long, default_value = "/")]
     pub(crate) routes: String,
+    /// Internal MCP verification scope: a root route must not expand to project defaults.
+    #[arg(skip)]
+    pub(crate) exact_routes: bool,
     /// Viewports as name:WxH, comma-separated
     #[arg(long, default_value = "desktop:1440x900,mobile:390x844")]
     pub(crate) viewports: String,

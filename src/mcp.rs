@@ -663,22 +663,66 @@ pub(crate) struct UxlintMcp {
     key_is_explicit: bool,
 }
 
-/// The text of a PASSING verify — and the scope of the claim it is making.
-///
-/// Reported from the field: `verify_fix` said a rule was cleared with zero hits on the page it
-/// loaded, and a full audit immediately afterwards fired it again, listing MORE components than
-/// before. It was a site-scoped rule (`styleguide-coverage`, whose input is the whole site's
-/// component inventory), which a single-route pass cannot settle either way. The reply was not
-/// wrong about the page; it was wrong about what the page proves. A confident "cleared" that a
-/// full pass contradicts is worse than no answer, because it ends the fix loop early — so the
-/// verdict now names its own scope, every time, rather than only when other findings happen to
-/// give `others_line` something to say.
+/// Only an explicit execution receipt can establish a pass. Old servers, unknown rule names,
+/// site/judge/interaction checks and missing captures must never turn zero hits into success.
+fn verification_status(
+    report: &Value,
+    rule: &str,
+    route: &str,
+    hits: usize,
+    withheld: bool,
+) -> &'static str {
+    if hits > 0 || withheld {
+        return "failed";
+    }
+    let Some(checks) = report["verification"]["checks"]
+        .as_array()
+        .filter(|_| report["verification"]["schema"] == 1)
+    else {
+        return "not_evaluated";
+    };
+    let matching: Vec<_> = checks
+        .iter()
+        .filter(|c| c["rule"] == rule && c["route"] == route)
+        .collect();
+    if matching.iter().any(|c| c["status"] == "failed") {
+        return "failed";
+    }
+    if report["timed_out"] == true {
+        return "inconclusive";
+    }
+    if matching.is_empty() {
+        return "not_evaluated";
+    }
+    if matching.iter().any(|c| c["status"] != "passed") {
+        return "inconclusive";
+    }
+    // verify_fix requests both viewports. A missing mobile capture is not a mobile pass.
+    for viewport in ["desktop", "mobile"] {
+        let Some(pages) = report["pages"].as_array() else {
+            return "inconclusive";
+        };
+        let pages: Vec<_> = pages
+            .iter()
+            .filter(|p| p["route"] == route && p["viewport"] == viewport)
+            .collect();
+        if pages.is_empty()
+            || pages.iter().any(|p| {
+                !matching.iter().any(|c| {
+                    c["viewport"] == viewport
+                        && c["state"].as_str().unwrap_or("anonymous")
+                            == p["state"].as_str().unwrap_or("anonymous")
+                })
+            })
+        {
+            return "inconclusive";
+        }
+    }
+    "passed"
+}
+
 fn cleared_text(rule: &str, route: &str, others: &str) -> String {
-    format!(
-        "✓ {rule} is CLEAR on {route} — verified for THIS PAGE (one route, deterministic pass). \
-A rule whose input is the whole SITE (a component inventory, the link graph, cross-page \
-consistency) cannot be settled by one page — re-run audit_url for those.{others}"
-    )
+    format!("✓ {rule} is CLEAR on {route} — verified for THIS PAGE in the captured desktop/mobile states. This confirms the check cleared; it does not establish that the edit improved the UX. Re-run audit_url to check the wider site.{others}")
 }
 
 #[tool_router(router = tool_router)]
@@ -809,6 +853,7 @@ impl UxlintMcp {
         let args = AuditArgs {
             base,
             routes: a.routes.unwrap_or_else(|| "/".to_string()),
+            exact_routes: false,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call —
             // secrets stay out of the tool args and the transcript.
@@ -979,6 +1024,21 @@ impl UxlintMcp {
                         g("new"),
                         g("persisting")
                     ));
+                    if g("not_verified") > 0 {
+                        t.push_str(&format!(" {} previous finding(s) were absent without passing evidence and remain unverified.", g("not_verified")));
+                    }
+                    if let Some(changes) = d.get("occurrence_changes").and_then(|v| v.as_array()) {
+                        for change in changes.iter().take(6) {
+                            t.push_str(&format!(
+                                "\n  {} on {} ({}): {} → {} observed occurrences.",
+                                change["rule"].as_str().unwrap_or("?"),
+                                change["route"].as_str().unwrap_or("?"),
+                                change["viewport"].as_str().unwrap_or("?"),
+                                change["before"],
+                                change["after"]
+                            ));
+                        }
+                    }
                     // Name the newly-INTRODUCED findings first — most likely caused by your last edit.
                     if let Some(nf) = d
                         .get("new_findings")
@@ -1193,7 +1253,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url. SCOPE: a clear verdict covers the ONE page it loads. A rule whose input is the whole site — a component inventory, the link graph, cross-page consistency — can pass here and still fire in a full audit, so confirm those with audit_url before calling them done."
+        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). Returns status passed, failed, not_evaluated or inconclusive. A pass requires explicit server evidence for the requested route and both viewports. Currently supported passing checks: page-title-missing, html-lang-missing, horizontal-overflow. Other rules can report observed failures but cannot pass without execution evidence; re-run audit_url for judge, interaction and site checks. Unknown rules and missing evidence never clear. A cleared finding is not a user endorsement of the fix."
     )]
     async fn verify_fix(
         &self,
@@ -1204,6 +1264,7 @@ impl UxlintMcp {
         let args = AuditArgs {
             base: resolve_base(a.base, self.default_base.as_deref()),
             routes: route.clone(),
+            exact_routes: true,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call.
             headers: Vec::new(),
@@ -1252,8 +1313,7 @@ impl UxlintMcp {
         let rule_for_task = rule.clone();
         let route_for_task = route.clone();
         let feedback_enabled = self.feedback_enabled;
-        // Run the audit AND the best-effort "accept" POST on the blocking pool — both are
-        // blocking, and keeping them together lets the POST fire while off the transport thread.
+        // Browser capture and report submission block; keep them off the MCP transport thread.
         let outcome = tokio::task::spawn_blocking(move || {
             let rule = rule_for_task;
             let route = route_for_task;
@@ -1268,6 +1328,7 @@ impl UxlintMcp {
                         .unwrap_or(false);
                     let up_url = report["upsell"]["upgrade_url"].as_str().unwrap_or("").to_string();
                     let hits = report["pages"].as_array().map(|ps| ps.iter()
+                        .filter(|p| p["route"] == route)
                         .flat_map(|p| p["findings"].as_array().cloned().unwrap_or_default())
                         .filter(|f| f["rule"].as_str() == Some(rule.as_str()))
                         .count()).unwrap_or(0);
@@ -1289,6 +1350,7 @@ impl UxlintMcp {
                     {
                         let empty = vec![];
                         for p in report["pages"].as_array().unwrap_or(&empty) {
+                            if p["route"] != route { continue; }
                             let r = p["route"].as_str().unwrap_or("");
                             let vp = p["viewport"].as_str().unwrap_or("");
                             for f in p["findings"].as_array().unwrap_or(&empty) {
@@ -1319,11 +1381,12 @@ impl UxlintMcp {
                         .iter()
                         .map(|(rr, sev, n)| json!({"rule": rr, "severity": sev, "count": n}))
                         .collect();
+                    let status = verification_status(&report, &rule, &route, hits, withheld);
                     structured = json!({
                         "report_url": report["report_url"], "report_id": report_id,
                         // `scope` is the caveat in machine-readable form: `cleared` is a claim about
                         // this PAGE, and a site-scoped rule needs a full audit to be settled.
-                        "rule": rule, "route": route, "cleared": hits == 0 && !withheld, "scope": "page", "hits": hits, "withheld": withheld,
+                        "rule": rule, "route": route, "cleared": status == "passed", "status": status, "execution": report["verification"], "scope": "page", "hits": hits, "withheld": withheld,
                         "remaining": remaining, "other_findings": others_json,
                     });
                     // One compact line naming the other rules still on the page (worst first, capped).
@@ -1353,21 +1416,14 @@ impl UxlintMcp {
                     };
                     if withheld {
                         format!("▲ {rule} is a Pro finding and still fires on {route} — it's withheld on the free plan, so it can't be fully verified here. Upgrade at {up_url} to see every occurrence and confirm the fix. (Tell the user.)")
-                    } else if hits == 0 {
-                        // A verified fix is an implicit "accept" — the finding was worth acting
-                        // on. Best-effort, stable-keyed (source "fix"), never blocks the reply.
-                        if let Some(key) = &cli.api_key {
-                            let _ = reqwest::blocking::Client::new()
-                                .post(format!("{}/v1/feedback", cli.server))
-                                .bearer_auth(key)
-                                .json(&json!({"rule": rule, "verdict": "accept", "source": "fix", "reason": "verified via verify_fix"}))
-                                .send();
-                        }
+                    } else if status == "not_evaluated" || status == "inconclusive" {
+                        format!("▲ {rule}: {status} on {route}. No passing execution evidence covers this rule on both requested viewports. The finding is NOT verified as cleared. Re-run audit_url with the original routes, personas and required probes; inspect its evidence before declaring the fix complete.{}", others_line("Also:"))
+                    } else if status == "passed" {
                         // Cleared — but name any OTHER findings still on the page so this isn't read
                         // as "the page is done." That's the whack-a-mole guard.
                         cleared_text(&rule, &route, &others_line("Heads-up:"))
                     } else {
-                        let mut m = format!("▲ {rule} STILL FIRES on {route} ({hits} occurrence(s)) — the fix hasn't landed yet.");
+                        let mut m = format!("▲ {rule} STILL FIRES on {route} — the check observed a failure ({hits} visible occurrence(s); grouped findings may appear elsewhere in the report).");
                         for rf in &remaining {
                             if let Some(u) = rf["screenshot_url"].as_str() {
                                 m.push_str(&format!("\n  shot: {u}"));
@@ -1624,16 +1680,18 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
+        description = "Project design memory and best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Reads the nearest project’s uxlint.design.json on each call; only explicitly approved versioned decisions guide edits. Never auto-approve or rewrite that contract to silence a lint. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
     )]
     async fn ux_guidance(
         &self,
         Parameters(a): Parameters<UxGuidanceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let topic = a.topic.as_deref().unwrap_or("");
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            crate::guidance::guidance(topic),
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "{}{}",
+            crate::design_memory::guidance(),
+            crate::guidance::guidance(topic)
+        ))]))
     }
 
     // ONE feedback tool, gated by ONE opt-in setting (`feedback = true` in uxlint.toml,
@@ -2113,11 +2171,8 @@ mod cleared_text_tests {
         // THE report: a site-scoped rule "cleared" on one page, then fired again in the full pass —
         // and the agent had already stopped fixing. The verdict must carry its own scope even on the
         // happy path, where there is no other finding to hang the "re-run audit_url" advice on.
-        let t = cleared_text("styleguide-coverage", "/styleguide", "");
-        assert!(
-            t.starts_with("✓ styleguide-coverage is CLEAR on /styleguide"),
-            "{t}"
-        );
+        let t = cleared_text("page-title-missing", "/", "");
+        assert!(t.starts_with("✓ page-title-missing is CLEAR on /"), "{t}");
         assert!(t.contains("THIS PAGE"), "{t}");
         assert!(
             t.contains("audit_url"),
@@ -2137,6 +2192,77 @@ mod cleared_text_tests {
         assert!(
             t.contains("Heads-up: 2 other deterministic finding(s)"),
             "{t}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verification_status_tests {
+    use super::*;
+    fn report() -> Value {
+        json!({"verification":{"schema":1,"checks":[
+            {"route":"/","viewport":"desktop","state":"anonymous","rule":"page-title-missing","status":"passed"},
+            {"route":"/","viewport":"mobile","state":"anonymous","rule":"page-title-missing","status":"passed"}
+        ]}, "pages":[{"route":"/","viewport":"desktop"},{"route":"/","viewport":"mobile"}]})
+    }
+    #[test]
+    fn requires_positive_evidence_on_both_requested_viewports() {
+        let mut r = report();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "passed"
+        );
+        r["verification"]["checks"].as_array_mut().unwrap().pop();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
+        );
+    }
+    #[test]
+    fn unknown_rules_old_servers_and_other_routes_do_not_clear() {
+        for rule in [
+            "typo",
+            "styleguide-coverage",
+            "prose-clarity",
+            "dialog-escape",
+        ] {
+            assert_eq!(
+                verification_status(&report(), rule, "/", 0, false),
+                "not_evaluated"
+            );
+        }
+        assert_eq!(
+            verification_status(&json!({}), "page-title-missing", "/", 0, false),
+            "not_evaluated"
+        );
+        assert_eq!(
+            verification_status(&report(), "page-title-missing", "/settings", 0, false),
+            "not_evaluated"
+        );
+    }
+    #[test]
+    fn withheld_grouped_and_incomplete_checks_do_not_clear() {
+        let mut r = report();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, true),
+            "failed"
+        );
+        r["verification"]["checks"][0]["status"] = json!("failed");
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "failed"
+        );
+        let mut r = report();
+        r["timed_out"] = json!(true);
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
+        );
+        let mut r = report();
+        r["pages"][0]["state"] = json!("member");
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
         );
     }
 }

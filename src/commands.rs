@@ -242,6 +242,7 @@ fn default_audit_args() -> AuditArgs {
         no_judge: true,
         no_tests: false,
         rule: None,
+        exact_routes: false,
         preview_rule: None,
         site_type: None,
         org: None,
@@ -323,6 +324,7 @@ pub(crate) fn run_ci(cli: &Cli) -> Result<()> {
                 no_previews: true,
                 crawl: 12, // budget cap; the toml can widen it
                 rule: None,
+                exact_routes: false,
                 preview_rule: None,
                 parallel: None, // auto: full throttle locally, polite on public hosts
                 no_judge: false,

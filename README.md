@@ -154,6 +154,34 @@ and off by default (§ Privacy) — one tool for three kinds of signal: whether 
 a lint uxlint is missing, or a component library it didn't recognise. The agent audits, reads the
 fixes, edits, and re-audits until green.
 
+### Verification and design memory
+
+`verify_fix` returns `passed`, `failed`, `not_evaluated` or `inconclusive`. Zero findings alone
+never means a fix passed. Passing verification currently covers `page-title-missing`,
+`html-lang-missing` and `horizontal-overflow`, with explicit evidence for the requested route and
+both viewports. Other checks can report failures but need a full audit and evidence review;
+unknown rules, skipped checks and old servers cannot pass. A cleared check never submits an
+automatic acceptance vote.
+
+Keep approved project decisions in `uxlint.design.json` beside `uxlint.toml`. `ux_guidance` reads
+it afresh each time, including in a new agent session. Start with a draft:
+
+```json
+{"version":1,"revision":1,"status":"draft","site":"example.test",
+ "tokens":{"accent":"var(--color-brand)"},
+ "components":{"primary_action":"Reuse PrimaryButton"},
+ "pages":{"/":"Explain the product and offer a clear starting action"},
+ "journeys":["Start the main task from the homepage"],
+ "references":["/styleguide"],"exceptions":[]}
+```
+
+Set `site` to the project's configured site. Review the decisions with the owner before setting
+`status` to `approved` and committing the file. Increment `revision` for subsequent approved
+changes. The tool never approves or writes the contract; drafts do not become guidance. References
+are not automatically fetched, exceptions do not suppress lints, and this initial local memory
+does not yet enforce tokens or compare screenshots. Invalid contracts produce a visible warning.
+Keep the file below 32 KiB and do not put credentials or private customer data in it.
+
 ## Privacy & trust
 
 This CLI runs on your machine and drives a real browser against real pages, so it's fair to ask

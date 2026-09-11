@@ -1566,14 +1566,23 @@ mod decision_tests {
     }
 
     #[test]
+    fn verification_does_not_inherit_project_routes_or_crawl_budget() {
+        assert_eq!(effective_routes("/", Some("/a,/b"), true), "/");
+        assert_eq!(resolve_crawl_cap(1, 30, 1, true), 1);
+    }
+
+    #[test]
     fn effective_routes_prefers_toml_only_for_the_bare_default() {
         // Bare `--routes /` yields to the project's declared routes…
-        assert_eq!(effective_routes("/", Some("/a,/b")), "/a,/b");
+        assert_eq!(effective_routes("/", Some("/a,/b"), false), "/a,/b");
         // …but an explicit --routes always wins, even over declared routes…
-        assert_eq!(effective_routes("/pricing", Some("/a,/b")), "/pricing");
+        assert_eq!(
+            effective_routes("/pricing", Some("/a,/b"), false),
+            "/pricing"
+        );
         // …and with no declared routes, the CLI value stands (including the bare default).
-        assert_eq!(effective_routes("/", None), "/");
-        assert_eq!(effective_routes("/x", None), "/x");
+        assert_eq!(effective_routes("/", None, false), "/");
+        assert_eq!(effective_routes("/x", None, false), "/x");
     }
 
     #[test]
@@ -1620,9 +1629,9 @@ mod decision_tests {
 
     #[test]
     fn resolve_crawl_cap_is_the_max_of_flag_toml_and_seed_count() {
-        assert_eq!(resolve_crawl_cap(12, 0, 3), 12); // flag wins
-        assert_eq!(resolve_crawl_cap(2, 30, 3), 30); // toml wins
-        assert_eq!(resolve_crawl_cap(2, 1, 5), 5); // never fewer than the seeds asked for
+        assert_eq!(resolve_crawl_cap(12, 0, 3, false), 12); // flag wins
+        assert_eq!(resolve_crawl_cap(2, 30, 3, false), 30); // toml wins
+        assert_eq!(resolve_crawl_cap(2, 1, 5, false), 5); // never fewer than the seeds asked for
     }
 
     #[test]

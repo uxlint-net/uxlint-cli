@@ -196,9 +196,9 @@ pub(crate) fn prevalidate_org(me: &Value, org: &str, site: Option<&str>) -> Resu
 
 /// The routes to seed the crawl: CLI `--routes` unless it's the bare default "/", in which case the
 /// project's declared routes win (when it declares any). Pure.
-pub(crate) fn effective_routes(cli_routes: &str, toml_routes: Option<&str>) -> String {
+pub(crate) fn effective_routes(cli_routes: &str, toml_routes: Option<&str>, exact: bool) -> String {
     match toml_routes {
-        Some(r) if cli_routes == "/" => r.to_string(),
+        Some(r) if cli_routes == "/" && !exact => r.to_string(),
         _ => cli_routes.to_string(),
     }
 }
@@ -236,8 +236,17 @@ pub(crate) fn compute_seeds(effective_routes: &str, excludes: &[String]) -> Vec<
 
 /// Crawl budget: the largest of `--crawl`, the uxlint.toml `crawl`, and the seed count (never fewer
 /// pages than were explicitly asked for). Pure.
-pub(crate) fn resolve_crawl_cap(cli_crawl: usize, toml_cap: usize, seed_count: usize) -> usize {
-    cli_crawl.max(toml_cap).max(seed_count)
+pub(crate) fn resolve_crawl_cap(
+    cli_crawl: usize,
+    toml_cap: usize,
+    seed_count: usize,
+    exact: bool,
+) -> usize {
+    if exact {
+        seed_count
+    } else {
+        cli_crawl.max(toml_cap).max(seed_count)
+    }
 }
 
 /// Parse `--viewports` ("name:WxH,..." ) into (name, w, h) triples, silently dropping malformed
@@ -496,6 +505,7 @@ pub(crate) fn resolve_target(
     let effective = effective_routes(
         &args.routes,
         project.as_ref().and_then(|p| p.routes.as_deref()),
+        args.exact_routes,
     );
     // Opening banner: what's being audited, then the dimmed setup facts under it.
     {
@@ -581,7 +591,7 @@ pub(crate) fn resolve_target(
             ))
         );
     }
-    let crawl_cap = resolve_crawl_cap(args.crawl, toml_cap, seeds.len());
+    let crawl_cap = resolve_crawl_cap(args.crawl, toml_cap, seeds.len(), args.exact_routes);
     // Goals validate WHOLE-SITE reachability, so only walk them on a full-site audit — a crawl or a
     // multi-route run. A single-route, no-crawl audit (a targeted check / verify) skips them, and
     // --no-goals (also accepted as --no-wayfind) forces off.
