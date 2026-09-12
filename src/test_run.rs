@@ -583,11 +583,20 @@ pub(crate) const SUBMIT_JS: &str = r#"(() => {
   const p = document.querySelector('input[type=password]');
   const e = document.querySelector('input[autocomplete=username], input[type=email], input[type=text]');
   const form = (p && p.form) || (e && e.form);
-  const btn = [...document.querySelectorAll('button[type=submit], input[type=submit], button')]
-    .find(b => !b.disabled && /log ?in|sign ?in|continue|submit|next/i.test(b.textContent || b.value || ''));
+  // Submit only the form whose credentials we filled. A document-wide label match can
+  // select an OAuth/dev-account shortcut and silently audit a different identity.
+  const buttons = [...document.querySelectorAll('button, input[type=submit]')];
+  if (form) {
+    const submits = buttons.filter(b => b.form === form && b.type === 'submit');
+    const btn = submits.find(b => !b.disabled);
+    if (btn) { btn.click(); return 'clicked'; }
+    if (submits.length) return 'no-submit'; // preserve the form's disabled/loading gate
+    if (form.requestSubmit) { form.requestSubmit(); return 'requestSubmit'; }
+    return 'no-submit'; // native submit() bypasses validation and framework handlers
+  }
+  const btn = buttons.find(b => !b.disabled &&
+    /^(log ?in|sign ?in|continue|submit|next)$/i.test((b.textContent || b.value || '').trim()));
   if (btn) { btn.click(); return 'clicked'; }
-  if (form && form.requestSubmit) { form.requestSubmit(); return 'requestSubmit'; }
-  if (form) { form.submit(); return 'submit'; }
   return 'no-submit';
 })()"#;
 
@@ -1507,6 +1516,51 @@ mod wait_tests {
         assert_eq!(
             wait_fingerprint(&running("Auditing…")),
             wait_fingerprint(&running("Auditing…"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod login_submit_tests {
+    #[test]
+    fn credential_form_wins_over_account_shortcuts() {
+        let driver = r#"
+const submit = process.argv[1];
+const assert = require('assert');
+let clicked, requested, buttons, form;
+const button = (text, owner, type='submit', disabled=false) =>
+  ({textContent:text, form:owner, type, disabled, click(){clicked=text;}});
+global.document = {
+  querySelector: () => ({form}),
+  querySelectorAll: () => buttons,
+};
+const run = () => { clicked=null; requested=false; return eval(submit); };
+form = {requestSubmit(){requested=true;}};
+// Real worldbuilding login shape: fixed dev-account shortcuts precede the credential form.
+buttons = [button('Dev1 Login', null, 'button'), button('Sign in with Google', null, 'button'),
+           button('Sign in', form)];
+assert.equal(run(), 'clicked'); assert.equal(clicked, 'Sign in');
+buttons[2].disabled=true;
+assert.equal(run(), 'no-submit'); assert.equal(clicked, null); assert.equal(requested, false);
+buttons.pop();
+assert.equal(run(), 'requestSubmit'); assert.equal(requested, true);
+// External form-associated submit controls and input submit values also work.
+buttons = [button('', form)]; buttons[0].value='Authenticate';
+assert.equal(run(), 'clicked');
+form=null;
+buttons = [button('Dev1 Login', null, 'button'), button('Sign in with Google', null, 'button')];
+assert.equal(run(), 'no-submit');
+buttons.push(button('Continue', null, 'button'));
+assert.equal(run(), 'clicked'); assert.equal(clicked, 'Continue');
+"#;
+        let out = std::process::Command::new("node")
+            .args(["-e", driver, super::SUBMIT_JS])
+            .output()
+            .expect("node is required for login selection regression tests");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
