@@ -115,6 +115,7 @@ fn shot_url(
 /// its location, fix, and the annotated screenshot URL — so a caller never re-parses the text or
 /// hunts through report JSON for images.
 fn audit_structured(report: &Value, server: &str, full: bool) -> Value {
+    let guidance = agent_summary(report);
     let report_id = report_id_of(report);
     let empty = vec![];
     let mut findings = Vec::new();
@@ -173,6 +174,10 @@ fn audit_structured(report: &Value, server: &str, full: bool) -> Value {
         // on a clean run, so a caller can trust the finding set is complete.
         "timed_out": report["timed_out"].as_bool().unwrap_or(false),
         "timeout": report["timeout_detail"],
+        // What to read FIRST: the report link, warnings, how each page was read, the action plan, and
+        // each root cause as one line. Claude Code shows the agent this structured result rather than
+        // the text, so this is where the guidance has to be. Null from a server that predates it.
+        "summary": guidance,
         "findings": findings,
         // Compact form: each rule's fix, once. (Full form carries it on every finding instead.)
         "fixes": if full { Value::Null } else { Value::Object(fixes) },
@@ -194,23 +199,8 @@ fn agent_prose(report: &Value, server: &str, feedback_enabled: bool) -> String {
     let Some(text) = report["agent_text"].as_str() else {
         return report_text(report, server, feedback_enabled);
     };
-    let mut body = text.to_string();
-    for (n, w) in report["agent_where"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let finding = &report["pages"][w["page"].as_u64().unwrap_or(0) as usize]["findings"]
-            [w["finding"].as_u64().unwrap_or(0) as usize];
-        let at = match finding["source"].as_str() {
-            Some(src) => format!(" · source: {src}"),
-            None => w["fallback"].as_str().unwrap_or("").to_string(),
-        };
-        body = body.replace(&format!("{{{{where:{n}}}}}"), &at);
-    }
     let mut t = local_warnings(report);
-    t.push_str(&body);
+    t.push_str(&fill_where(text, report));
     t.push_str(&local_dry(report));
     if feedback_enabled {
         let mut rules: Vec<String> = Vec::new();
@@ -232,6 +222,38 @@ fn agent_prose(report: &Value, server: &str, feedback_enabled: bool) -> String {
         }
     }
     t
+}
+
+/// The server's compact summary (`agent_summary`), completed the same way as the full prose — for the
+/// STRUCTURED result, which is what Claude Code actually hands the agent (it doesn't show a tool's
+/// text when structured content is present; found 2026-09-25). `None` from a server too old to send it.
+fn agent_summary(report: &Value) -> Option<String> {
+    let text = report["agent_summary"].as_str()?;
+    let mut t = local_warnings(report);
+    t.push_str(&fill_where(text, report));
+    t.push_str(&local_dry(report));
+    Some(t)
+}
+
+/// Replace each `{{where:N}}` the server left with the finding's LOCAL source hint (source never leaves
+/// the machine), or the selector fallback the server gave when there's none.
+fn fill_where(text: &str, report: &Value) -> String {
+    let mut body = text.to_string();
+    for (n, w) in report["agent_where"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let finding = &report["pages"][w["page"].as_u64().unwrap_or(0) as usize]["findings"]
+            [w["finding"].as_u64().unwrap_or(0) as usize];
+        let at = match finding["source"].as_str() {
+            Some(src) => format!(" · source: {src}"),
+            None => w["fallback"].as_str().unwrap_or("").to_string(),
+        };
+        body = body.replace(&format!("{{{{where:{n}}}}}"), &at);
+    }
+    body
 }
 
 /// What this client found wrong with the RUN itself — a config that audits signed out, thin seed
@@ -2428,6 +2450,18 @@ mod report_tool_tests {
         );
         assert!(t.contains("[warn] b (/y·desktop) · selector: .b"), "{t}");
         assert!(!t.contains("{{where"), "no token survives: {t}");
+        // The structured result carries the summary, completed the same way.
+        let mut r = report.clone();
+        r["agent_summary"] = json!("Grade B\n[warn] a (/x·desktop){{where:0}}\n");
+        let sm = super::audit_structured(&r, "https://uxlint.net", false)["summary"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            sm.starts_with("⚠ CONFIG")
+                && sm.contains("[warn] a (/x·desktop) · source: src/A.svelte:12"),
+            "{sm}"
+        );
     }
 
     #[test]
