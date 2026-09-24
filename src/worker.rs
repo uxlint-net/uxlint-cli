@@ -425,6 +425,14 @@ const SHADOW_REGISTRY_JS: &str = r#"(() => { try {
 // Author opt-out: any element carrying the `uxlint-hide` class is removed from the audit — a site
 // tags dev-only or noise chrome (an env banner, a "DEV" marker, a debug toolbar) with it and that
 // chrome vanishes from screenshots AND from the captured element set, so it never seeds findings.
+//
+// Dev-server tooling gets the same treatment WITHOUT anyone tagging it: framework dev toolbars
+// (Astro's, Next's dev indicator), Vue / TanStack Query devtools, the Svelte inspector, and the
+// Vite / webpack / Next ERROR overlays. None of it ships, and a full-viewport error overlay didn't
+// just add noise — every hit-test landed on it, so controls all over the page read as covered.
+// Reported from the field on 2026-09-24 (audits of local dev servers). The error overlays are hidden
+// but still DETECTED by the collector (`js.errorOverlay`) and reported as `dev-error-overlay`,
+// because an app showing a compile error is the one finding that matters on that page.
 // Injected as an init script (before the page's own scripts, on every document) so the elements are
 // display:none from first paint — never flashing into a screenshot and zero-sized to the collector.
 // Inert on the real site: the class does nothing unless THIS stylesheet is present, which only the
@@ -434,7 +442,7 @@ const UXLINT_HIDE_JS: &str = r#"(() => { try {
     if (document.getElementById('__uxlint_hide')) return;
     const s = document.createElement('style');
     s.id = '__uxlint_hide';
-    s.textContent = '.uxlint-hide{display:none !important;}';
+    s.textContent = '.uxlint-hide,vite-error-overlay,#webpack-dev-server-client-overlay,nextjs-portal,astro-dev-toolbar,#__vue-devtools-container__,.tsqd-parent-container,#svelte-inspector-host{display:none !important;}';
     (document.head || document.documentElement).appendChild(s);
   };
   if (document.head || document.documentElement) inject();

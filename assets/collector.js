@@ -407,7 +407,18 @@ function collectSnapshot() {
 					count++;
 				}
 			}
-			return { bytes, count, dev, domNodes: document.getElementsByTagName('*').length };
+			// A dev server's ERROR overlay over the page: the app failed to compile or threw, and every
+			// other finding is about a screen no build will ship. Detected by presence — the audit's
+			// init stylesheet hides these (worker.rs UXLINT_HIDE_JS) so the page under them is still
+			// captured, and hidden elements are still in the DOM. Named so the finding can say whose.
+			let errorOverlay = '';
+			if (document.querySelector('vite-error-overlay')) errorOverlay = 'Vite';
+			else if (document.getElementById('webpack-dev-server-client-overlay')) errorOverlay = 'webpack';
+			else {
+				const np = document.querySelector('nextjs-portal');
+				if (np && np.shadowRoot && np.shadowRoot.querySelector('[data-nextjs-dialog], [data-nextjs-dialog-overlay]')) errorOverlay = 'Next.js';
+			}
+			return { bytes, count, dev, errorOverlay, domNodes: document.getElementsByTagName('*').length };
 		} catch (_) { return { bytes: 0, count: 0, domNodes: 0 }; }
 	})();
 
