@@ -986,7 +986,9 @@ fn project_setup_instructions(
          site_type = \"saas\"          # saas | marketing | ecommerce | content | portfolio | aggregator\n  \
          styleguide = \"/styleguide\"  # the design-system page, if this project has one\n  \
          exclude = [\"/admin/*\"]      # routes the audit must never open (demos, fixtures, destructive tools)\n  \
-         desktop_only = [\"/editor/*\"] # desktop-primary surfaces, so mobile findings there stay info-level\n\n\
+         desktop_only = [\"/editor/*\"] # desktop-primary surfaces, so mobile findings there stay info-level\n\n  \
+         [page_kinds]                 # only if a report shows a page read as the wrong kind\n  \
+         \"/projects/*/edit\" = \"app-workspace\"  # marketing | document | auth | app | app-collection | app-record | app-workspace | app-form\n\n\
          If the app is behind a login, add a persona — the local client replays it, so no secret \
          reaches this tool or the transcript. Ask the user for the credential; a real secret goes in \
          a gitignored .env as ${{VAR}}, only a throwaway dev login is ever inlined:\n\n  \

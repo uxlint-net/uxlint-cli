@@ -62,6 +62,10 @@ pub(crate) struct ProjectConfig {
     /// on these routes below the desktop width to `info` — so a mobile layout complaint there doesn't
     /// gate CI or read as an error. Same wildcard grammar as `exclude`.
     pub(crate) desktop_only: Vec<String>,
+    /// `[page_kinds]` — route glob → page kind (`"/projects/*/edit" = "app-workspace"`). The server
+    /// classifies every page itself; this is how a project CORRECTS a misreading, and it wins. Same
+    /// wildcard grammar as `exclude`.
+    pub(crate) page_kinds: Vec<(String, String)>,
 }
 
 pub(crate) fn project_config() -> Option<ProjectConfig> {
@@ -167,6 +171,17 @@ pub(crate) fn project_config() -> Option<ProjectConfig> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // [page_kinds] "/projects/*/edit" = "app-workspace" — a project's correction of how the
+            // server read a page (see `ProjectConfig::page_kinds`). Order kept: first match wins.
+            let page_kinds = v
+                .get("page_kinds")
+                .and_then(|t| t.as_table())
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|(glob, kind)| Some((glob.clone(), kind.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
             return Some(ProjectConfig {
                 org,
                 site,
@@ -179,6 +194,7 @@ pub(crate) fn project_config() -> Option<ProjectConfig> {
                 styleguide,
                 exclude,
                 desktop_only,
+                page_kinds,
             });
         }
         if !dir.pop() {

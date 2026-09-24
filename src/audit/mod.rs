@@ -553,6 +553,10 @@ pub(crate) fn run_audit_ext(
         .as_ref()
         .map(|p| p.desktop_only.clone())
         .unwrap_or_default();
+    let page_kinds = project
+        .as_ref()
+        .map(|p| p.page_kinds.clone())
+        .unwrap_or_default();
     // Fold duplicate auth walls (many gated URLs anonymously render the SAME login) into ONE
     // representative page — so they're counted + linted once, not N times. Runs AFTER walk pages merge
     // and BEFORE the payload build, since the server lints exactly what we post. The folded routes ride
@@ -584,6 +588,7 @@ pub(crate) fn run_audit_ext(
         theme: theme.as_ref(),
         site_type: site_type.as_deref(),
         desktop_only: &desktop_only,
+        page_kinds: &page_kinds,
     });
     // --dry-run: this is the whole point of the flag — write the EXACT payload we would POST to disk
     // (with screenshots split out as viewable JPEGs) and stop, without sending anything to the
@@ -1500,6 +1505,7 @@ mod request_tests {
             theme: None,
             site_type: Some("saas"),
             desktop_only: &[],
+            page_kinds: &[],
         }
     }
 
@@ -1548,6 +1554,25 @@ mod request_tests {
         let body = build_audit_request(&inputs);
         assert_eq!(body["crawl"], 0);
         assert!(body.get("crawl").is_some_and(|v| !v.is_null()));
+    }
+
+    /// A project's `[page_kinds]` corrections reach the server in order, as {route, kind} pairs.
+    #[test]
+    fn page_kind_overrides_ride_in_the_request_body() {
+        let prov = AuditProvenance {
+            git_sha: None,
+            git_branch: None,
+            runner: String::new(),
+            change_url: None,
+        };
+        let kinds = vec![("/projects/*/edit".to_string(), "app-workspace".to_string())];
+        let mut inputs = sample_inputs(&prov);
+        inputs.page_kinds = &kinds;
+        let body = build_audit_request(&inputs);
+        assert_eq!(
+            body["page_kinds"][0],
+            serde_json::json!({"route": "/projects/*/edit", "kind": "app-workspace"})
+        );
     }
 
     #[test]
