@@ -836,6 +836,9 @@ pub(crate) struct PassShared {
     /// as a clean capture that quietly yielded nothing (field report). Not cleared between auth
     /// states: a hang in any state is a finding.
     pub(crate) hung: Mutex<Vec<Value>>,
+    /// Routes whose interaction / resilience / fault passes were SKIPPED so the remaining pages could
+    /// still be captured at rest inside the time cap (see `trim_depth`).
+    pub(crate) depth_trimmed: std::sync::atomic::AtomicUsize,
     /// Routes that produced no capture on the first pass (nav failure, rate-limited,
     /// challenged) — later viewport passes skip them instead of re-paying the timeout.
     pub(crate) failed: Mutex<Vec<String>>,
@@ -1481,7 +1484,38 @@ pub(crate) fn audit_route(
     let log_len = || logbuf.lock().map(|v| v.len()).unwrap_or(0);
     let load_mark = log_len();
     let tp_states = std::time::Instant::now();
-    let interactions = if ctx.args.states && ctx.name == "desktop" {
+    // Coverage before depth: when the time left no longer covers capturing every remaining page at
+    // rest, skip this route's extra passes rather than run out of time with pages unseen.
+    let trimmed = {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = shared.crawl_done.load(Relaxed);
+        let remaining = shared.crawl_total.load(Relaxed).saturating_sub(done);
+        let at_rest_ms = shared.t_nav.load(Relaxed)
+            + shared.t_settle.load(Relaxed)
+            + shared.t_capture.load(Relaxed);
+        let time_left = shared
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        let wants_depth = ctx.name == "desktop"
+            && (ctx.args.states
+                || ctx.args.resilience
+                || ctx.args.slow_network
+                || ctx.args.probe_errors);
+        let trim = wants_depth
+            && trim_depth(
+                time_left,
+                remaining,
+                done,
+                at_rest_ms,
+                shared.route_peak.load(Relaxed) as usize,
+            );
+        if trim && shared.depth_trimmed.fetch_add(1, Relaxed) == 0 {
+            note!(ctx.progress, "  ⏱ time is short — capturing the remaining pages at rest and skipping their interaction checks, so no page goes unseen");
+        }
+        trim
+    };
+    let interactions = if ctx.args.states && ctx.name == "desktop" && !trimmed {
         let _states_conc = Concurrency::enter(&shared.states_active, &shared.states_peak);
         tab.set_default_timeout(std::time::Duration::from_secs(8));
         let tph = std::time::Instant::now();
@@ -1615,6 +1649,7 @@ pub(crate) fn audit_route(
     // NEXT route, not this one's post-mortem.
     let tp_res = std::time::Instant::now();
     let resilience = if (ctx.args.resilience || ctx.args.slow_network)
+        && !trimmed
         && ctx.name == "desktop"
         && !auth_blocked
         && renderer_ok
@@ -1634,7 +1669,12 @@ pub(crate) fn audit_route(
         None
     };
     add_ms(&shared.t_resilience, tp_res);
-    let fault = if ctx.args.probe_errors && ctx.name == "desktop" && !auth_blocked && renderer_ok {
+    let fault = if ctx.args.probe_errors
+        && ctx.name == "desktop"
+        && !auth_blocked
+        && renderer_ok
+        && !trimmed
+    {
         let fr = probe_error_state(tab, &url);
         note!(
             ctx.progress,
@@ -1671,6 +1711,30 @@ pub(crate) fn audit_route(
         "final_path": final_path,
         "cls": cls
     })))
+}
+
+/// Should this route skip its interaction / resilience / fault passes so every remaining page can
+/// still be captured AT REST before the time cap? True when the seconds left no longer cover the
+/// remaining captures at the at-rest pace measured so far (spread over the workers actually running),
+/// with a 30% margin.
+///
+/// The passes used to run route by route to completion, so a tight cap cut COVERAGE, not depth: a
+/// field run on 2026-09-24 captured 12 of 24 pages (~25s a page) and timed out with half the site
+/// unseen. A page never captured has no findings at all; a page captured without its hover and
+/// dialog probes still has every at-rest one. Before any capture has finished there is no pace to
+/// judge by, so nothing is trimmed on a guess.
+pub(crate) fn trim_depth(
+    time_left_s: f64,
+    remaining: usize,
+    done: usize,
+    at_rest_ms_total: u64,
+    parallel: usize,
+) -> bool {
+    if remaining == 0 || done == 0 {
+        return false;
+    }
+    let per_capture_s = at_rest_ms_total as f64 / 1000.0 / done as f64;
+    time_left_s < remaining as f64 * per_capture_s * 1.3 / parallel.max(1) as f64
 }
 
 /// Tag each console entry with the part of the capture it arrived in — `load`, `interaction` or
@@ -1713,6 +1777,20 @@ pub(crate) fn tag_console_phases(
 
 #[cfg(test)]
 mod same_site_tests {
+    #[test]
+    fn depth_is_trimmed_only_when_time_no_longer_covers_the_remaining_pages() {
+        use super::trim_depth;
+        // 10 captures took 60s at rest → 6s each. 12 left on 2 workers need ~47s with margin.
+        assert!(
+            trim_depth(30.0, 12, 10, 60_000, 2),
+            "30s can't cover 12 more pages"
+        );
+        assert!(!trim_depth(120.0, 12, 10, 60_000, 2), "120s can");
+        // No pace measured yet: never trim on a guess. Nothing left: nothing to protect.
+        assert!(!trim_depth(1.0, 12, 0, 0, 1));
+        assert!(!trim_depth(1.0, 0, 10, 60_000, 1));
+    }
+
     #[test]
     fn console_entries_are_tagged_by_the_phase_they_arrived_in() {
         let e = |t: &str| serde_json::json!({"source": "network", "level": "error", "text": t});

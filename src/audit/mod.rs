@@ -261,6 +261,7 @@ pub(crate) fn run_audit_ext(
         anon: Mutex::new(Vec::new()),
         bot_blocked: Mutex::new(Vec::new()),
         hung: Mutex::new(Vec::new()),
+        depth_trimmed: std::sync::atomic::AtomicUsize::new(0),
         failed: Mutex::new(Vec::new()),
         throttled: std::sync::atomic::AtomicBool::new(false),
         serial: Mutex::new(()),
@@ -384,6 +385,9 @@ pub(crate) fn run_audit_ext(
     let anon_routes: Vec<String> = shared.anon.lock().unwrap().clone();
     let bot_blocked_routes: Vec<String> = shared.bot_blocked.lock().unwrap().clone();
     let hung_routes: Vec<Value> = shared.hung.lock().unwrap().clone();
+    let depth_trimmed = shared
+        .depth_trimmed
+        .load(std::sync::atomic::Ordering::Relaxed);
     if !bot_blocked_routes.is_empty() {
         note!(progress,
             "\n  ⚠ bot protection intercepted {} route(s): {}\n    uxlint identifies itself as \"uxlint/0.1 (+https://uxlint.net)\" and does not evade bot\n    detection. Allowlist that user agent (or your audit source IP) in your WAF/CDN, or\n    audit a staging host.",
@@ -594,6 +598,9 @@ pub(crate) fn run_audit_ext(
     if let Ok(report) = &mut out {
         if !config_warnings.is_empty() {
             report["config_warnings"] = json!(config_warnings);
+        }
+        if depth_trimmed > 0 {
+            report["depth_trimmed"] = json!(depth_trimmed);
         }
     }
     out

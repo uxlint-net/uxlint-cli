@@ -287,6 +287,13 @@ fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
         }
         t.push_str("\n\n");
     }
+    // Coverage was protected by skipping depth: every page was captured, but some without their
+    // interaction checks. Say so, so "no hover/dialog findings" there isn't read as "clean".
+    if let Some(n) = report["depth_trimmed"].as_u64().filter(|n| *n > 0) {
+        t.push_str(&format!(
+            "⏱ Time was short, so {n} page(s) were captured at rest without their interaction checks (hover, focus, dialogs, fault probes) — every page was still seen. Raise the time cap (--timeout, or uxlint.toml `timeout`) for full depth.\n\n"
+        ));
+    }
     // Warn the agent up front when the audit hit its time cap — the finding set
     // below may be partial, so "clean" here doesn't mean the whole site was checked.
     if report["timed_out"].as_bool() == Some(true) {
