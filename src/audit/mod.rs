@@ -126,12 +126,12 @@ pub(crate) fn run_audit_ext(
     let args = inject_credentials(args, progress);
     // A config that will audit SIGNED OUT when it plainly meant not to (see `persona_warnings`) is
     // said BEFORE the crawl the user is about to wait for, and again at the top of the report.
-    let config_warnings = crate::project::persona_warnings();
+    let mut config_warnings = crate::project::persona_warnings();
     for w in &config_warnings {
         note!(
             progress,
             "{}",
-            crate::style::Stream::Err.yellow(&format!("  ⚠ uxlint.toml: {w}"))
+            crate::style::Stream::Err.yellow(&format!("  ⚠ {w}"))
         );
     }
     let args = &args;
@@ -438,6 +438,18 @@ pub(crate) fn run_audit_ext(
     // Signed-out gating re-check: routes that showed account affordances while signed in should
     // redirect a logged-out visitor, not strand them. Only meaningful when we WERE signed in.
     let was_authed = !args.storage.is_empty() || !args.headers.is_empty();
+    // Signed in (by session OR by form) and most of what it saw was empty: the account's seed data is
+    // too thin to judge the app — see `thin_seed_warning`.
+    if was_authed || args.username.is_some() {
+        if let Some(w) = thin_seed_warning(&pages) {
+            note!(
+                progress,
+                "{}",
+                crate::style::Stream::Err.yellow(&format!("  ⚠ {w}"))
+            );
+            config_warnings.push(w);
+        }
+    }
     let (anon_checks, login_discoverable) =
         run_signed_out_gating(args, &anon_routes, was_authed, deadline, progress);
 
@@ -604,6 +616,30 @@ pub(crate) fn run_audit_ext(
         }
     }
     out
+}
+
+/// A signed-in audit whose pages were mostly EMPTY STATES was run against an account with too little
+/// data to judge the app. Field report, 2026-08-31: thin seed data produced a false duplicate-heading
+/// finding (a component echoing the title when a description was empty) AND hid two real ones (line
+/// measure, a missing focus ring) that only appeared once the record held real prose — and the report
+/// gave no sign either way. Not a UX finding (the site isn't wrong; the audit's account is), so it is
+/// a warning at the top of the result. Keyed on the collector's own empty-state detection rather than
+/// a word count, because a dashboard legitimately has little prose and would trip any threshold.
+fn thin_seed_warning(pages: &[Value]) -> Option<String> {
+    let desktop: Vec<&Value> = pages
+        .iter()
+        .filter(|p| p["viewport"].as_str() == Some("desktop"))
+        .collect();
+    let empty = desktop
+        .iter()
+        .filter(|p| p["snapshot"]["emptyState"].as_bool() == Some(true))
+        .count();
+    (desktop.len() >= 2 && empty * 2 >= desktop.len()).then(|| {
+        format!(
+            "{empty} of {} signed-in pages showed an EMPTY state — the account holds too little data to judge lists, tables, density and long text. Seed realistic records and re-run: findings about those may be missing, and some may only exist because the data is thin",
+            desktop.len()
+        )
+    })
 }
 
 /// The `audit_jobs` row that makes THIS run visible in the web while it happens (`POST
@@ -1023,6 +1059,43 @@ fn merge_walk_pages(pages: &mut Vec<Value>, walk_pages: Vec<Value>, cap: usize) 
         added += 1;
     }
     (added, over_cap)
+}
+
+#[cfg(test)]
+mod thin_seed_tests {
+    use super::thin_seed_warning;
+    use serde_json::json;
+
+    fn page(vp: &str, empty: bool) -> serde_json::Value {
+        json!({"viewport": vp, "snapshot": {"emptyState": empty}})
+    }
+
+    #[test]
+    fn mostly_empty_signed_in_pages_warn_and_a_real_account_does_not() {
+        // THE 2026-08-31 report: thin seed data both invented and hid findings, silently.
+        let w = thin_seed_warning(&[
+            page("desktop", true),
+            page("desktop", true),
+            page("desktop", false),
+            page("mobile", true),
+        ]);
+        assert!(
+            w.as_deref()
+                .is_some_and(|w| w.starts_with("2 of 3 signed-in pages showed an EMPTY state")),
+            "{w:?}"
+        );
+        // One empty list among real pages is a page's own empty state, not a thin account.
+        assert_eq!(
+            thin_seed_warning(&[
+                page("desktop", true),
+                page("desktop", false),
+                page("desktop", false)
+            ]),
+            None
+        );
+        // A single page is not evidence about the account.
+        assert_eq!(thin_seed_warning(&[page("desktop", true)]), None);
+    }
 }
 
 #[cfg(test)]

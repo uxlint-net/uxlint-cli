@@ -367,6 +367,9 @@ pub(crate) fn persona_warnings() -> Vec<String> {
     find_project_toml()
         .map(|(_, v)| persona_warnings_in(&v))
         .unwrap_or_default()
+        .into_iter()
+        .map(|w| format!("uxlint.toml: {w}"))
+        .collect()
 }
 
 fn persona_warnings_in(v: &toml::Value) -> Vec<String> {
