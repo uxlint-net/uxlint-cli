@@ -549,7 +549,13 @@ pub(crate) fn resolve_target(
         args.org.as_deref(),
         project.as_ref().map(|p| p.org.as_str()),
     );
-    if site.is_none() {
+    // An UNFILED run (MCP first run) deliberately names no site — see `AuditArgs::unfiled`.
+    let (site, org) = if args.unfiled {
+        (None, None)
+    } else {
+        (site, org)
+    };
+    if site.is_none() && !args.unfiled {
         anyhow::bail!(
             "no site for this audit of {}. Pass --site <host> (or set UXLINT_SITE), pin it with `uxlint init`, or create it: `uxlint site create <host>`.",
             args.base
@@ -838,6 +844,11 @@ pub(crate) fn capture_viewports(
 pub(crate) fn run_signed_out_gating(
     args: &AuditArgs,
     anon_routes: &[String],
+    // Every OTHER captured route, re-visited signed out only to learn whether it's PRIVATE (bounced to
+    // sign-in) — the server's page classification reads that (a signed-in editor with no account
+    // chrome still reads as part of the app). Tagged `account_view: false`, so the gating verdict,
+    // which is about account views that should redirect, never judges a public page by it.
+    extra_routes: &[String],
     was_authed: bool,
     deadline: std::time::Instant,
     progress: &(dyn Progress + Sync),
@@ -849,7 +860,7 @@ pub(crate) fn run_signed_out_gating(
         // (to see where a logged-out visitor gets bounced — that's the login URL).
         let probe_routes: Vec<String> = {
             let mut v = vec!["/".to_string()];
-            for r in anon_routes {
+            for r in anon_routes.iter().chain(extra_routes) {
                 if !v.contains(r) {
                     v.push(r.clone());
                 }
@@ -928,6 +939,7 @@ pub(crate) fn run_signed_out_gating(
                             "text_len": probe["textLen"].as_f64().unwrap_or(0.0),
                             "signin": probe["signin"].as_bool().unwrap_or(false),
                             "login_href": probe["loginHref"].as_str().unwrap_or(""),
+                            "account_view": route == "/" || anon_routes.contains(route),
                         }));
                     }
                 });

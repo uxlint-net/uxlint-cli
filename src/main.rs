@@ -344,6 +344,11 @@ pub(crate) struct AuditArgs {
     /// Internal MCP verification scope: a root route must not expand to project defaults.
     #[arg(skip)]
     pub(crate) exact_routes: bool,
+    /// Internal (MCP first run): audit WITHOUT filing the report under a site, because none has been
+    /// set up yet and creating one is its owner's call. The report is reachable by its link and the
+    /// result, but joins no site's history. See `mcp::audit_url`.
+    #[arg(skip)]
+    pub(crate) unfiled: bool,
     /// Viewports as name:WxH, comma-separated
     #[arg(long, default_value = "desktop:1440x900,mobile:390x844")]
     pub(crate) viewports: String,

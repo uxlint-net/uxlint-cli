@@ -52,6 +52,8 @@ pub(crate) struct AuditRequestInputs<'a> {
     /// `[page_kinds]` route-glob → kind overrides (uxlint.toml) — the server applies them over its own
     /// classification. Empty ⇒ the server's reading stands.
     pub(crate) page_kinds: &'a [(String, String)],
+    /// File under NO site (`AuditArgs::unfiled`) — the server skips attaching the report anywhere.
+    pub(crate) unfiled: bool,
 }
 
 /// Assemble the exact JSON body POSTed to `/v1/audit`. THE single visible place where the upload
@@ -63,6 +65,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "pages": i.pages,
         "org": i.org,
         "site": i.site,
+        "unfiled": i.unfiled,
         "tests": i.tests,
         "anon_checks": i.anon_checks,
         "login_discoverable": i.login_discoverable,

@@ -1567,6 +1567,11 @@ function collectSnapshot() {
 			borderBW: cs.borderBottomStyle !== 'none' ? parseFloat(cs.borderBottomWidth) || 0 : 0,
 			bgA: ownBg ? ownBg.a : 0,
 			bgRgb: ownBg && ownBg.a >= 0.5 ? { r: ownBg.r, g: ownBg.g, b: ownBg.b } : null,
+			// A colour set INLINE on this element (style="background:#e5484d", or a custom property
+			// carrying one) is almost always DATA: per-item colour coding, a user's label colour, a
+			// swatch. The site's accent comes from its stylesheet. Field report, 2026-09-24: the
+			// "accent" measured on two editor pages was the clips' colour coding. Omitted when false.
+			inlineColour: /(#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(|oklch\()/i.test(el.getAttribute('style') || '') || undefined,
 			borderRgb:
 				cs.borderTopStyle !== 'none' && parseFloat(cs.borderTopWidth) > 0
 					? parseColor(cs.borderTopColor)
@@ -1713,6 +1718,8 @@ function collectSnapshot() {
 	const palette = [];
 	for (const e of els) {
 		if (e.ariaHidden || e.y > vh * 3) continue;
+		// Data-driven colours (see `inlineColour`) say nothing about the site's palette.
+		if (e.inlineColour) continue;
 		const visW = Math.min(Math.max(e.w, 0), vw);
 		const visH = Math.max(e.h, 0);
 		if (e.bgA >= 0.5 && e.bgRgb && visW * visH > 64)
