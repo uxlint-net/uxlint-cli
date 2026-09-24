@@ -260,6 +260,7 @@ pub(crate) fn run_audit_ext(
         results: Mutex::new(Vec::new()),
         anon: Mutex::new(Vec::new()),
         bot_blocked: Mutex::new(Vec::new()),
+        hung: Mutex::new(Vec::new()),
         failed: Mutex::new(Vec::new()),
         throttled: std::sync::atomic::AtomicBool::new(false),
         serial: Mutex::new(()),
@@ -382,6 +383,7 @@ pub(crate) fn run_audit_ext(
     // joined once, right before this function returns.
     let anon_routes: Vec<String> = shared.anon.lock().unwrap().clone();
     let bot_blocked_routes: Vec<String> = shared.bot_blocked.lock().unwrap().clone();
+    let hung_routes: Vec<Value> = shared.hung.lock().unwrap().clone();
     if !bot_blocked_routes.is_empty() {
         note!(progress,
             "\n  ⚠ bot protection intercepted {} route(s): {}\n    uxlint identifies itself as \"uxlint/0.1 (+https://uxlint.net)\" and does not evade bot\n    detection. Allowlist that user agent (or your audit source IP) in your WAF/CDN, or\n    audit a staging host.",
@@ -543,6 +545,7 @@ pub(crate) fn run_audit_ext(
         open_redirect: &open_redirect,
         styleguide: &styleguide_probe,
         bot_blocked_routes: &bot_blocked_routes,
+        hung_routes: &hung_routes,
         labels: &args.labels,
         timed_out,
         crawl: args.crawl,
@@ -1394,6 +1397,7 @@ mod request_tests {
             open_redirect: &Value::Null,
             styleguide: &Value::Null,
             bot_blocked_routes: &[],
+            hung_routes: &[],
             labels: &[],
             timed_out: false,
             crawl: 8,

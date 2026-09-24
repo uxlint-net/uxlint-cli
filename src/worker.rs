@@ -830,6 +830,12 @@ pub(crate) struct PassShared {
     pub(crate) results: Mutex<Vec<(usize, Value)>>,
     pub(crate) anon: Mutex<Vec<String>>,
     pub(crate) bot_blocked: Mutex<Vec<String>>,
+    /// Routes that HUNG the browser — `{route, stage, secs}` — for the server's `page-hung`. A route
+    /// whose load never finished on two tabs, or whose interaction passes froze the tab, used to be
+    /// dropped with a progress note and nothing in the report: a page that crashes the browser read
+    /// as a clean capture that quietly yielded nothing (field report). Not cleared between auth
+    /// states: a hang in any state is a finding.
+    pub(crate) hung: Mutex<Vec<Value>>,
     /// Routes that produced no capture on the first pass (nav failure, rate-limited,
     /// challenged) — later viewport passes skip them instead of re-paying the timeout.
     pub(crate) failed: Mutex<Vec<String>>,
@@ -1155,6 +1161,16 @@ pub(crate) fn audit_route(
                 }
                 Err(rev_err) => {
                     note!(ctx.progress, "  {} {route} … skipped after {:.1}s (nav timeout/error: {first_err}; revive failed: {rev_err})", ctx.name, t0.elapsed().as_secs_f64());
+                    // Only a TIMEOUT is a hang: a refused connection or a DNS error fails in
+                    // milliseconds and is the target being down, not the page freezing a browser.
+                    let secs = t0.elapsed().as_secs();
+                    if secs + 5 >= NAV_TIMEOUT_SECS {
+                        shared
+                            .hung
+                            .lock()
+                            .unwrap()
+                            .push(json!({"route": route, "stage": "load", "secs": secs}));
+                    }
                     return Ok(None);
                 }
             }
@@ -1580,6 +1596,11 @@ pub(crate) fn audit_route(
                 "  {} {route} … interaction pass wedged the renderer — replacing the tab",
                 ctx.name
             );
+            shared
+                .hung
+                .lock()
+                .unwrap()
+                .push(json!({"route": route, "stage": "interaction"}));
             if let Ok(fresh) = setup_tab(&wk.browser, ctx.args) {
                 *wk.slot.lock().unwrap() = fresh;
             }
