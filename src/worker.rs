@@ -1452,6 +1452,10 @@ pub(crate) fn audit_route(
     // still navigate — cheap when healthy, 3s cap when wedged. A wedged tab is replaced
     // here and now; a hung worker stalling the whole audit is a product dealbreaker.
     let mut renderer_ok = true;
+    // Console phase boundaries (see `tag_console_phases`): everything logged up to here is the page
+    // loading; from here to `probe_mark` is uxlint using it; after that, uxlint breaking it on purpose.
+    let log_len = || logbuf.lock().map(|v| v.len()).unwrap_or(0);
+    let load_mark = log_len();
     let tp_states = std::time::Instant::now();
     let interactions = if ctx.args.states && ctx.name == "desktop" {
         let _states_conc = Concurrency::enter(&shared.states_active, &shared.states_peak);
@@ -1575,6 +1579,7 @@ pub(crate) fn audit_route(
     }
     add_ms(&shared.t_spinner, tp_spin); // spinner recheck + renderer health gate
 
+    let probe_mark = log_len();
     // Fault injection (opt-in, desktop, non-auth-walled): fail data requests and see how
     // the error UX holds up. Runs LAST — it leaves the page broken. Skipped when the
     // renderer wedged — these passes navigate, and the replacement tab belongs to the
@@ -1622,7 +1627,11 @@ pub(crate) fn audit_route(
         "shot_h": ctx.h as f64,
         "interactions": interactions,
         "auth_blocked": auth_blocked,
-        "console": logbuf.lock().map(|v| v.clone()).unwrap_or_default(),
+        "console": tag_console_phases(
+            logbuf.lock().map(|v| v.clone()).unwrap_or_default(),
+            load_mark,
+            probe_mark,
+        ),
         "native_dialogs": native_dialogs.lock().map(|v| v.clone()).unwrap_or_default(),
         "fault": fault,
         "resilience": resilience,
@@ -1635,8 +1644,57 @@ pub(crate) fn audit_route(
     })))
 }
 
+/// Tag each console entry with the part of the capture it arrived in — `load`, `interaction` or
+/// `probe` — from the buffer's length at the two boundaries (`load_mark`: before the interaction
+/// passes; `probe_mark`: before the resilience and fault probes).
+///
+/// The buffer is read ONCE, after everything, and the server used to treat all of it as the page
+/// loading. So the offline probe's `ERR_INTERNET_DISCONNECTED` and the fault probe's wall of
+/// `ERR_FAILED` — failures uxlint causes on purpose — were reported as "N network requests failed
+/// while loading this page", and an error only a hover or a dialog-open provoked read as a startup
+/// bug. Found in the planning review of 2026-09-24. The server drops `probe` and words
+/// `interaction` honestly; an untagged entry (an older CLI) still reads as `load`.
+///
+/// CDP log events arrive on the listener's thread, so an entry that belongs to the load but lands a
+/// beat late is tagged `interaction` — the conservative direction: it is still reported, just
+/// without the "every visitor gets this" claim.
+pub(crate) fn tag_console_phases(
+    entries: Vec<Value>,
+    load_mark: usize,
+    probe_mark: usize,
+) -> Vec<Value> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut e)| {
+            let phase = if i < load_mark {
+                "load"
+            } else if i < probe_mark {
+                "interaction"
+            } else {
+                "probe"
+            };
+            if let Some(o) = e.as_object_mut() {
+                o.insert("phase".into(), json!(phase));
+            }
+            e
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod same_site_tests {
+    #[test]
+    fn console_entries_are_tagged_by_the_phase_they_arrived_in() {
+        let e = |t: &str| serde_json::json!({"source": "network", "level": "error", "text": t});
+        let got = super::tag_console_phases(vec![e("a"), e("b"), e("c"), e("d")], 1, 3);
+        let phases: Vec<&str> = got.iter().map(|v| v["phase"].as_str().unwrap()).collect();
+        assert_eq!(phases, ["load", "interaction", "interaction", "probe"]);
+        // No interaction or probe passes ran: both marks sit at the end, everything is load.
+        let got = super::tag_console_phases(vec![e("a"), e("b")], 2, 2);
+        assert!(got.iter().all(|v| v["phase"] == "load"));
+    }
+
     use super::{host_of, same_site};
 
     #[test]
