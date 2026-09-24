@@ -13,6 +13,7 @@ use crate::{AuditArgs, Cli};
 mod probes;
 mod provenance;
 mod request;
+mod target_id;
 // `pub(crate)` for `fetch_me`: the MCP server asks /v1/me for the account's real orgs and sites when
 // it has to tell an agent what to put in a missing uxlint.toml (`mcp::project_setup_instructions`).
 pub(crate) mod setup;
@@ -110,6 +111,11 @@ pub(crate) fn run_audit_ext(
         crawl_cap,
         run_goals,
     } = resolve_target(cli, args, progress)?;
+    // Is the app at --base the one this site's audits have been of? Checked before anything is
+    // announced, launched, signed into or filed — see `target_id` (field report, 2026-08-29).
+    if let Err(msg) = target_id::check_target(&args.base, site.as_deref(), args.accept_target) {
+        anyhow::bail!(msg);
+    }
     // Tell the server this run is starting, so the web shows it in progress exactly like a hosted
     // audit. A CLI/MCP audit used to be invisible for its whole duration — you'd kick one off from an
     // agent, open the dashboard, and see nothing at all until the finished report appeared minutes

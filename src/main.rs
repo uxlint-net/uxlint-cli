@@ -369,6 +369,12 @@ pub(crate) struct AuditArgs {
     /// delete flow are different acts and now take different consent.
     #[arg(long = "allow-mutation")]
     pub(crate) allow_mutation: bool,
+    /// The app at --base doesn't match what this machine last audited for the site, and it IS your
+    /// app now (renamed, re-branded): record the new one instead of stopping. uxlint stops on a clear
+    /// mismatch because another project's dev server on the same port would otherwise be crawled,
+    /// filed under this site, and handed this project's credentials.
+    #[arg(long = "accept-target")]
+    pub(crate) accept_target: bool,
     /// Fault-injection: fail the page's data (XHR/fetch) requests and check the error UX
     #[arg(long)]
     pub(crate) probe_errors: bool,

@@ -1276,6 +1276,7 @@ impl UxlintMcp {
             // behalf. This is the surface whose own description promised "only NAVIGATES and READS",
             // and it is now the surface that keeps that promise unconditionally.
             allow_mutation: false,
+            accept_target: false,
             crawl: a.crawl.unwrap_or(12) as usize,
             parallel: None, // auto: full throttle locally, polite on public hosts
             probe_errors: false,
@@ -1402,6 +1403,7 @@ impl UxlintMcp {
             password: None,
             states: a.states.unwrap_or(false),
             allow_mutation: false, // verify_fix re-checks a page; it never rehearses its delete flow
+            accept_target: false,
             crawl: 1,
             rule: None,
             // Crops scoped to the rule under test; the audit still reports everything it finds on
