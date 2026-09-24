@@ -959,6 +959,7 @@ pub(crate) fn spawn_partial_poster(
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default();
+            let mut last_post = std::time::Instant::now();
             loop {
                 // Throttle: ≥2s between posts, but wake in 100ms slices to exit promptly on stop.
                 for _ in 0..20 {
@@ -972,11 +973,19 @@ pub(crate) fn spawn_partial_poster(
                 // on stop. Runs for the WHOLE audit (crawl → walks → server), not just the crawl
                 // window, so the web banner can show phase + walk progress through the ~80s of AI
                 // review between the last crawl tick and the finished report.
-                if ps.dirty.swap(false, Relaxed) || stopping {
+                //
+                // It also posts on a 10s beat with nothing new, and before the first page exists: the
+                // clock is progress too. A run parked in discovery or on one slow route used to post
+                // NOTHING — the dashboard sat on "starting…" for minutes and read as hung (field
+                // report, 2026-09-24) — while the phase and the elapsed time were right here.
+                let beat = last_post.elapsed() >= std::time::Duration::from_secs(10);
+                if ps.dirty.swap(false, Relaxed) || stopping || beat {
                     let pages = ps.pages.lock().unwrap().clone();
-                    if !pages.is_empty() {
+                    let phase = ps.phase.lock().unwrap().clone();
+                    if !pages.is_empty() || !phase.is_empty() {
+                        last_post = std::time::Instant::now();
                         let total = ps.total.load(Relaxed).max(pages.len());
-                        let phase = ps.phase.lock().unwrap().clone();
+                        let (elapsed_secs, cap_secs) = ps.clock();
                         let walks_done = ps.walks_done.load(Relaxed);
                         let walks_total = ps.walks_total.load(Relaxed);
                         let _ = http
@@ -986,6 +995,7 @@ pub(crate) fn spawn_partial_poster(
                                 "partial": true, "pages_done": pages.len(), "pages_total": total, "pages": pages,
                                 "phase": phase, "walks_done": walks_done, "walks_total": walks_total,
                                 "viewports": ps.viewports.load(Relaxed),
+                                "elapsed_secs": elapsed_secs, "cap_secs": cap_secs,
                             }))
                             .send();
                     }

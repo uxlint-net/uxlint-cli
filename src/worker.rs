@@ -711,10 +711,11 @@ pub(crate) struct PassQueue {
 }
 
 /// State shared by all workers during the viewport passes.
-/// Live-partial streaming state: the hosted crawl records each captured page here as it lands,
-/// so a background poster in `run_audit` can stream the findings-so-far to the server. Created ONLY
-/// when the audit runs under a hosted job (`UXLINT_JOB_ID`, set by the audit-worker); local/CLI runs
-/// never build one, so the recording below is a strict no-op for them.
+/// Live-partial streaming state: the crawl records each captured page here as it lands, so a
+/// background poster in `run_audit` can stream progress and the findings-so-far to the server. Built
+/// when the run is on the dashboard as a job — hosted (`UXLINT_JOB_ID`) or a local run's announced
+/// row — or when an MCP caller wants progress notifications; otherwise (a `--dry-run`, no API key)
+/// nothing builds one and the recording below is a strict no-op.
 #[derive(Default)]
 pub(crate) struct PartialState {
     /// Captured page snapshots so far, screenshots stripped (the deterministic lints don't need them,
@@ -735,8 +736,31 @@ pub(crate) struct PartialState {
     /// "N of M pages" total — which counts route×viewport CAPTURES — honestly as "pages · viewports"
     /// instead of implying M distinct pages. Set once, alongside `total`.
     pub(crate) viewports: std::sync::atomic::AtomicUsize,
+    /// When the browser phase started and its time cap — so progress can say "1m 40s of 5m" and a
+    /// long silent stretch (discovery, a slow route) still visibly moves. Unset until `start_clock`.
+    pub(crate) started: Mutex<Option<std::time::Instant>>,
+    pub(crate) cap_secs: std::sync::atomic::AtomicU64,
 }
 impl PartialState {
+    /// Start the audit clock against its browser-phase cap (see `started`).
+    pub(crate) fn start_clock(&self, cap_secs: u64) {
+        *self.started.lock().unwrap() = Some(std::time::Instant::now());
+        self.cap_secs
+            .store(cap_secs, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// (seconds since `start_clock`, the cap in seconds) — (0, 0) before the clock starts.
+    pub(crate) fn clock(&self) -> (u64, u64) {
+        let elapsed = self
+            .started
+            .lock()
+            .unwrap()
+            .map_or(0, |t| t.elapsed().as_secs());
+        (
+            elapsed,
+            self.cap_secs.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
     /// Record a freshly-captured page (screenshot dropped) for the next partial post.
     pub(crate) fn note_page(&self, page: &Value) {
         let mut p = page.clone();
@@ -786,7 +810,8 @@ pub(crate) struct PassShared {
     /// a probe/walk skipped in `run_audit`) — the honest signal that the report is incomplete because
     /// time ran out, distinct from routes that merely failed. Drives the report's `timed_out` flag.
     pub(crate) timed_out: std::sync::atomic::AtomicBool,
-    /// Hosted-run live-partial recorder. `None` for local runs — then the crawl records nothing.
+    /// Live-partial recorder (see [`PartialState`]). `None` when nobody is watching this run — then
+    /// the crawl records nothing.
     pub(crate) partial: Option<Arc<PartialState>>,
     pub(crate) queue: Mutex<PassQueue>,
     /// Per route-template discovery coverage: (instances probed, distinct structure fingerprints

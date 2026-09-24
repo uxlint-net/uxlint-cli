@@ -216,13 +216,18 @@ pub(crate) fn run_audit_ext(
     // can answer "where's the bottleneck?". (`crawl_ms`/`goals_ms` are computed by `run_tests`.)
     let t_crawl = std::time::Instant::now();
     // Live-partial streaming: the background HTTP poster (below) streams progress to
-    // /v1/jobs/{id}/partial ONLY under a hosted job (the audit-worker sets UXLINT_JOB_ID) — strictly
-    // no-op for local/CLI/MCP runs (env unset). The progress STATE itself (`partial_state`) is
-    // broader: an `external_partial` handle (MCP's audit_url) gets the same live crawl/walks/phase
-    // tracking without any job id or HTTP involved — the caller polls the Arc directly.
+    // /v1/jobs/{id}/partial for whichever job this run is on the dashboard as — the hosted one the
+    // audit-worker names in UXLINT_JOB_ID, or the row `LocalRun::announce` created for a CLI/MCP run.
+    // It used to be the hosted one ONLY: a local run announced itself, then never said another word,
+    // so its row read "In progress · starting…" from the first second to the last. That is the
+    // field report of 2026-09-24 — minutes of "starting" that looked exactly like a hang. A
+    // `--dry-run` announces nothing and so still posts nothing. The progress STATE (`partial_state`)
+    // is broader again: an `external_partial` handle (MCP's audit_url) gets the same live
+    // crawl/walks/phase tracking for its own progress notifications — the caller polls the Arc.
     let partial_job = std::env::var("UXLINT_JOB_ID")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| local_run.as_ref().map(|r| r.job_id().to_string()));
     let partial_state: Option<std::sync::Arc<crate::worker::PartialState>> =
         external_partial.clone().or_else(|| {
             partial_job
@@ -260,8 +265,22 @@ pub(crate) fn run_audit_ext(
         crawl_total: std::sync::atomic::AtomicUsize::new(0),
     };
     if let Some(ps) = &partial_state {
+        ps.start_clock(timeout_secs);
         ps.set_phase("crawl");
     }
+    // The poster starts BEFORE discovery, not after it. Discovery is the stretch with nothing to
+    // count yet — no route set, no pages — and it used to be invisible: the dashboard read
+    // "starting…" and an MCP caller heard nothing until the first page landed, which on a slow dev
+    // server is minutes. Reported from the field on 2026-09-24 as an audit that "looks hung". The
+    // phase and the clock are enough to show it isn't.
+    let partial_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let partial_poster = spawn_partial_poster(
+        partial_state.as_ref(),
+        partial_job.as_deref(),
+        &partial_stop,
+        &cli.server,
+        cli.api_key.as_deref().unwrap_or(""),
+    );
 
     let mut route_list = discover_and_sample(
         &workers, &shared, args, collector, &viewports, &seeds, crawl_cap, progress,
@@ -281,14 +300,6 @@ pub(crate) fn run_audit_ext(
         ps.viewports
             .store(viewports.len().max(1), std::sync::atomic::Ordering::Relaxed);
     }
-    let partial_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let partial_poster = spawn_partial_poster(
-        partial_state.as_ref(),
-        partial_job.as_deref(),
-        &partial_stop,
-        &cli.server,
-        cli.api_key.as_deref().unwrap_or(""),
-    );
 
     {
         let _s = crate::otel::phase("capture");
