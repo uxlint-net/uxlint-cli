@@ -469,6 +469,35 @@ fn progress_message(
     })
 }
 
+/// What `archive_feedback` says it closed. The COUNT goes back to the caller — one that meant to close a
+/// single reason and closed the whole rule finds out here, not by the digest quietly going empty — and
+/// it counts BOTH halves: it used to report verdicts only, so closing a lint idea read "archived 0
+/// verdicts on  as fixed", a success that looked exactly like a no-op (the server 404s a real no-op).
+/// The empty rule is a wholly new lint idea and is named as one.
+fn archive_confirmation(v: &Value) -> String {
+    let n = |k: &str| v[k].as_i64().unwrap_or(0);
+    let plural = |n: i64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut closed = Vec::new();
+    if n("archived") > 0 || n("suggestions") == 0 {
+        closed.push(plural(n("archived"), "verdict", "verdicts"));
+    }
+    if n("suggestions") > 0 {
+        closed.push(plural(n("suggestions"), "lint idea", "lint ideas"));
+    }
+    let on = match v["rule"].as_str() {
+        Some("") => "new lint".to_string(),
+        Some(r) => r.to_string(),
+        None => "?".to_string(),
+    };
+    format!(
+        "archived {} on {on} as {} ({} scope). Anything filed after now stays live — including this \
+         same complaint if it comes back.",
+        closed.join(" and "),
+        v["outcome"].as_str().unwrap_or("?"),
+        v["scope"].as_str().unwrap_or("?"),
+    )
+}
+
 /// Compact end-of-result nudge — appended to the PROSE half only (never the structured JSON the
 /// caller parses), and only when there were findings to react to. The CALLER gates this on
 /// `self.feedback_enabled` — absent entirely on a project that hasn't opted in, since the `lint_feedback`
@@ -1783,17 +1812,7 @@ impl UxlintMcp {
                             v["rule"].as_str().unwrap_or("?")
                         ));
                     }
-                    // Report the COUNT back: a caller that meant to close one reason and closed the
-                    // whole rule finds out here, not by the digest quietly going empty.
-                    Ok(format!(
-                        "archived {} verdict{} on {} as {} ({} scope). Anything filed after now stays \
-                         live — including this same complaint if it comes back.",
-                        v["archived"].as_i64().unwrap_or(0),
-                        if v["archived"].as_i64() == Some(1) { "" } else { "s" },
-                        v["rule"].as_str().unwrap_or("?"),
-                        v["outcome"].as_str().unwrap_or("?"),
-                        v["scope"].as_str().unwrap_or("?"),
-                    ))
+                    Ok(archive_confirmation(&v))
                 }
                 Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
                     Err(credential_rejected(&cli.server))
@@ -2081,6 +2100,22 @@ mod report_tool_tests {
         );
         // Nothing has started: say nothing rather than something made up.
         assert_eq!(progress_message(snap(0, 0, ""), 0, 0), None);
+    }
+
+    #[test]
+    fn closing_a_lint_idea_says_so_instead_of_zero_verdicts() {
+        use super::archive_confirmation;
+        // THE 2026-09-24 confusion: a successful close of a new-lint idea printed "archived 0 verdicts on  as fixed".
+        let idea = json!({"rule": "", "outcome": "fixed", "archived": 0, "suggestions": 1, "scope": "reason"});
+        assert!(archive_confirmation(&idea)
+            .starts_with("archived 1 lint idea on new lint as fixed (reason scope)"));
+        let both = json!({"rule": "contrast", "outcome": "fixed", "archived": 3, "suggestions": 2, "scope": "rule"});
+        assert!(archive_confirmation(&both)
+            .starts_with("archived 3 verdicts and 2 lint ideas on contrast"));
+        let one = json!({"rule": "contrast", "outcome": "wont_fix", "archived": 1, "suggestions": 0, "scope": "reason"});
+        assert!(
+            archive_confirmation(&one).starts_with("archived 1 verdict on contrast as wont_fix")
+        );
     }
 }
 
