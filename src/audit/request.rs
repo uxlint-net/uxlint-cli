@@ -49,6 +49,9 @@ pub(crate) struct AuditRequestInputs<'a> {
     /// `desktop_only` route globs (uxlint.toml) — the server demotes findings on these routes at a
     /// below-desktop width to `info`. Empty ⇒ every route is graded at every viewport as before.
     pub(crate) desktop_only: &'a [String],
+    /// `[page_kinds]` route-glob → kind overrides (uxlint.toml) — the server applies them over its own
+    /// classification. Empty ⇒ the server's reading stands.
+    pub(crate) page_kinds: &'a [(String, String)],
 }
 
 /// Assemble the exact JSON body POSTed to `/v1/audit`. THE single visible place where the upload
@@ -88,6 +91,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "theme": i.theme,
         "site_type": i.site_type,
         "desktop_only": i.desktop_only,
+        "page_kinds": i.page_kinds.iter().map(|(route, kind)| json!({"route": route, "kind": kind})).collect::<Vec<_>>(),
     })
 }
 

@@ -124,6 +124,27 @@ pub(crate) const SETTLE_JS: &str = r#"new Promise(res => {
   })();
 })"#;
 
+/// Is the page still showing a loading state — almost no text and what there is says so, or a main /
+/// body region marked `aria-busy`? Mirrors the server's `page_kind::looks_transient` (same words), so
+/// the client waits for exactly what the server would otherwise have to discount.
+pub(crate) const LOADING_JS: &str = r#"(() => {
+  const t = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const words = /loading|opening|please wait|just a moment|one moment|preparing/;
+  const busy = !!document.querySelector('main[aria-busy="true"], body[aria-busy="true"], [role="main"][aria-busy="true"]');
+  return busy || (t.length < 60 && words.test(t));
+})()"#;
+
+/// The longest a capture waits for a page to leave its loading state (see `LOADING_JS`).
+const LOADING_WAIT_SECS: u64 = 5;
+
+fn still_loading(tab: &headless_chrome::Tab) -> bool {
+    tab.evaluate(LOADING_JS, false)
+        .ok()
+        .and_then(|r| r.value)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Make headless Chrome report a hover-capable fine pointer (matches Playwright's behaviour).
 pub(crate) const BLINK_POINTER: &str =
     "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4";
@@ -1297,6 +1318,20 @@ pub(crate) fn audit_route(
     let tp = std::time::Instant::now();
     if tab.evaluate(SETTLE_JS, true).is_err() {
         std::thread::sleep(std::time::Duration::from_millis(600)); // fallback: fixed settle
+    }
+    // Still LOADING? A client-rendered page can settle its layout while it still shows its loading
+    // shell ("Opening…", an aria-busy region), and the capture then judged the skeleton — field
+    // report, 2026-09-24: dead-end-page on two pages captured at 0 and 14 characters that render
+    // fully a moment later. Wait for it to finish, bounded, and settle again. The server still
+    // classifies a page captured mid-load as `transient` if it never finishes.
+    if !ctx.discover_only && still_loading(tab) {
+        let t_wait = std::time::Instant::now();
+        while t_wait.elapsed() < std::time::Duration::from_secs(LOADING_WAIT_SECS)
+            && still_loading(tab)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let _ = tab.evaluate(SETTLE_JS, true);
     }
     add_ms(&shared.t_settle, tp);
     // Preliminary discovery: we only need the page's links (to keep crawling) and its layout

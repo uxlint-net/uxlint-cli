@@ -597,7 +597,7 @@ function collectSnapshot() {
 	const headingEls = []; // DOM node per section, parallel to `sections`, for structural attribution
 	try {
 		let cur = null;
-		for (const el of document.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,dl,table,pre,figure,img,svg,canvas,iframe,video,progress,meter,[role="progressbar"],[role="meter"]')) {
+		for (const el of document.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,dl,table,pre,figure,img,svg,canvas,iframe,video,progress,meter,[role="progressbar"],[role="meter"],input,select,textarea,button')) {
 			// Only what's actually RENDERED is part of the page's outline. A closed <dialog> (and any
 			// display:none subtree) still holds its markup, and innerText falls back to textContent for
 			// unrendered nodes — so without this a modal's heading joins every page's section list and
@@ -609,13 +609,20 @@ function collectSnapshot() {
 				if (sections.length >= 60) break;
 				const t = redactSecrets((el.innerText || '').trim());
 				if (!t) continue;
-				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false, card: false };
+				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false, card: false, buttons: 0 };
 				sections.push(cur);
 				headingEls.push(el);
 			} else if (cur && (tag === 'PROGRESS' || tag === 'METER' || el.matches('[role="progressbar"],[role="meter"]'))) {
 				// A gauge/progress meter (storage used, quota, completion) IS the section's content —
 				// a "Storage" heading over a usage bar keeps its promise even with no prose words.
 				cur.hasMedia = true;
+			} else if (cur && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(tag)) {
+				// CONTROLS are a section's content too — an "Account" heading over its fields, a "Cast
+				// in this scene" heading over a row of chips. Word count under the heading is the wrong
+				// measure there (field report, 2026-09-24: section-empty on form sections and item rows).
+				// One real field is content; buttons only as a group, so a lone action isn't a section.
+				if (tag === 'BUTTON') { if (++cur.buttons >= 2) cur.hasMedia = true; }
+				else if (!(tag === 'INPUT' && /^(hidden|submit|button|reset)$/i.test(el.type || ''))) cur.hasMedia = true;
 			} else if (cur && /^(DL|TABLE|PRE|FIGURE|IMG|SVG|CANVAS|IFRAME|VIDEO)$/.test(tag)) {
 				// A section's content can be a list, table, code block, figure, image or diagram — not
 				// just prose. Mark it so a word-light section built from these isn't called empty.
@@ -629,7 +636,7 @@ function collectSnapshot() {
 				if (cur.gist.length < 400) cur.gist += t.slice(0, 400 - cur.gist.length) + ' ';
 			}
 		}
-		for (const sec of sections) sec.gist = sec.gist.trim();
+		for (const sec of sections) { sec.gist = sec.gist.trim(); delete sec.buttons; }
 	} catch (_) { /* ignore */ }
 
 	// Is a heading a section PROMISE, or just the LABEL on one repeated item? A card title in a grid
