@@ -496,7 +496,21 @@ pub(crate) fn run_audit_ext(
         test_outcomes.len(),
     );
     // Fold the tests' novel captures into the pages to be linted. Merged AFTER the timeout
-    // detail above so that stays a crawl-vs-planned measure.
+    // detail above so that stays a crawl-vs-planned measure. NOT on a run scoped to exactly its
+    // routes (no crawl): the tests still report their outcomes, but the pages they wandered through
+    // aren't what was asked to be audited (field report, 2026-09-24).
+    let scoped = crawl_cap <= seeds.len();
+    let skipped_walk_pages = if scoped { walk_pages.len() } else { 0 };
+    let walk_pages = if scoped { Vec::new() } else { walk_pages };
+    if skipped_walk_pages > 0 {
+        note!(
+            progress,
+            "  {}",
+            crate::style::Stream::Err.dim(&format!(
+                "tests passed through {skipped_walk_pages} other page state(s) — not linted, because this run was scoped to exactly its routes"
+            ))
+        );
+    }
     let (added, over_cap) = merge_walk_pages(&mut pages, walk_pages, WALK_PAGE_CAP);
     if added > 0 {
         note!(
@@ -1748,6 +1762,8 @@ mod decision_tests {
         assert_eq!(resolve_crawl_cap(12, 0, 3, false), 12); // flag wins
         assert_eq!(resolve_crawl_cap(2, 30, 3, false), 30); // toml wins
         assert_eq!(resolve_crawl_cap(2, 1, 5, false), 5); // never fewer than the seeds asked for
+                                                          // An explicit 0 is "exactly these routes" — uxlint.toml's crawl budget must not override it.
+        assert_eq!(resolve_crawl_cap(0, 30, 2, false), 2);
     }
 
     #[test]

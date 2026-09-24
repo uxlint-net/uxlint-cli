@@ -242,7 +242,11 @@ pub(crate) fn resolve_crawl_cap(
     seed_count: usize,
     exact: bool,
 ) -> usize {
-    if exact {
+    // `--crawl 0` (the flag defaults to 12, so 0 is always a deliberate choice) means exactly the seed
+    // routes — the documented "check a single page" form. It used to be max'ed against uxlint.toml's
+    // `crawl`, so a project's crawl budget silently overrode it and a two-route check audited sibling
+    // pages nobody asked for (field report, 2026-09-24).
+    if exact || cli_crawl == 0 {
         seed_count
     } else {
         cli_crawl.max(toml_cap).max(seed_count)

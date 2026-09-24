@@ -1458,7 +1458,9 @@ impl UxlintMcp {
         let args = AuditArgs {
             base,
             routes: a.routes.unwrap_or_else(|| "/".to_string()),
-            exact_routes: false,
+            // crawl=0 means EXACTLY the routes asked for: no crawl, no project default routes, and no
+            // pages the tests wander through (field report, 2026-09-24).
+            exact_routes: a.crawl == Some(0),
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call —
             // secrets stay out of the tool args and the transcript.
