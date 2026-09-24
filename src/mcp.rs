@@ -319,7 +319,7 @@ fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
     for g in groups.iter().take(MAX_GROUPS) {
         let f = g.first;
         // rule name (for verify_fix), location, the problem, and the fix.
-        if !rules_seen.iter().any(|r| *r == g.rule) {
+        if !rules_seen.contains(&g.rule) {
             rules_seen.push(g.rule.clone());
         }
         let sel = f["sel"].as_str().unwrap_or("");
