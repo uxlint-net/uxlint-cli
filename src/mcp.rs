@@ -162,6 +162,18 @@ fn audit_structured(report: &Value, server: &str) -> Value {
 /// read back later is exactly the report the agent would have been handed at the time.
 fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
     let mut t = String::new();
+    // Before anything else: a config that made this run audit SIGNED OUT when it meant not to. Every
+    // finding below is about the wrong experience if this fires, so it can't sit under them.
+    if let Some(ws) = report["config_warnings"]
+        .as_array()
+        .filter(|w| !w.is_empty())
+    {
+        t.push_str("⚠ CONFIG — this audit may not have seen what you meant it to:\n");
+        for w in ws.iter().filter_map(|w| w.as_str()) {
+            t.push_str(&format!("  · uxlint.toml: {w}\n"));
+        }
+        t.push_str("Fix uxlint.toml and re-run before acting on the findings below.\n\n");
+    }
     if let Some(blocked) = report["auth_blocked_routes"].as_array() {
         let routes: Vec<&str> = blocked
             .iter()

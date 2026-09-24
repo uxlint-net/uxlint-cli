@@ -327,18 +327,83 @@ pub(crate) fn project_credentials() -> ProjectCredentials {
 }
 
 fn credentials_from(v: &toml::Value) -> ProjectCredentials {
-    let Some(def) = v
-        .get("default_persona")
-        .and_then(|d| d.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(def) = crawl_persona_in(v) else {
         return ProjectCredentials::default();
     };
     let Some(p) = personas_from(v).into_iter().find(|p| p.name == def) else {
         return ProjectCredentials::default();
     };
     persona_creds(v, p)
+}
+
+/// Which persona the (single-state) crawl signs in as: `default_persona`, or — when that's unset —
+/// the one persona `audit_states` names on its own.
+///
+/// `audit_states = ["user"]` says "audit this as user" as plainly as a config can, but a single state
+/// never reaches the multi-state crawl, and the single-state crawl only ever read `default_persona`.
+/// So that config audited SIGNED OUT, with no error and no warning, and the report looked entirely
+/// legitimate — same routes, a plausibly smaller finding count. Reported from the field on 2026-08-31;
+/// it cost the reporter a whole misdiagnosis cycle.
+fn crawl_persona_in(v: &toml::Value) -> Option<String> {
+    let set = |k: &str| {
+        v.get(k)
+            .and_then(|d| d.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    set("default_persona").or_else(|| match audit_states_in(v).as_slice() {
+        [only] if !only.eq_ignore_ascii_case("anonymous") => Some(only.clone()),
+        _ => None,
+    })
+}
+
+/// Everything in `uxlint.toml` that will make a run audit SIGNED OUT when it plainly meant not to — as
+/// sentences to print before the crawl and at the top of the report. Each of these used to be a
+/// silent fallback to a logged-out capture (correctly: a half-login is worse), and the report it
+/// produced gave no sign of it (field report, 2026-08-31). Refusing would be wrong — personas are
+/// also declared just for test plans — so the answer is to say so, loudly, where the reader looks.
+pub(crate) fn persona_warnings() -> Vec<String> {
+    find_project_toml()
+        .map(|(_, v)| persona_warnings_in(&v))
+        .unwrap_or_default()
+}
+
+fn persona_warnings_in(v: &toml::Value) -> Vec<String> {
+    let personas = personas_from(v);
+    let has_login_url = v
+        .get("login_url")
+        .and_then(|u| u.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    let mut out = Vec::new();
+    let mut check = |name: &str, what: &str| {
+        match personas.iter().find(|p| p.name == name) {
+        None => out.push(format!(
+            "{what} \"{name}\" names no [personas.{name}] — that capture runs SIGNED OUT"
+        )),
+        Some(p) if p.is_form() && !has_login_url => out.push(format!(
+            "persona \"{name}\" signs in with a form but uxlint.toml has no login_url — that capture runs SIGNED OUT"
+        )),
+        Some(_) => {}
+    }
+    };
+    let states = audit_states_in(v);
+    if states.len() > 1 {
+        for s in states
+            .iter()
+            .filter(|s| !s.eq_ignore_ascii_case("anonymous"))
+        {
+            check(s, "audit_states lists");
+        }
+    } else if let Some(name) = crawl_persona_in(v) {
+        let what = if v.get("default_persona").is_some() {
+            "default_persona"
+        } else {
+            "audit_states lists"
+        };
+        check(&name, what);
+    }
+    out
 }
 
 /// Resolve one persona to the credentials the crawl replays: a form persona becomes a `login` submitted
@@ -373,6 +438,10 @@ pub(crate) fn audit_states() -> Vec<String> {
     let Some((_, v)) = find_project_toml() else {
         return Vec::new();
     };
+    audit_states_in(&v)
+}
+
+fn audit_states_in(v: &toml::Value) -> Vec<String> {
     v.get("audit_states")
         .and_then(|s| s.as_array())
         .map(|a| {
@@ -765,7 +834,7 @@ pub(crate) fn skip_route(r: &str) -> bool {
 
 #[cfg(test)]
 mod credential_tests {
-    use super::{credentials_from, personas_from};
+    use super::{credentials_from, persona_warnings_in, personas_from};
 
     fn toml(s: &str) -> toml::Value {
         s.parse().expect("test toml")
@@ -843,6 +912,82 @@ mod credential_tests {
         let c = credentials_from(&v);
         assert_eq!(c.login, None);
         assert!(c.headers.is_empty() && c.storage.is_empty());
+    }
+
+    /// THE 2026-08-31 report: `audit_states = ["user"]` with no `default_persona` audited signed out,
+    /// silently. A single named state IS the crawl persona.
+    #[test]
+    fn a_lone_audit_state_signs_the_crawl_in_as_that_persona() {
+        let v = toml(
+            r#"
+            audit_states = ["member"]
+            [personas.member]
+            headers = ["Cookie: sid=dev"]
+            "#,
+        );
+        assert_eq!(
+            credentials_from(&v).headers,
+            vec!["Cookie: sid=dev".to_string()]
+        );
+        assert!(
+            persona_warnings_in(&v).is_empty(),
+            "{:?}",
+            persona_warnings_in(&v)
+        );
+        // …but a lone `anonymous` is just a signed-out run, as asked.
+        let anon = toml(r#"audit_states = ["anonymous"]"#);
+        assert!(
+            credentials_from(&anon).headers.is_empty() && persona_warnings_in(&anon).is_empty()
+        );
+    }
+
+    /// Each silent fall-back-to-signed-out is now SAID, in words that name the fix.
+    #[test]
+    fn a_config_that_will_audit_signed_out_says_so() {
+        let unknown = toml(
+            r#"
+            default_persona = "nobody"
+            [personas.user]
+            headers = ["Cookie: a=b"]
+            "#,
+        );
+        let w = persona_warnings_in(&unknown);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("default_persona \"nobody\" names no [personas.nobody]")
+                && w[0].contains("SIGNED OUT"),
+            "{w:?}"
+        );
+
+        let no_login_url = toml(
+            r#"
+            default_persona = "user"
+            [personas.user]
+            username = "u@acme.dev"
+            password = "pw"
+            "#,
+        );
+        let w = persona_warnings_in(&no_login_url);
+        assert!(w.len() == 1 && w[0].contains("no login_url"), "{w:?}");
+
+        let multi = toml(
+            r#"
+            audit_states = ["anonymous", "member", "ghost"]
+            [personas.member]
+            headers = ["Cookie: a=b"]
+            "#,
+        );
+        let w = persona_warnings_in(&multi);
+        assert!(w.len() == 1 && w[0].contains("\"ghost\""), "{w:?}");
+
+        // Personas declared only for the test plan, no crawl persona asked for: nothing to warn about.
+        let tests_only = toml(
+            r#"
+            [personas.user]
+            username = "u@acme.dev"
+            "#,
+        );
+        assert!(persona_warnings_in(&tests_only).is_empty());
     }
 
     /// A form persona named as default but with no `login_url` has nothing to submit against → no login.

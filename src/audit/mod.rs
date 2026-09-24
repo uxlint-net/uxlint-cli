@@ -118,6 +118,16 @@ pub(crate) fn run_audit_ext(
     let mut local_run = LocalRun::announce(cli, args, site.as_deref());
     // Backfill credentials (hosted-door env vars, then uxlint.toml [credentials]) onto a clone.
     let args = inject_credentials(args, progress);
+    // A config that will audit SIGNED OUT when it plainly meant not to (see `persona_warnings`) is
+    // said BEFORE the crawl the user is about to wait for, and again at the top of the report.
+    let config_warnings = crate::project::persona_warnings();
+    for w in &config_warnings {
+        note!(
+            progress,
+            "{}",
+            crate::style::Stream::Err.yellow(&format!("  ⚠ uxlint.toml: {w}"))
+        );
+    }
     let args = &args;
     // The page-capture code is BAKED INTO THIS BINARY (not fetched from the server), so the CLI
     // ships — and this repo fully vouches for — the exact JS that runs in your pages and decides
@@ -549,7 +559,7 @@ pub(crate) fn run_audit_ext(
     if let Some(run) = &local_run {
         payload["job_id"] = json!(run.job_id());
     }
-    let out = send_and_finalize(FinalizeInputs {
+    let mut out = send_and_finalize(FinalizeInputs {
         cli,
         args,
         progress,
@@ -570,6 +580,11 @@ pub(crate) fn run_audit_ext(
     if out.is_ok() {
         if let Some(run) = &mut local_run {
             run.finish();
+        }
+    }
+    if let Ok(report) = &mut out {
+        if !config_warnings.is_empty() {
+            report["config_warnings"] = json!(config_warnings);
         }
     }
     out
