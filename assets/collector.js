@@ -1614,6 +1614,12 @@ function collectSnapshot() {
 			clientH: el.clientHeight,
 			naturalW: el.naturalWidth || 0,
 			naturalH: el.naturalHeight || 0,
+			// A VECTOR image (an SVG source) has no pixel resolution: its naturalWidth is a browser
+			// default (300×150, or a viewBox-shaped box) that says nothing about sharpness, so a
+			// resolution rule comparing it to the display size reports an SVG as "upscaled 2×" —
+			// field report, 2026-09-24. Flagged rather than zeroed, because other rules rightly read
+			// a natural size as "an image is here" (vision, media-in-section).
+			imgVector: el.tagName === 'IMG' && /\.svgz?([?#]|$)|^data:image\/svg\+xml/i.test(el.currentSrc || el.src || ''),
 			// A click-to-enlarge thumbnail: an image inside a link/button that opens a larger view.
 			// Its full-res source is used when opened, so it's not "overweight". (Images only.)
 			imgClickable: el.tagName === 'IMG' && !!el.closest('a[href],button,[role="button"]'),
