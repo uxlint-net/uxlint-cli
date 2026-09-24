@@ -1018,6 +1018,11 @@ struct ArchiveFeedbackArgs {
     /// complaints back in the digest.
     #[serde(default)]
     revert: Option<bool>,
+    /// Where the fix lives — REQUIRED for `outcome=fixed`: the uxlint commit sha that fixed it, or the
+    /// CLI release that ships it (`cli v0.1.37`). The digest uses it to say whether the fix is live on
+    /// prod yet, so "fixed" stops meaning "fixed somewhere".
+    #[serde(default)]
+    fix_ref: Option<String>,
 }
 
 /// Resolve the base URL for a tool call: an explicit per-call `base` wins (a blank one is treated as
@@ -1771,7 +1776,7 @@ impl UxlintMcp {
     // The write half of the staff loop, behind the same `--admin` switch as `get_feedback`.
     #[tool(
         name = "archive_feedback",
-        description = "uxlint STAFF: close a lint complaint OR a lint idea you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes one. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT item — a verdict's reason or a suggestion's text, both matched the same way (an idea the digest shows as `[new lint]` has no rule yet: pass `rule=\"new lint\"`, and its text is then required); omitting `reason` closes every complaint AND idea on the rule, which is a much bigger claim — only do it when you have read them all.\n\nIt REFUSES (404) when nothing matches, rather than reporting success for having closed nothing: if you get that, check the rule name and that `reason` is the exact text the digest printed — it is matched whole, never by substring. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
+        description = "uxlint STAFF: close a lint complaint OR a lint idea you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes one. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT item — a verdict's reason or a suggestion's text, both matched the same way (an idea the digest shows as `[new lint]` has no rule yet: pass `rule=\"new lint\"`, and its text is then required); omitting `reason` closes every complaint AND idea on the rule, which is a much bigger claim — only do it when you have read them all.\n\nIt REFUSES (404) when nothing matches, rather than reporting success for having closed nothing: if you get that, check the rule name and that `reason` is the exact text the digest printed — it is matched whole, never by substring. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all. A `fixed` also needs `fix_ref` — the uxlint commit sha, or `cli vX.Y.Z` for a CLI fix — so the digest can say whether it is live on prod yet.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
     )]
     async fn archive_feedback(
         &self,
@@ -1793,6 +1798,7 @@ impl UxlintMcp {
                 "note": a.note.unwrap_or_default(),
                 "through": a.through.unwrap_or_default(),
                 "revert": revert,
+                "fix_ref": a.fix_ref.unwrap_or_default(),
             });
             let resp = reqwest::blocking::Client::new()
                 .post(format!("{server}/v1/lints/feedback/archive"))
