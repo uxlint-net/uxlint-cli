@@ -450,8 +450,34 @@ pub(crate) fn run_audit_ext(
             config_warnings.push(w);
         }
     }
-    let (anon_checks, login_discoverable) =
-        run_signed_out_gating(args, &anon_routes, was_authed, deadline, progress);
+    // The rest of what was captured, checked signed out too — only to learn which routes are PRIVATE
+    // (see `run_signed_out_gating`). Bounded: a signed-out visit costs up to ~2.4s, three at a time.
+    let privacy_routes: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for p in pages
+            .iter()
+            .filter(|p| p["viewport"].as_str() == Some("desktop"))
+        {
+            if let Some(r) = p["route"].as_str() {
+                if r != "/"
+                    && !anon_routes.iter().any(|a| a == r)
+                    && !v.iter().any(|x| x == r)
+                    && v.len() < 12
+                {
+                    v.push(r.to_string());
+                }
+            }
+        }
+        v
+    };
+    let (anon_checks, login_discoverable) = run_signed_out_gating(
+        args,
+        &anon_routes,
+        &privacy_routes,
+        was_authed || args.username.is_some(),
+        deadline,
+        progress,
+    );
 
     let TestRunOutcome {
         test_outcomes,
