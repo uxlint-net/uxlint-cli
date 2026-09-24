@@ -759,6 +759,27 @@ fn finding_groups(report: &Value) -> Vec<FindingGroup<'_>> {
     groups
 }
 
+/// Turn a setup message that used to END the call into the header of an unfiled run: it now says the
+/// audit ran (unfiled — saved under no site, so outside any site's history) and that finishing setup
+/// files the next one. Everything else in the message — the exact commands, the real orgs and sites —
+/// stays, because it's still what the user needs to do.
+fn as_unfiled(advice: &str) -> String {
+    const RAN: &str =
+        "this audit ran UNFILED (saved under no site, so it isn't part of any site's history yet)";
+    let body = advice
+        .replacen("the audit did NOT run:", &format!("{RAN} because"), 1)
+        .replacen("the audit did NOT run", RAN, 1)
+        .replace(
+            "Then call audit_url again.",
+            "Then call audit_url again to file the next run under that site.",
+        )
+        .replace(
+            "Then call audit_url again:",
+            "Then call audit_url again to file the next run:",
+        );
+    format!("{body}\n\n")
+}
+
 /// Compact end-of-result nudge — appended to the PROSE half only (never the structured JSON the
 /// caller parses), and only when there were findings to react to. The CALLER gates this on
 /// `self.feedback_enabled` — absent entirely on a project that hasn't opted in, since the `lint_feedback`
@@ -1491,13 +1512,22 @@ impl UxlintMcp {
             }
             Ok(me) => me,
         };
+        // First run: no site exists yet, and creating one is its OWNER's act — so the audit runs
+        // UNFILED (under no site) instead of refusing, with the setup steps on top. Field report,
+        // 2026-09-24: the first audit in every new session failed because the agent can't finish
+        // setup itself. A wrong ORG is still a stop: that's a config error, not a first run.
+        let mut unfiled = false;
         let setup_prefix = match &project {
-            Some(p) => {
-                if let Some(advice) = missing_site_instructions(&p.org, &p.site, me.as_ref()) {
+            Some(p) => match missing_site_instructions(&p.org, &p.site, me.as_ref()) {
+                Some(advice) if advice.starts_with("ORG NOT FOUND") => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(advice)]));
                 }
-                None
-            }
+                Some(advice) => {
+                    unfiled = true;
+                    Some(as_unfiled(&advice))
+                }
+                None => None,
+            },
             None => {
                 // No base at all is the same bind as a local one: nothing to name a site after
                 // (`run_audit` would fall back to the toml `base` that doesn't exist either).
@@ -1509,12 +1539,18 @@ impl UxlintMcp {
                     blocked,
                     crate::project::find_project_toml().is_some(),
                 );
-                // Blocked: the audit cannot produce a report, so the instructions ARE the answer.
-                // Otherwise it still runs, and they ride along as a prefix.
-                if blocked {
+                // Blocked used to mean "no report" — now it runs UNFILED, and the instructions ride
+                // along as a prefix either way.
+                if base.trim().is_empty() {
+                    // Nothing to audit at all — the instructions are the whole answer.
                     return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
                 }
-                Some(text)
+                if blocked {
+                    unfiled = true;
+                    Some(as_unfiled(&text))
+                } else {
+                    Some(text)
+                }
             }
         };
         let args = AuditArgs {
@@ -1523,6 +1559,7 @@ impl UxlintMcp {
             // crawl=0 means EXACTLY the routes asked for: no crawl, no project default routes, and no
             // pages the tests wander through (field report, 2026-09-24).
             exact_routes: a.crawl == Some(0),
+            unfiled,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call —
             // secrets stay out of the tool args and the transcript.
@@ -1657,6 +1694,7 @@ impl UxlintMcp {
             base: resolve_base(a.base, self.default_base.as_deref()),
             routes: route.clone(),
             exact_routes: true,
+            unfiled: false,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call.
             headers: Vec::new(),
@@ -2503,6 +2541,25 @@ mod report_tool_tests {
             lines[2].starts_with("[warn] request-failed — 2 places"),
             "{t}"
         );
+    }
+    /// First run: the setup message becomes the header of an UNFILED run instead of a refusal.
+    #[test]
+    fn a_missing_site_runs_unfiled_with_the_setup_steps_on_top() {
+        let advice = "SITE NOT SET UP — the audit did NOT run. This project's uxlint.toml files its reports under site \"x\".\n\nASK THE USER to create it:\n  uxlint site create x\n\nThen call audit_url again.";
+        let t = super::as_unfiled(advice);
+        assert!(
+            t.contains("this audit ran UNFILED") && !t.contains("did NOT run"),
+            "{t}"
+        );
+        assert!(t.contains("uxlint site create x"), "the steps stay: {t}");
+        assert!(t.contains("to file the next run under that site"), "{t}");
+        // The no-toml local-target head reads as a reason, not a refusal.
+        let t = super::as_unfiled("SETUP REQUIRED — the audit did NOT run: this project has no uxlint.toml, and …\n\nThen call audit_url again: the report files under that site");
+        assert!(
+            t.contains("any site's history yet) because this project has no uxlint.toml"),
+            "{t}"
+        );
+        assert!(t.contains("again to file the next run:"), "{t}");
     }
 }
 

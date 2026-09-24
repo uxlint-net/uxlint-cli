@@ -549,7 +549,13 @@ pub(crate) fn resolve_target(
         args.org.as_deref(),
         project.as_ref().map(|p| p.org.as_str()),
     );
-    if site.is_none() {
+    // An UNFILED run (MCP first run) deliberately names no site — see `AuditArgs::unfiled`.
+    let (site, org) = if args.unfiled {
+        (None, None)
+    } else {
+        (site, org)
+    };
+    if site.is_none() && !args.unfiled {
         anyhow::bail!(
             "no site for this audit of {}. Pass --site <host> (or set UXLINT_SITE), pin it with `uxlint init`, or create it: `uxlint site create <host>`.",
             args.base

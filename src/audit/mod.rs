@@ -615,6 +615,7 @@ pub(crate) fn run_audit_ext(
         site_type: site_type.as_deref(),
         desktop_only: &desktop_only,
         page_kinds: &page_kinds,
+        unfiled: args.unfiled,
     });
     // --dry-run: this is the whole point of the flag — write the EXACT payload we would POST to disk
     // (with screenshots split out as viewable JPEGs) and stop, without sending anything to the
@@ -1532,6 +1533,7 @@ mod request_tests {
             site_type: Some("saas"),
             desktop_only: &[],
             page_kinds: &[],
+            unfiled: false,
         }
     }
 
