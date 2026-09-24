@@ -114,10 +114,17 @@ fn shot_url(
 /// The machine-readable half of an audit_url result: report identity, counts, and every finding with
 /// its location, fix, and the annotated screenshot URL — so a caller never re-parses the text or
 /// hunts through report JSON for images.
-fn audit_structured(report: &Value, server: &str) -> Value {
+fn audit_structured(report: &Value, server: &str, full: bool) -> Value {
     let report_id = report_id_of(report);
     let empty = vec![];
     let mut findings = Vec::new();
+    // Compact by default. Every finding stays (an agent maps them to code), but the long text that
+    // repeats — a rule's fix and its best-practice paragraph are the same for every instance — is
+    // said ONCE per rule in `fixes`, and best practice only with `detail: "full"`. Field report,
+    // 2026-09-24: the full form was ~66k characters, past the client's output limit, so it spilled to a
+    // file and the agent had to parse it with scripts. On that report: 70k → 32k structured, and the
+    // whole result (with the prose) from ~102k to ~65k characters — back under the default limit.
+    let mut fixes = serde_json::Map::new();
     for page in report["pages"].as_array().unwrap_or(&empty) {
         let route = page["route"].as_str().unwrap_or("");
         let viewport = page["viewport"].as_str().unwrap_or("");
@@ -128,13 +135,31 @@ fn audit_structured(report: &Value, server: &str) -> Value {
                         .then(|| json!({"from": m["from"], "to": m["to"]}))
                 })
             });
-            findings.push(json!({
+            if full {
+                findings.push(json!({
+                    "rule": f["rule"], "severity": f["severity"], "route": route, "viewport": viewport,
+                    "message": f["msg"], "fix": f["fix"], "best_practice": f["best_practice"],
+                    "selector": f["sel"], "source": f["source"],
+                    "rect": f["rect"], "edit": edit,
+                    "screenshot_url": shot_url(server, report_id, route, viewport, &f["rect"]),
+                }));
+                continue;
+            }
+            if let (Some(rule), Some(fix)) = (f["rule"].as_str(), f["fix"].as_str()) {
+                fixes.entry(rule.to_string()).or_insert_with(|| json!(fix));
+            }
+            let msg: String = f["msg"].as_str().unwrap_or("").chars().take(160).collect();
+            let mut c = json!({
                 "rule": f["rule"], "severity": f["severity"], "route": route, "viewport": viewport,
-                "message": f["msg"], "fix": f["fix"], "best_practice": f["best_practice"],
-                "selector": f["sel"], "source": f["source"],
-                "rect": f["rect"], "edit": edit,
-                "screenshot_url": shot_url(server, report_id, route, viewport, &f["rect"]),
-            }));
+                "message": msg, "selector": f["sel"],
+            });
+            if !f["source"].is_null() {
+                c["source"] = f["source"].clone();
+            }
+            if let Some(e) = edit {
+                c["edit"] = e;
+            }
+            findings.push(c);
         }
     }
     let summary = &report["summary"];
@@ -149,6 +174,9 @@ fn audit_structured(report: &Value, server: &str) -> Value {
         "timed_out": report["timed_out"].as_bool().unwrap_or(false),
         "timeout": report["timeout_detail"],
         "findings": findings,
+        // Compact form: each rule's fix, once. (Full form carries it on every finding instead.)
+        "fixes": if full { Value::Null } else { Value::Object(fixes) },
+        "detail": if full { "full" } else { "compact — pass detail: \"full\" for every finding's fix, best practice, rect and screenshot URL" },
         "dry": report["source_dry"],
         // Cross-audit delta vs the previous comparable crawl (resolved/new/persisting + samples);
         // null when there's no comparable prior audit to diff against.
@@ -1066,6 +1094,11 @@ struct AuditUrlArgs {
     /// Run the site's declared tests (whole-site reachability). ON by default; auto-scoped to crawling audits. Set false to skip for speed. Tests are a paid-plan feature — on a free plan, tests declared but not run print a one-line skip warning instead.
     #[serde(default)]
     tests: Option<bool>,
+    /// `full` for every finding's fix, best practice, rect and screenshot URL in the structured
+    /// result. Default is compact: every finding, with each rule's fix said once — the full form can
+    /// run past a client's output limit on a big site.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1178,6 +1211,10 @@ struct GetReportArgs {
     /// The report to read: its URL as the dashboard shows it (`https://uxlint.net/sites/8/r/abc123`),
     /// a `/r/…` path, or the bare report id.
     report: String,
+    /// `full` for every finding's fix, best practice, rect and screenshot URL in the structured
+    /// result; compact by default (see audit_url).
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1399,6 +1436,7 @@ impl UxlintMcp {
         meta: Meta,
         client: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let full = a.detail.as_deref() == Some("full");
         if self.call_cli().api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 signup_hint(&self.cli.server),
@@ -1560,7 +1598,7 @@ impl UxlintMcp {
         let mut structured = Value::Null;
         let text = match report {
             Ok(report) => {
-                structured = audit_structured(&report, &self.cli.server);
+                structured = audit_structured(&report, &self.cli.server, full);
                 agent_prose(&report, &self.cli.server, self.feedback_enabled)
             }
             Err(e) => format!("audit failed: {e}"),
@@ -1862,6 +1900,7 @@ impl UxlintMcp {
         &self,
         Parameters(a): Parameters<GetReportArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let full = a.detail.as_deref() == Some("full");
         if self.call_cli().api_key.is_none() {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
                 signup_hint(&self.cli.server),
@@ -1903,7 +1942,7 @@ impl UxlintMcp {
             Ok(report) => {
                 let text = agent_prose(&report, &self.cli.server, self.feedback_enabled);
                 let mut r = CallToolResult::success(vec![ContentBlock::text(text)]);
-                r.structured_content = Some(audit_structured(&report, &self.cli.server));
+                r.structured_content = Some(audit_structured(&report, &self.cli.server, full));
                 Ok(r)
             }
             Err(msg) => Ok(CallToolResult::success(vec![ContentBlock::text(msg)])),
@@ -2337,6 +2376,35 @@ mod report_tool_tests {
         assert!(
             archive_confirmation(&one).starts_with("archived 1 verdict on contrast as wont_fix")
         );
+    }
+
+    /// Compact structured output keeps every finding but says each rule's fix once; `full` restores
+    /// the per-finding fix, best practice and screenshot URL.
+    #[test]
+    fn structured_output_is_compact_unless_full_is_asked_for() {
+        use super::audit_structured;
+        let f = |sel: &str| json!({"rule": "contrast", "severity": "error", "msg": "Low contrast 3.1:1", "fix": "darken it", "best_practice": "a long paragraph", "sel": sel, "rect": [1, 2, 3, 4]});
+        let report = json!({"report_url": "https://uxlint.net/r/abc", "pages": [{"route": "/", "viewport": "desktop", "findings": [f(".a"), f(".b")]}]});
+        let compact = audit_structured(&report, "https://uxlint.net", false);
+        assert_eq!(
+            compact["findings"].as_array().unwrap().len(),
+            2,
+            "every finding stays"
+        );
+        assert!(
+            compact["findings"][0].get("fix").is_none()
+                && compact["findings"][0].get("best_practice").is_none()
+        );
+        assert_eq!(
+            compact["fixes"]["contrast"], "darken it",
+            "the fix, once per rule"
+        );
+        let full = audit_structured(&report, "https://uxlint.net", true);
+        assert_eq!(full["findings"][1]["fix"], "darken it");
+        assert!(full["findings"][0]["screenshot_url"]
+            .as_str()
+            .unwrap()
+            .contains("/r/abc/annot"));
     }
 
     /// The server's prose is used as-is; only the LOCAL parts are filled in here — the source hint
