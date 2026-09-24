@@ -2612,11 +2612,18 @@ function collectSnapshot() {
 					// the absorbed width is slack translated labels grow INTO, not fight. Counting it as
 					// consumed made every spacer-justified nav look full and falsely fail the German test.
 					// Drop the spacer's width, and drop an auto margin's resolved px off any child.
+					//
+					// `k.style` only sees an INLINE auto margin. Set from a stylesheet (`.spacer{margin-left:
+					// auto}`), getComputedStyle hands back the RESOLVED px — the whole free space — and the
+					// bar read as "0px free" at 1440px while mostly empty (field report, 2026-09-24). So: an
+					// empty element with no width is a spacer however it's styled, and no single margin in a
+					// nav row counts past 32px — anything wider is distributed slack, not a label's room.
 					const marginAuto = k.style.marginLeft === 'auto' || k.style.marginRight === 'auto';
-					if (label.length < 2 && ((parseFloat(kcs.flexGrow) || 0) > 0 || marginAuto)) continue;
+					if (label.length < 2 && ((parseFloat(kcs.flexGrow) || 0) > 0 || marginAuto || kr.width < 2)) continue;
+					const margin = v => Math.min(parseFloat(v) || 0, 32);
 					childrenW += kr.width
-						+ (k.style.marginLeft === 'auto' ? 0 : parseFloat(kcs.marginLeft) || 0)
-						+ (k.style.marginRight === 'auto' ? 0 : parseFloat(kcs.marginRight) || 0);
+						+ (k.style.marginLeft === 'auto' ? 0 : margin(kcs.marginLeft))
+						+ (k.style.marginRight === 'auto' ? 0 : margin(kcs.marginRight));
 					if (label && cctx) {
 						try {
 							cctx.font = `${kcs.fontWeight} ${kcs.fontSize} ${kcs.fontFamily}`;
