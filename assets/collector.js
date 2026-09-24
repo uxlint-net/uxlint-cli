@@ -1265,6 +1265,31 @@ function collectSnapshot() {
 				else if (el.closest && el.closest('label')) labelled = true;
 			} catch (_) { /* ignore */ }
 		}
+		// An unlabelled control sitting right under (or beside) a visible <label> that belongs to
+		// a DIFFERENT control. Field report: it looked labelled in the markup, so the first fix
+		// went at the wrong element — the rule couldn't say "that label is owned by the input
+		// next door". Nearest visible label within 48px above or 24px to the left; owner named
+		// by id, else name, else tag.
+		let nearLabel = null, nearLabelOwner = null;
+		if (isControl && !labelled) {
+			try {
+				let best = null, bestD = Infinity;
+				for (const lb of document.querySelectorAll('label')) {
+					const lr = lb.getBoundingClientRect();
+					if (lr.width < 8 || lr.height < 8) continue;
+					const above = lr.bottom <= rect.top + 4 && rect.top - lr.bottom <= 48 && lr.left < rect.right && lr.right > rect.left;
+					const beside = lr.right <= rect.left + 4 && rect.left - lr.right <= 24 && lr.top < rect.bottom && lr.bottom > rect.top;
+					if (!above && !beside) continue;
+					const d = above ? rect.top - lr.bottom : rect.left - lr.right;
+					if (d < bestD) { bestD = d; best = lb; }
+				}
+				const owner = best && (best.htmlFor ? document.getElementById(best.htmlFor) : best.querySelector('input,select,textarea'));
+				if (owner && owner !== el) {
+					nearLabel = redactSecrets((best.innerText || '').replace(/\s+/g, ' ').trim()).slice(0, 40);
+					nearLabelOwner = owner.id ? `#${owner.id}` : owner.getAttribute('name') ? `${owner.tagName.toLowerCase()}[name="${owner.getAttribute('name')}"]` : owner.tagName.toLowerCase();
+				}
+			} catch (_) { /* ignore */ }
+		}
 		// Form-field signals (Wave 2). Only text-entry inputs — checkboxes/radios/buttons
 		// don't have the same labelling/autocomplete/keyboard concerns.
 		let field;
@@ -1526,6 +1551,8 @@ function collectSnapshot() {
 			inputType,
 			inFieldset,
 			labelled,
+			nearLabel,
+			nearLabelOwner,
 			iconOnly,
 			ariaHidden,
 			radius: parseFloat(cs.borderTopLeftRadius) || 0,

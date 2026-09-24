@@ -1234,6 +1234,11 @@ pub(crate) const OVERLAY_JS: &str = r##"(() => {
   };
   // A dialog-ish overlay: declared role, native dialog, or a big fixed layer. Must be VISIBLE
   // — a hidden role=dialog pre-rendered in the DOM is not "open".
+  const labelRefs = el => {
+    const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+    const missing = ids.filter(id => { const t = document.getElementById(id); return !t || !(t.textContent || '').trim(); });
+    return { resolved: ids.length > missing.length, missing: missing.join(' ') };
+  };
   const decl = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]'))
     .find(e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden');
   if (decl) {
@@ -1242,7 +1247,13 @@ pub(crate) const OVERLAY_JS: &str = r##"(() => {
       present: true,
       declared: true,
       modal: el.getAttribute('aria-modal') === 'true' || el.tagName === 'DIALOG',
-      labelled: !!(el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')),
+      // Labelled means the name RESOLVES — not that the attribute is there. Field report: a
+      // dialog's aria-labelledby pointed at its title, which only rendered on one branch; opened
+      // straight into the other (editing an existing record) the reference dangled and the dialog
+      // had no name at all, while an attribute check called it labelled. The unresolved ids ride
+      // along so the finding can name the reference instead of looking like a missing attribute.
+      labelled: !!(el.getAttribute('aria-label') || '').trim() || labelRefs(el).resolved,
+      dangling_label: labelRefs(el).missing,
       focus_inside: el.contains(document.activeElement) && document.activeElement !== document.body,
       scrollLocked: (function(){ var b=getComputedStyle(document.body), h=getComputedStyle(document.documentElement); return b.overflow==='hidden'||b.overflow==='clip'||h.overflow==='hidden'||h.overflow==='clip'||b.position==='fixed'; })(),
       scrollable: document.documentElement.scrollHeight > window.innerHeight + 4,
@@ -1377,6 +1388,7 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
                 "declared": ov["declared"],
                 "modal": ov["modal"],
                 "labelled": ov["labelled"],
+                "dangling_label": ov["dangling_label"],
                 "focus_inside": ov["focus_inside"],
                 "escape_closes": escaped,
                 "has_close": ov["has_close"],
