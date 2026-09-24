@@ -1614,6 +1614,12 @@ function collectSnapshot() {
 			clientH: el.clientHeight,
 			naturalW: el.naturalWidth || 0,
 			naturalH: el.naturalHeight || 0,
+			// A VECTOR image (an SVG source) has no pixel resolution: its naturalWidth is a browser
+			// default (300×150, or a viewBox-shaped box) that says nothing about sharpness, so a
+			// resolution rule comparing it to the display size reports an SVG as "upscaled 2×" —
+			// field report, 2026-09-24. Flagged rather than zeroed, because other rules rightly read
+			// a natural size as "an image is here" (vision, media-in-section).
+			imgVector: el.tagName === 'IMG' && /\.svgz?([?#]|$)|^data:image\/svg\+xml/i.test(el.currentSrc || el.src || ''),
 			// A click-to-enlarge thumbnail: an image inside a link/button that opens a larger view.
 			// Its full-res source is used when opened, so it's not "overweight". (Images only.)
 			imgClickable: el.tagName === 'IMG' && !!el.closest('a[href],button,[role="button"]'),
@@ -2606,11 +2612,18 @@ function collectSnapshot() {
 					// the absorbed width is slack translated labels grow INTO, not fight. Counting it as
 					// consumed made every spacer-justified nav look full and falsely fail the German test.
 					// Drop the spacer's width, and drop an auto margin's resolved px off any child.
+					//
+					// `k.style` only sees an INLINE auto margin. Set from a stylesheet (`.spacer{margin-left:
+					// auto}`), getComputedStyle hands back the RESOLVED px — the whole free space — and the
+					// bar read as "0px free" at 1440px while mostly empty (field report, 2026-09-24). So: an
+					// empty element with no width is a spacer however it's styled, and no single margin in a
+					// nav row counts past 32px — anything wider is distributed slack, not a label's room.
 					const marginAuto = k.style.marginLeft === 'auto' || k.style.marginRight === 'auto';
-					if (label.length < 2 && ((parseFloat(kcs.flexGrow) || 0) > 0 || marginAuto)) continue;
+					if (label.length < 2 && ((parseFloat(kcs.flexGrow) || 0) > 0 || marginAuto || kr.width < 2)) continue;
+					const margin = v => Math.min(parseFloat(v) || 0, 32);
 					childrenW += kr.width
-						+ (k.style.marginLeft === 'auto' ? 0 : parseFloat(kcs.marginLeft) || 0)
-						+ (k.style.marginRight === 'auto' ? 0 : parseFloat(kcs.marginRight) || 0);
+						+ (k.style.marginLeft === 'auto' ? 0 : margin(kcs.marginLeft))
+						+ (k.style.marginRight === 'auto' ? 0 : margin(kcs.marginRight));
 					if (label && cctx) {
 						try {
 							cctx.font = `${kcs.fontWeight} ${kcs.fontSize} ${kcs.fontFamily}`;
