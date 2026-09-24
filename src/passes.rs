@@ -333,6 +333,24 @@ pub(crate) fn resilience_pass(tab: &headless_chrome::Tab, url: &str, slow_networ
     out
 }
 
+/// The request the page re-sent in a loop while its data requests were failing, and how many times —
+/// or `(None, 0)`. Reported from the field: a single failed fetch became thousands of identical
+/// requests, because a reactive effect's guard READ the state it then wrote, so success latched and
+/// failure re-fired forever. Nobody noticed for months; the happy path is silent. The fault probe is
+/// the one moment that shape is exposed, and counting needs no framework knowledge. Six in the
+/// probe's ~1.2s window is the bar: a retry with backoff makes one to three attempts in that time; a
+/// hot loop makes dozens.
+pub(crate) fn retry_loop(
+    counts: &std::collections::HashMap<String, usize>,
+) -> (Option<String>, usize) {
+    const LOOP_AT: usize = 6;
+    counts
+        .iter()
+        .filter(|(_, n)| **n >= LOOP_AT)
+        .max_by_key(|(k, n)| (**n, std::cmp::Reverse((*k).clone())))
+        .map_or((None, 0), |(k, n)| (Some(k.clone()), *n))
+}
+
 /// Fault injection: fail the page's data requests (XHR/fetch only — HTML/JS/CSS load
 /// normally) and observe the error UX. Static analysis can't see error messaging because a
 /// healthy server never shows it; provoking the failure makes it deterministic.
@@ -356,10 +374,24 @@ pub(crate) fn probe_error_state(tab: &headless_chrome::Tab, url: &str) -> Value 
     if tab.enable_fetch(Some(&patterns), None).is_err() {
         return json!({ "probed": false });
     }
+    // Every failed request, by method + URL (query dropped: a cache-buster must not make a loop look
+    // like distinct requests). A page whose loader re-fires on failure shows up here as ONE request
+    // repeated many times — see `retry_loop` below.
+    let seen: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let counter = seen.clone();
     tab.enable_request_interception(Arc::new(
-        |_t: Arc<headless_chrome::browser::transport::Transport>,
-         _s,
-         ev: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent| {
+        move |_t: Arc<headless_chrome::browser::transport::Transport>,
+              _s,
+              ev: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent| {
+            let r = &ev.params.request;
+            let key = format!(
+                "{} {}",
+                r.method,
+                r.url.split(['?', '#']).next().unwrap_or("")
+            );
+            if let Ok(mut m) = counter.lock() {
+                *m.entry(key).or_default() += 1;
+            }
             RequestPausedDecision::Fail(Fetch::FailRequest {
                 request_id: ev.params.request_id,
                 error_reason: ErrorReason::Failed,
@@ -399,8 +431,11 @@ pub(crate) fn probe_error_state(tab: &headless_chrome::Tab, url: &str) -> Value 
         },
     ))
     .ok();
+    let (loop_request, loop_count) =
+        retry_loop(&seen.lock().map(|m| m.clone()).unwrap_or_default());
     json!({
         "probed": true,
+        "retry_loop": loop_request.map(|r| json!({ "request": r, "count": loop_count })),
         "has_error_affordance": obs["hasAlert"].as_bool().unwrap_or(false) || obs["hasErrorText"].as_bool().unwrap_or(false),
         "has_retry": obs["hasRetry"].as_bool().unwrap_or(false),
         "stuck_loading": obs["stuckLoading"].as_bool().unwrap_or(false),
@@ -1848,5 +1883,32 @@ process.stdout.write({});"#,
         assert!(is_dangerous_label("DELETE"));
         assert!(is_dangerous_label("Delete/remove"));
         assert!(!is_dangerous_label(""));
+    }
+}
+
+#[cfg(test)]
+mod retry_loop_tests {
+    use super::retry_loop;
+
+    #[test]
+    fn one_request_repeated_is_a_loop_and_a_few_retries_are_not() {
+        let m = |xs: &[(&str, usize)]| xs.iter().map(|(k, n)| (k.to_string(), *n)).collect();
+        assert_eq!(
+            retry_loop(&m(&[
+                ("GET http://a.test/api/films", 40),
+                ("GET http://a.test/api/me", 2)
+            ])),
+            (Some("GET http://a.test/api/films".into()), 40)
+        );
+        // A retry with backoff: a few attempts, then it gives up. Not a loop.
+        assert_eq!(
+            retry_loop(&m(&[("GET http://a.test/api/films", 3)])),
+            (None, 0)
+        );
+        // Many DIFFERENT requests failing once each is a busy page, not a loop.
+        let busy: Vec<(String, usize)> = (0..20)
+            .map(|i| (format!("GET http://a.test/api/{i}"), 1))
+            .collect();
+        assert_eq!(retry_loop(&busy.into_iter().collect()), (None, 0));
     }
 }
