@@ -156,6 +156,102 @@ fn audit_structured(report: &Value, server: &str) -> Value {
     })
 }
 
+/// The prose an agent reads for a report. The SERVER renders it (`agent_text`) so presentation ships
+/// with a deploy rather than a CLI release — this only adds what the server can't know: the LOCAL
+/// source hint for each finding group (source never leaves the machine; the server leaves a
+/// `{{where:N}}` token and says which finding it belongs to), the warnings this client raised about
+/// the run, the local-source DRY advisory, and the feedback prompt. A server too old to send
+/// `agent_text` gets the built-in renderer, `report_text`, exactly as before.
+fn agent_prose(report: &Value, server: &str, feedback_enabled: bool) -> String {
+    let Some(text) = report["agent_text"].as_str() else {
+        return report_text(report, server, feedback_enabled);
+    };
+    let mut body = text.to_string();
+    for (n, w) in report["agent_where"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let finding = &report["pages"][w["page"].as_u64().unwrap_or(0) as usize]["findings"]
+            [w["finding"].as_u64().unwrap_or(0) as usize];
+        let at = match finding["source"].as_str() {
+            Some(src) => format!(" · source: {src}"),
+            None => w["fallback"].as_str().unwrap_or("").to_string(),
+        };
+        body = body.replace(&format!("{{{{where:{n}}}}}"), &at);
+    }
+    let mut t = local_warnings(report);
+    t.push_str(&body);
+    t.push_str(&local_dry(report));
+    if feedback_enabled {
+        let mut rules: Vec<String> = Vec::new();
+        for f in report["pages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p["findings"].as_array().into_iter().flatten())
+        {
+            if let Some(r) = f["rule"]
+                .as_str()
+                .filter(|r| !r.is_empty() && !rules.iter().any(|x| x == r))
+            {
+                rules.push(r.to_string());
+            }
+        }
+        if !rules.is_empty() {
+            t.push_str(&feedback_solicitation(report_id_of(report), &rules));
+        }
+    }
+    t
+}
+
+/// What this client found wrong with the RUN itself — a config that audits signed out, thin seed
+/// data, pages captured without their interaction checks. Raised locally, so rendered locally, and
+/// put first: every finding below is about the wrong experience if it applies.
+fn local_warnings(report: &Value) -> String {
+    let mut t = String::new();
+    if let Some(ws) = report["config_warnings"]
+        .as_array()
+        .filter(|w| !w.is_empty())
+    {
+        t.push_str("⚠ CONFIG — this audit may not have seen what you meant it to:\n");
+        for w in ws.iter().filter_map(|w| w.as_str()) {
+            t.push_str(&format!("  · {w}\n"));
+        }
+        t.push_str("Fix that and re-run before acting on the findings below.\n\n");
+    }
+    if let Some(n) = report["depth_trimmed"].as_u64().filter(|n| *n > 0) {
+        t.push_str(&format!(
+            "⏱ Time was short, so {n} page(s) were captured at rest without their interaction checks (hover, focus, dialogs, fault probes) — every page was still seen. Raise the time cap (--timeout, or uxlint.toml `timeout`) for full depth.\n\n"
+        ));
+    }
+    t
+}
+
+/// DRY / componentization from the LOCAL source (never sent to the server): card/panel class clusters
+/// retyped across the tree — each a component waiting to be extracted.
+fn local_dry(report: &Value) -> String {
+    let mut t = String::new();
+    if let Some(dry) = report["source_dry"].as_array().filter(|d| !d.is_empty()) {
+        let total: i64 = dry.iter().map(|d| d["count"].as_i64().unwrap_or(0)).sum();
+        t.push_str(&format!(
+            "\nDRY (local source): {total} inlined card/panel(s) across {} repeated cluster(s) — extract a shared component instead of retyping the classes:\n",
+            dry.len()
+        ));
+        for d in dry.iter().take(5) {
+            t.push_str(&format!(
+                "  ×{} in {} file(s) · from {}: \"{}\"\n",
+                d["count"].as_i64().unwrap_or(0),
+                d["files"].as_i64().unwrap_or(0),
+                d["source"].as_str().unwrap_or("-"),
+                d["cluster"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    t
+}
+
 /// The prose half of an audit result, for the agent: setup asks, the grade, what moved since last
 /// time, a TIMED OUT warning, the action plan, then every finding with its fix and screenshot. Shared
 /// by `audit_url` (a run it just finished) and `get_report` (one that already exists), so a report
@@ -1463,7 +1559,7 @@ impl UxlintMcp {
         let text = match report {
             Ok(report) => {
                 structured = audit_structured(&report, &self.cli.server);
-                report_text(&report, &self.cli.server, self.feedback_enabled)
+                agent_prose(&report, &self.cli.server, self.feedback_enabled)
             }
             Err(e) => format!("audit failed: {e}"),
         };
@@ -1803,7 +1899,7 @@ impl UxlintMcp {
         .map_err(|e| McpError::internal_error(format!("get_report task panicked: {e}"), None))?;
         match result {
             Ok(report) => {
-                let text = report_text(&report, &self.cli.server, self.feedback_enabled);
+                let text = agent_prose(&report, &self.cli.server, self.feedback_enabled);
                 let mut r = CallToolResult::success(vec![ContentBlock::text(text)]);
                 r.structured_content = Some(audit_structured(&report, &self.cli.server));
                 Ok(r)
@@ -2239,6 +2335,29 @@ mod report_tool_tests {
         assert!(
             archive_confirmation(&one).starts_with("archived 1 verdict on contrast as wont_fix")
         );
+    }
+
+    /// The server's prose is used as-is; only the LOCAL parts are filled in here — the source hint
+    /// replaces its token, the selector fallback is used where there's none, and client warnings lead.
+    #[test]
+    fn server_prose_is_passed_through_with_local_source_filled_in() {
+        use super::agent_prose;
+        let report = json!({
+            "agent_text": "Grade B\n[warn] a (/x·desktop){{where:0}}\n[warn] b (/y·desktop){{where:1}}\nend\n",
+            "agent_where": [{"page": 0, "finding": 0, "fallback": " · selector: .a"},
+                            {"page": 1, "finding": 0, "fallback": " · selector: .b"}],
+            "pages": [{"findings": [{"rule": "a", "source": "src/A.svelte:12"}]},
+                      {"findings": [{"rule": "b"}]}],
+            "config_warnings": ["uxlint.toml: default_persona \"x\" names no [personas.x]"],
+        });
+        let t = agent_prose(&report, "https://uxlint.net", false);
+        assert!(t.starts_with("⚠ CONFIG"), "client warnings lead: {t}");
+        assert!(
+            t.contains("[warn] a (/x·desktop) · source: src/A.svelte:12"),
+            "{t}"
+        );
+        assert!(t.contains("[warn] b (/y·desktop) · selector: .b"), "{t}");
+        assert!(!t.contains("{{where"), "no token survives: {t}");
     }
 
     #[test]

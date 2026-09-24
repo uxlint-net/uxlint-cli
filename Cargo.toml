@@ -5,7 +5,7 @@
 
 [package]
 name = "uxlint"
-version = "0.1.37"
+version = "0.1.38"
 edition = "2021"
 # Machine-readable provenance, so a tool never has to infer any of it from a text file.
 license = "Apache-2.0"
@@ -44,7 +44,9 @@ tonic = "0.14"
 # Official MCP SDK — the async stdio server that replaces the hand-rolled JSON-RPC loop.
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
 # Async runtime for the rmcp server; blocking audits/HTTP run on spawn_blocking.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+# `process`, `io-util` and `time` are for the MCP supervisor (src/supervise.rs), which relays the
+# session to a child `uxlint mcp` and swaps it for a newer one without the agent restarting.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "process", "io-util", "time"] }
 # JSON Schema derive for the MCP tool input structs (schemars reads /// docs as field descriptions).
 schemars = "1"
 # Interactive CLI prompts (arrow-key Select with type-to-filter, Text, Confirm, Password) for

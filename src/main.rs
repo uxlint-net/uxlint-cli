@@ -34,6 +34,7 @@ mod shipped_defaults;
 mod site;
 mod source_map;
 mod style;
+mod supervise;
 mod test_run;
 mod update;
 mod worker;
@@ -138,6 +139,12 @@ enum Cmd {
             value_parser = clap::builder::FalseyValueParser::new(),
         )]
         admin: bool,
+        /// Run as the SUPERVISOR the Claude Code plugin launches: hold the agent's MCP session and
+        /// relay it to a child `uxlint mcp`, swapping that child for the plugin's new version when
+        /// Claude Code auto-updates the plugin — no agent restart, and the old process is retired once
+        /// it has finished what it was doing. See src/supervise.rs.
+        #[arg(long)]
+        supervise: bool,
     },
     /// Re-audit a past report's site and show what changed: fixed, new/regressed, still open
     Diff {
@@ -587,7 +594,16 @@ fn main() -> Result<()> {
             action,
             base,
             admin,
+            supervise,
         } => match action {
+            None if *supervise => {
+                // Every child gets exactly this invocation's arguments, minus the switch itself.
+                let args: Vec<String> = std::env::args()
+                    .skip(1)
+                    .filter(|a| a != "--supervise")
+                    .collect();
+                supervise::run(args)
+            }
             None => run_mcp(&cli, base.clone(), *admin),
             Some(McpCmd::Install { tool, name }) => mcp_install::install(tool.as_deref(), name),
             Some(McpCmd::Uninstall { tool, name }) => mcp_install::uninstall(tool.as_deref(), name),
