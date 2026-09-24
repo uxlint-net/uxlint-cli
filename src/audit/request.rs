@@ -31,6 +31,8 @@ pub(crate) struct AuditRequestInputs<'a> {
     /// (or configured) styleguide path. Clears `styleguide-missing` for an unlinked design-system page.
     pub(crate) styleguide: &'a Value,
     pub(crate) bot_blocked_routes: &'a [String],
+    /// Routes that hung the browser (`worker::PassShared::hung`) — the server's `page-hung`.
+    pub(crate) hung_routes: &'a [Value],
     pub(crate) labels: &'a [String],
     pub(crate) timed_out: bool,
     /// The CRAWL BUDGET this run used — how many pages beyond the seed routes the client was allowed
@@ -69,6 +71,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "open_redirect": i.open_redirect,
         "styleguide": i.styleguide,
         "bot_blocked_routes": i.bot_blocked_routes,
+        "hung_routes": i.hung_routes,
         "labels": i.labels,
         "timed_out": i.timed_out,
         "crawl": i.crawl,

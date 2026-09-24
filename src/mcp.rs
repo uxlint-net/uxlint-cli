@@ -162,6 +162,18 @@ fn audit_structured(report: &Value, server: &str) -> Value {
 /// read back later is exactly the report the agent would have been handed at the time.
 fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
     let mut t = String::new();
+    // Before anything else: a config that made this run audit SIGNED OUT when it meant not to. Every
+    // finding below is about the wrong experience if this fires, so it can't sit under them.
+    if let Some(ws) = report["config_warnings"]
+        .as_array()
+        .filter(|w| !w.is_empty())
+    {
+        t.push_str("⚠ CONFIG — this audit may not have seen what you meant it to:\n");
+        for w in ws.iter().filter_map(|w| w.as_str()) {
+            t.push_str(&format!("  · {w}\n"));
+        }
+        t.push_str("Fix that and re-run before acting on the findings below.\n\n");
+    }
     if let Some(blocked) = report["auth_blocked_routes"].as_array() {
         let routes: Vec<&str> = blocked
             .iter()
@@ -275,6 +287,13 @@ fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
         }
         t.push_str("\n\n");
     }
+    // Coverage was protected by skipping depth: every page was captured, but some without their
+    // interaction checks. Say so, so "no hover/dialog findings" there isn't read as "clean".
+    if let Some(n) = report["depth_trimmed"].as_u64().filter(|n| *n > 0) {
+        t.push_str(&format!(
+            "⏱ Time was short, so {n} page(s) were captured at rest without their interaction checks (hover, focus, dialogs, fault probes) — every page was still seen. Raise the time cap (--timeout, or uxlint.toml `timeout`) for full depth.\n\n"
+        ));
+    }
     // Warn the agent up front when the audit hit its time cap — the finding set
     // below may be partial, so "clean" here doesn't mean the whole site was checked.
     if report["timed_out"].as_bool() == Some(true) {
@@ -303,56 +322,73 @@ fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
     // Every distinct rule id shown below — feeds the closing feedback solicitation
     // (deduped, insertion order; empty iff nothing was reported).
     let mut rules_seen: Vec<String> = Vec::new();
-    for page in report["pages"].as_array().unwrap_or(&vec![]) {
-        let route = page["route"].as_str().unwrap_or("");
-        let viewport = page["viewport"].as_str().unwrap_or("");
-        for f in page["findings"]
-            .as_array()
-            .unwrap_or(&vec![])
+    let groups = finding_groups(report);
+    for g in groups.iter().take(MAX_GROUPS) {
+        let f = g.first;
+        // rule name (for verify_fix), location, the problem, and the fix.
+        if !rules_seen.contains(&g.rule) {
+            rules_seen.push(g.rule.clone());
+        }
+        let sel = f["sel"].as_str().unwrap_or("");
+        // Prefer the source hint (file:line, from the local grep) as the
+        // location; fall back to the DOM selector.
+        let where_ = match (f["source"].as_str(), sel) {
+            (Some(src), _) => format!(" · source: {src}"),
+            (None, s) if !s.is_empty() && s != "page" && s != "site" => {
+                format!(" · selector: {s}")
+            }
+            _ => String::new(),
+        };
+        let places = g
+            .places
             .iter()
-            .take(30)
-        {
-            // rule name (for verify_fix), location, the problem, and the fix.
-            let rule = f["rule"].as_str().unwrap_or("");
-            if !rule.is_empty() && !rules_seen.iter().any(|r| r.as_str() == rule) {
-                rules_seen.push(rule.to_string());
-            }
-            let sel = f["sel"].as_str().unwrap_or("");
-            // Prefer the source hint (file:line, from the local grep) as the
-            // location; fall back to the DOM selector.
-            let where_ = match (f["source"].as_str(), sel) {
-                (Some(src), _) => format!(" · source: {src}"),
-                (None, s) if !s.is_empty() && s != "page" && s != "site" => {
-                    format!(" · selector: {s}")
+            .take(4)
+            .map(|(r, v)| format!("{r}·{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let at = if g.places.len() == 1 {
+            format!("({places})")
+        } else {
+            let more = g.places.len().saturating_sub(4);
+            format!(
+                "— {} places, fix once: {places}{}",
+                g.places.len(),
+                if more > 0 {
+                    format!(" +{more} more")
+                } else {
+                    String::new()
                 }
-                _ => String::new(),
-            };
-            t.push_str(&format!(
-                "[{}] {} ({}·{}){}\n  {}\n  fix: {}\n",
-                f["severity"].as_str().unwrap_or(""),
-                rule,
-                route,
-                viewport,
-                where_,
-                f["msg"].as_str().unwrap_or(""),
-                f["fix"].as_str().unwrap_or(""),
-            ));
-            // The flagged element boxed on its page screenshot — look before you fix.
-            if let Some(url) = shot_url(server, report_id, route, viewport, &f["rect"]) {
-                t.push_str(&format!("  shot: {url}\n"));
-            }
-            // Exact applicable edit for copy findings: a literal find-and-replace
-            // the agent can grep for and apply, then confirm with verify_fix.
-            if let Some(marks) = f["marks"].as_array() {
-                for m in marks {
-                    if m["t"].as_str() == Some("rewrite") {
-                        if let (Some(from), Some(to)) = (m["from"].as_str(), m["to"].as_str()) {
-                            t.push_str(&format!("  edit: replace \"{from}\" with \"{to}\"\n"));
-                        }
+            )
+        };
+        t.push_str(&format!(
+            "[{}] {} {at}{where_}\n  {}\n  fix: {}\n",
+            g.severity,
+            g.rule,
+            f["msg"].as_str().unwrap_or(""),
+            f["fix"].as_str().unwrap_or(""),
+        ));
+        // The flagged element boxed on its page screenshot — look before you fix.
+        let (route, viewport) = &g.places[0];
+        if let Some(url) = shot_url(server, report_id, route, viewport, &f["rect"]) {
+            t.push_str(&format!("  shot: {url}\n"));
+        }
+        // Exact applicable edit for copy findings: a literal find-and-replace
+        // the agent can grep for and apply, then confirm with verify_fix.
+        if let Some(marks) = f["marks"].as_array() {
+            for m in marks {
+                if m["t"].as_str() == Some("rewrite") {
+                    if let (Some(from), Some(to)) = (m["from"].as_str(), m["to"].as_str()) {
+                        t.push_str(&format!("  edit: replace \"{from}\" with \"{to}\"\n"));
                     }
                 }
             }
         }
+    }
+    if groups.len() > MAX_GROUPS {
+        t.push_str(&format!(
+            "…and {} more (lower-severity, narrower) — every finding is in the structured result and on the report page.\n",
+            groups.len() - MAX_GROUPS
+        ));
     }
     // DRY / componentization (local source, never sent to the server): card/panel
     // class clusters retyped across the tree — each a component waiting to be
@@ -467,6 +503,114 @@ fn progress_message(
     } else {
         format!("{what} · {}", dur(elapsed))
     })
+}
+
+/// What `archive_feedback` says it closed. The COUNT goes back to the caller — one that meant to close a
+/// single reason and closed the whole rule finds out here, not by the digest quietly going empty — and
+/// it counts BOTH halves: it used to report verdicts only, so closing a lint idea read "archived 0
+/// verdicts on  as fixed", a success that looked exactly like a no-op (the server 404s a real no-op).
+/// The empty rule is a wholly new lint idea and is named as one.
+fn archive_confirmation(v: &Value) -> String {
+    let n = |k: &str| v[k].as_i64().unwrap_or(0);
+    let plural = |n: i64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut closed = Vec::new();
+    if n("archived") > 0 || n("suggestions") == 0 {
+        closed.push(plural(n("archived"), "verdict", "verdicts"));
+    }
+    if n("suggestions") > 0 {
+        closed.push(plural(n("suggestions"), "lint idea", "lint ideas"));
+    }
+    let on = match v["rule"].as_str() {
+        Some("") => "new lint".to_string(),
+        Some(r) => r.to_string(),
+        None => "?".to_string(),
+    };
+    format!(
+        "archived {} on {on} as {} ({} scope). Anything filed after now stays live — including this \
+         same complaint if it comes back.",
+        closed.join(" and "),
+        v["outcome"].as_str().unwrap_or("?"),
+        v["scope"].as_str().unwrap_or("?"),
+    )
+}
+
+/// How many root causes the prose lists before pointing at the rest (the structured half always
+/// carries every finding).
+const MAX_GROUPS: usize = 60;
+
+/// One root cause: the same rule on the same element (or source line, or — for a page-level finding —
+/// the same message with its numbers masked) wherever it turned up, across pages and viewports.
+struct FindingGroup<'a> {
+    rule: String,
+    severity: String,
+    first: &'a Value,
+    places: Vec<(String, String)>,
+}
+
+/// The findings as an agent should work them: grouped by root cause, most severe first, then the ones
+/// that turn up in the most places. The prose used to list them page by page, up to 30 a page, so a
+/// shared header's hover gap was a separate entry on every route — 71 warnings for one run (a field
+/// report, 2026-09-24) — when it is one edit. "Fix once, not N times" is what positive verdicts praise
+/// most; this puts it at the top of the result instead of leaving the agent to discover it.
+fn finding_groups(report: &Value) -> Vec<FindingGroup<'_>> {
+    let rank = |s: &str| match s {
+        "error" => 0,
+        "warn" => 1,
+        _ => 2,
+    };
+    let mut groups: Vec<FindingGroup> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for page in report["pages"].as_array().into_iter().flatten() {
+        let route = page["route"].as_str().unwrap_or("").to_string();
+        let viewport = page["viewport"].as_str().unwrap_or("").to_string();
+        for f in page["findings"].as_array().into_iter().flatten() {
+            let rule = f["rule"].as_str().unwrap_or("").to_string();
+            if rule.is_empty() {
+                continue; // a paywall-locked stub: no rule, nothing to act on
+            }
+            let sel = f["sel"].as_str().unwrap_or("");
+            let key = match f["source"].as_str() {
+                Some(src) => format!("src:{src}"),
+                None if !sel.is_empty() && sel != "page" && sel != "site" => format!("sel:{sel}"),
+                // Page-level: the message IS the identity, but "3 requests failed" and "2 requests
+                // failed" are the same problem on two pages.
+                None => format!(
+                    "msg:{}",
+                    f["msg"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                        .collect::<String>()
+                ),
+            };
+            let sev = f["severity"].as_str().unwrap_or("").to_string();
+            match index.get(&(rule.clone(), key.clone())) {
+                Some(&i) => {
+                    let g = &mut groups[i];
+                    if rank(&sev) < rank(&g.severity) {
+                        g.severity = sev;
+                    }
+                    if !g.places.contains(&(route.clone(), viewport.clone())) {
+                        g.places.push((route.clone(), viewport.clone()));
+                    }
+                }
+                None => {
+                    index.insert((rule.clone(), key), groups.len());
+                    groups.push(FindingGroup {
+                        rule,
+                        severity: sev,
+                        first: f,
+                        places: vec![(route.clone(), viewport.clone())],
+                    });
+                }
+            }
+        }
+    }
+    // Stable: equal groups keep report order, which is the server's own priority within a page.
+    groups.sort_by_key(|g| (rank(&g.severity), std::cmp::Reverse(g.places.len())));
+    groups
 }
 
 /// Compact end-of-result nudge — appended to the PROSE half only (never the structured JSON the
@@ -989,6 +1133,11 @@ struct ArchiveFeedbackArgs {
     /// complaints back in the digest.
     #[serde(default)]
     revert: Option<bool>,
+    /// Where the fix lives — REQUIRED for `outcome=fixed`: the uxlint commit sha that fixed it, or the
+    /// CLI release that ships it (`cli v0.1.37`). The digest uses it to say whether the fix is live on
+    /// prod yet, so "fixed" stops meaning "fixed somewhere".
+    #[serde(default)]
+    fix_ref: Option<String>,
 }
 
 /// Resolve the base URL for a tool call: an explicit per-call `base` wins (a blank one is treated as
@@ -1230,6 +1379,7 @@ impl UxlintMcp {
             // behalf. This is the surface whose own description promised "only NAVIGATES and READS",
             // and it is now the surface that keeps that promise unconditionally.
             allow_mutation: false,
+            accept_target: false,
             crawl: a.crawl.unwrap_or(12) as usize,
             parallel: None, // auto: full throttle locally, polite on public hosts
             probe_errors: false,
@@ -1356,6 +1506,7 @@ impl UxlintMcp {
             password: None,
             states: a.states.unwrap_or(false),
             allow_mutation: false, // verify_fix re-checks a page; it never rehearses its delete flow
+            accept_target: false,
             crawl: 1,
             rule: None,
             // Crops scoped to the rule under test; the audit still reports everything it finds on
@@ -1742,7 +1893,7 @@ impl UxlintMcp {
     // The write half of the staff loop, behind the same `--admin` switch as `get_feedback`.
     #[tool(
         name = "archive_feedback",
-        description = "uxlint STAFF: close a lint complaint OR a lint idea you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes one. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT item — a verdict's reason or a suggestion's text, both matched the same way (an idea the digest shows as `[new lint]` has no rule yet: pass `rule=\"new lint\"`, and its text is then required); omitting `reason` closes every complaint AND idea on the rule, which is a much bigger claim — only do it when you have read them all.\n\nIt REFUSES (404) when nothing matches, rather than reporting success for having closed nothing: if you get that, check the rule name and that `reason` is the exact text the digest printed — it is matched whole, never by substring. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
+        description = "uxlint STAFF: close a lint complaint OR a lint idea you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes one. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT item — a verdict's reason or a suggestion's text, both matched the same way (an idea the digest shows as `[new lint]` has no rule yet: pass `rule=\"new lint\"`, and its text is then required); omitting `reason` closes every complaint AND idea on the rule, which is a much bigger claim — only do it when you have read them all.\n\nIt REFUSES (404) when nothing matches, rather than reporting success for having closed nothing: if you get that, check the rule name and that `reason` is the exact text the digest printed — it is matched whole, never by substring. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all. A `fixed` also needs `fix_ref` — the uxlint commit sha, or `cli vX.Y.Z` for a CLI fix — so the digest can say whether it is live on prod yet.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
     )]
     async fn archive_feedback(
         &self,
@@ -1764,6 +1915,7 @@ impl UxlintMcp {
                 "note": a.note.unwrap_or_default(),
                 "through": a.through.unwrap_or_default(),
                 "revert": revert,
+                "fix_ref": a.fix_ref.unwrap_or_default(),
             });
             let resp = reqwest::blocking::Client::new()
                 .post(format!("{server}/v1/lints/feedback/archive"))
@@ -1783,17 +1935,7 @@ impl UxlintMcp {
                             v["rule"].as_str().unwrap_or("?")
                         ));
                     }
-                    // Report the COUNT back: a caller that meant to close one reason and closed the
-                    // whole rule finds out here, not by the digest quietly going empty.
-                    Ok(format!(
-                        "archived {} verdict{} on {} as {} ({} scope). Anything filed after now stays \
-                         live — including this same complaint if it comes back.",
-                        v["archived"].as_i64().unwrap_or(0),
-                        if v["archived"].as_i64() == Some(1) { "" } else { "s" },
-                        v["rule"].as_str().unwrap_or("?"),
-                        v["outcome"].as_str().unwrap_or("?"),
-                        v["scope"].as_str().unwrap_or("?"),
-                    ))
+                    Ok(archive_confirmation(&v))
                 }
                 Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
                     Err(credential_rejected(&cli.server))
@@ -2081,6 +2223,61 @@ mod report_tool_tests {
         );
         // Nothing has started: say nothing rather than something made up.
         assert_eq!(progress_message(snap(0, 0, ""), 0, 0), None);
+    }
+
+    #[test]
+    fn closing_a_lint_idea_says_so_instead_of_zero_verdicts() {
+        use super::archive_confirmation;
+        // THE 2026-09-24 confusion: a successful close of a new-lint idea printed "archived 0 verdicts on  as fixed".
+        let idea = json!({"rule": "", "outcome": "fixed", "archived": 0, "suggestions": 1, "scope": "reason"});
+        assert!(archive_confirmation(&idea)
+            .starts_with("archived 1 lint idea on new lint as fixed (reason scope)"));
+        let both = json!({"rule": "contrast", "outcome": "fixed", "archived": 3, "suggestions": 2, "scope": "rule"});
+        assert!(archive_confirmation(&both)
+            .starts_with("archived 3 verdicts and 2 lint ideas on contrast"));
+        let one = json!({"rule": "contrast", "outcome": "wont_fix", "archived": 1, "suggestions": 0, "scope": "reason"});
+        assert!(
+            archive_confirmation(&one).starts_with("archived 1 verdict on contrast as wont_fix")
+        );
+    }
+
+    #[test]
+    fn one_cause_on_many_pages_is_one_entry_listed_first() {
+        use super::report_text;
+        // THE 2026-09-24 run: 71 warnings, most of them one shared header control repeated per page.
+        let hover = |route: &str| {
+            json!({"route": route, "viewport": "desktop", "findings": [
+                {"rule": "state-hover-feedback", "severity": "warn", "sel": "A|nav-brand", "msg": "no hover", "fix": "add one", "rect": [1, 2, 3, 4]}
+            ]})
+        };
+        let mut pages: Vec<serde_json::Value> = ["/a", "/b", "/c", "/d", "/e"]
+            .iter()
+            .map(|r| hover(r))
+            .collect();
+        pages.push(json!({"route": "/a", "viewport": "desktop", "findings": [
+            {"rule": "request-failed", "severity": "warn", "sel": "page", "msg": "3 network requests failed", "fix": "check it"},
+        ]}));
+        pages.push(json!({"route": "/b", "viewport": "desktop", "findings": [
+            {"rule": "request-failed", "severity": "warn", "sel": "page", "msg": "2 network requests failed", "fix": "check it"},
+            {"rule": "contrast", "severity": "error", "sel": ".x", "msg": "Low contrast", "fix": "darken"},
+        ]}));
+        let t = report_text(
+            &json!({"report_url": "https://uxlint.net/r/abc", "errors": 1, "warnings": 7, "infos": 0, "pages": pages}),
+            "https://uxlint.net",
+            false,
+        );
+        let lines: Vec<&str> = t.lines().filter(|l| l.starts_with('[')).collect();
+        assert_eq!(lines.len(), 3, "{t}");
+        assert!(
+            lines[0].starts_with("[error] contrast (/b·desktop)"),
+            "errors first: {t}"
+        );
+        assert!(lines[1].starts_with("[warn] state-hover-feedback — 5 places, fix once: /a·desktop, /b·desktop, /c·desktop, /d·desktop +1 more"), "{t}");
+        // Page-level findings with different counts are still one cause.
+        assert!(
+            lines[2].starts_with("[warn] request-failed — 2 places"),
+            "{t}"
+        );
     }
 }
 

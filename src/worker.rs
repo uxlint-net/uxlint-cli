@@ -425,6 +425,14 @@ const SHADOW_REGISTRY_JS: &str = r#"(() => { try {
 // Author opt-out: any element carrying the `uxlint-hide` class is removed from the audit — a site
 // tags dev-only or noise chrome (an env banner, a "DEV" marker, a debug toolbar) with it and that
 // chrome vanishes from screenshots AND from the captured element set, so it never seeds findings.
+//
+// Dev-server tooling gets the same treatment WITHOUT anyone tagging it: framework dev toolbars
+// (Astro's, Next's dev indicator), Vue / TanStack Query devtools, the Svelte inspector, and the
+// Vite / webpack / Next ERROR overlays. None of it ships, and a full-viewport error overlay didn't
+// just add noise — every hit-test landed on it, so controls all over the page read as covered.
+// Reported from the field on 2026-09-24 (audits of local dev servers). The error overlays are hidden
+// but still DETECTED by the collector (`js.errorOverlay`) and reported as `dev-error-overlay`,
+// because an app showing a compile error is the one finding that matters on that page.
 // Injected as an init script (before the page's own scripts, on every document) so the elements are
 // display:none from first paint — never flashing into a screenshot and zero-sized to the collector.
 // Inert on the real site: the class does nothing unless THIS stylesheet is present, which only the
@@ -434,7 +442,7 @@ const UXLINT_HIDE_JS: &str = r#"(() => { try {
     if (document.getElementById('__uxlint_hide')) return;
     const s = document.createElement('style');
     s.id = '__uxlint_hide';
-    s.textContent = '.uxlint-hide{display:none !important;}';
+    s.textContent = '.uxlint-hide,vite-error-overlay,#webpack-dev-server-client-overlay,nextjs-portal,astro-dev-toolbar,#__vue-devtools-container__,.tsqd-parent-container,#svelte-inspector-host{display:none !important;}';
     (document.head || document.documentElement).appendChild(s);
   };
   if (document.head || document.documentElement) inject();
@@ -822,6 +830,15 @@ pub(crate) struct PassShared {
     pub(crate) results: Mutex<Vec<(usize, Value)>>,
     pub(crate) anon: Mutex<Vec<String>>,
     pub(crate) bot_blocked: Mutex<Vec<String>>,
+    /// Routes that HUNG the browser — `{route, stage, secs}` — for the server's `page-hung`. A route
+    /// whose load never finished on two tabs, or whose interaction passes froze the tab, used to be
+    /// dropped with a progress note and nothing in the report: a page that crashes the browser read
+    /// as a clean capture that quietly yielded nothing (field report). Not cleared between auth
+    /// states: a hang in any state is a finding.
+    pub(crate) hung: Mutex<Vec<Value>>,
+    /// Routes whose interaction / resilience / fault passes were SKIPPED so the remaining pages could
+    /// still be captured at rest inside the time cap (see `trim_depth`).
+    pub(crate) depth_trimmed: std::sync::atomic::AtomicUsize,
     /// Routes that produced no capture on the first pass (nav failure, rate-limited,
     /// challenged) — later viewport passes skip them instead of re-paying the timeout.
     pub(crate) failed: Mutex<Vec<String>>,
@@ -1147,6 +1164,16 @@ pub(crate) fn audit_route(
                 }
                 Err(rev_err) => {
                     note!(ctx.progress, "  {} {route} … skipped after {:.1}s (nav timeout/error: {first_err}; revive failed: {rev_err})", ctx.name, t0.elapsed().as_secs_f64());
+                    // Only a TIMEOUT is a hang: a refused connection or a DNS error fails in
+                    // milliseconds and is the target being down, not the page freezing a browser.
+                    let secs = t0.elapsed().as_secs();
+                    if secs + 5 >= NAV_TIMEOUT_SECS {
+                        shared
+                            .hung
+                            .lock()
+                            .unwrap()
+                            .push(json!({"route": route, "stage": "load", "secs": secs}));
+                    }
                     return Ok(None);
                 }
             }
@@ -1452,8 +1479,43 @@ pub(crate) fn audit_route(
     // still navigate — cheap when healthy, 3s cap when wedged. A wedged tab is replaced
     // here and now; a hung worker stalling the whole audit is a product dealbreaker.
     let mut renderer_ok = true;
+    // Console phase boundaries (see `tag_console_phases`): everything logged up to here is the page
+    // loading; from here to `probe_mark` is uxlint using it; after that, uxlint breaking it on purpose.
+    let log_len = || logbuf.lock().map(|v| v.len()).unwrap_or(0);
+    let load_mark = log_len();
     let tp_states = std::time::Instant::now();
-    let interactions = if ctx.args.states && ctx.name == "desktop" {
+    // Coverage before depth: when the time left no longer covers capturing every remaining page at
+    // rest, skip this route's extra passes rather than run out of time with pages unseen.
+    let trimmed = {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = shared.crawl_done.load(Relaxed);
+        let remaining = shared.crawl_total.load(Relaxed).saturating_sub(done);
+        let at_rest_ms = shared.t_nav.load(Relaxed)
+            + shared.t_settle.load(Relaxed)
+            + shared.t_capture.load(Relaxed);
+        let time_left = shared
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        let wants_depth = ctx.name == "desktop"
+            && (ctx.args.states
+                || ctx.args.resilience
+                || ctx.args.slow_network
+                || ctx.args.probe_errors);
+        let trim = wants_depth
+            && trim_depth(
+                time_left,
+                remaining,
+                done,
+                at_rest_ms,
+                shared.route_peak.load(Relaxed) as usize,
+            );
+        if trim && shared.depth_trimmed.fetch_add(1, Relaxed) == 0 {
+            note!(ctx.progress, "  ⏱ time is short — capturing the remaining pages at rest and skipping their interaction checks, so no page goes unseen");
+        }
+        trim
+    };
+    let interactions = if ctx.args.states && ctx.name == "desktop" && !trimmed {
         let _states_conc = Concurrency::enter(&shared.states_active, &shared.states_peak);
         tab.set_default_timeout(std::time::Duration::from_secs(8));
         let tph = std::time::Instant::now();
@@ -1568,6 +1630,11 @@ pub(crate) fn audit_route(
                 "  {} {route} … interaction pass wedged the renderer — replacing the tab",
                 ctx.name
             );
+            shared
+                .hung
+                .lock()
+                .unwrap()
+                .push(json!({"route": route, "stage": "interaction"}));
             if let Ok(fresh) = setup_tab(&wk.browser, ctx.args) {
                 *wk.slot.lock().unwrap() = fresh;
             }
@@ -1575,12 +1642,14 @@ pub(crate) fn audit_route(
     }
     add_ms(&shared.t_spinner, tp_spin); // spinner recheck + renderer health gate
 
+    let probe_mark = log_len();
     // Fault injection (opt-in, desktop, non-auth-walled): fail data requests and see how
     // the error UX holds up. Runs LAST — it leaves the page broken. Skipped when the
     // renderer wedged — these passes navigate, and the replacement tab belongs to the
     // NEXT route, not this one's post-mortem.
     let tp_res = std::time::Instant::now();
     let resilience = if (ctx.args.resilience || ctx.args.slow_network)
+        && !trimmed
         && ctx.name == "desktop"
         && !auth_blocked
         && renderer_ok
@@ -1600,7 +1669,12 @@ pub(crate) fn audit_route(
         None
     };
     add_ms(&shared.t_resilience, tp_res);
-    let fault = if ctx.args.probe_errors && ctx.name == "desktop" && !auth_blocked && renderer_ok {
+    let fault = if ctx.args.probe_errors
+        && ctx.name == "desktop"
+        && !auth_blocked
+        && renderer_ok
+        && !trimmed
+    {
         let fr = probe_error_state(tab, &url);
         note!(
             ctx.progress,
@@ -1622,7 +1696,11 @@ pub(crate) fn audit_route(
         "shot_h": ctx.h as f64,
         "interactions": interactions,
         "auth_blocked": auth_blocked,
-        "console": logbuf.lock().map(|v| v.clone()).unwrap_or_default(),
+        "console": tag_console_phases(
+            logbuf.lock().map(|v| v.clone()).unwrap_or_default(),
+            load_mark,
+            probe_mark,
+        ),
         "native_dialogs": native_dialogs.lock().map(|v| v.clone()).unwrap_or_default(),
         "fault": fault,
         "resilience": resilience,
@@ -1635,8 +1713,95 @@ pub(crate) fn audit_route(
     })))
 }
 
+/// Should this route skip its interaction / resilience / fault passes so every remaining page can
+/// still be captured AT REST before the time cap? True when the seconds left no longer cover the
+/// remaining captures at the at-rest pace measured so far (spread over the workers actually running),
+/// with a 30% margin.
+///
+/// The passes used to run route by route to completion, so a tight cap cut COVERAGE, not depth: a
+/// field run on 2026-09-24 captured 12 of 24 pages (~25s a page) and timed out with half the site
+/// unseen. A page never captured has no findings at all; a page captured without its hover and
+/// dialog probes still has every at-rest one. Before any capture has finished there is no pace to
+/// judge by, so nothing is trimmed on a guess.
+pub(crate) fn trim_depth(
+    time_left_s: f64,
+    remaining: usize,
+    done: usize,
+    at_rest_ms_total: u64,
+    parallel: usize,
+) -> bool {
+    if remaining == 0 || done == 0 {
+        return false;
+    }
+    let per_capture_s = at_rest_ms_total as f64 / 1000.0 / done as f64;
+    time_left_s < remaining as f64 * per_capture_s * 1.3 / parallel.max(1) as f64
+}
+
+/// Tag each console entry with the part of the capture it arrived in — `load`, `interaction` or
+/// `probe` — from the buffer's length at the two boundaries (`load_mark`: before the interaction
+/// passes; `probe_mark`: before the resilience and fault probes).
+///
+/// The buffer is read ONCE, after everything, and the server used to treat all of it as the page
+/// loading. So the offline probe's `ERR_INTERNET_DISCONNECTED` and the fault probe's wall of
+/// `ERR_FAILED` — failures uxlint causes on purpose — were reported as "N network requests failed
+/// while loading this page", and an error only a hover or a dialog-open provoked read as a startup
+/// bug. Found in the planning review of 2026-09-24. The server drops `probe` and words
+/// `interaction` honestly; an untagged entry (an older CLI) still reads as `load`.
+///
+/// CDP log events arrive on the listener's thread, so an entry that belongs to the load but lands a
+/// beat late is tagged `interaction` — the conservative direction: it is still reported, just
+/// without the "every visitor gets this" claim.
+pub(crate) fn tag_console_phases(
+    entries: Vec<Value>,
+    load_mark: usize,
+    probe_mark: usize,
+) -> Vec<Value> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut e)| {
+            let phase = if i < load_mark {
+                "load"
+            } else if i < probe_mark {
+                "interaction"
+            } else {
+                "probe"
+            };
+            if let Some(o) = e.as_object_mut() {
+                o.insert("phase".into(), json!(phase));
+            }
+            e
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod same_site_tests {
+    #[test]
+    fn depth_is_trimmed_only_when_time_no_longer_covers_the_remaining_pages() {
+        use super::trim_depth;
+        // 10 captures took 60s at rest → 6s each. 12 left on 2 workers need ~47s with margin.
+        assert!(
+            trim_depth(30.0, 12, 10, 60_000, 2),
+            "30s can't cover 12 more pages"
+        );
+        assert!(!trim_depth(120.0, 12, 10, 60_000, 2), "120s can");
+        // No pace measured yet: never trim on a guess. Nothing left: nothing to protect.
+        assert!(!trim_depth(1.0, 12, 0, 0, 1));
+        assert!(!trim_depth(1.0, 0, 10, 60_000, 1));
+    }
+
+    #[test]
+    fn console_entries_are_tagged_by_the_phase_they_arrived_in() {
+        let e = |t: &str| serde_json::json!({"source": "network", "level": "error", "text": t});
+        let got = super::tag_console_phases(vec![e("a"), e("b"), e("c"), e("d")], 1, 3);
+        let phases: Vec<&str> = got.iter().map(|v| v["phase"].as_str().unwrap()).collect();
+        assert_eq!(phases, ["load", "interaction", "interaction", "probe"]);
+        // No interaction or probe passes ran: both marks sit at the end, everything is load.
+        let got = super::tag_console_phases(vec![e("a"), e("b")], 2, 2);
+        assert!(got.iter().all(|v| v["phase"] == "load"));
+    }
+
     use super::{host_of, same_site};
 
     #[test]

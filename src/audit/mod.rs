@@ -13,6 +13,7 @@ use crate::{AuditArgs, Cli};
 mod probes;
 mod provenance;
 mod request;
+mod target_id;
 // `pub(crate)` for `fetch_me`: the MCP server asks /v1/me for the account's real orgs and sites when
 // it has to tell an agent what to put in a missing uxlint.toml (`mcp::project_setup_instructions`).
 pub(crate) mod setup;
@@ -110,6 +111,11 @@ pub(crate) fn run_audit_ext(
         crawl_cap,
         run_goals,
     } = resolve_target(cli, args, progress)?;
+    // Is the app at --base the one this site's audits have been of? Checked before anything is
+    // announced, launched, signed into or filed — see `target_id` (field report, 2026-08-29).
+    if let Err(msg) = target_id::check_target(&args.base, site.as_deref(), args.accept_target) {
+        anyhow::bail!(msg);
+    }
     // Tell the server this run is starting, so the web shows it in progress exactly like a hosted
     // audit. A CLI/MCP audit used to be invisible for its whole duration — you'd kick one off from an
     // agent, open the dashboard, and see nothing at all until the finished report appeared minutes
@@ -118,6 +124,16 @@ pub(crate) fn run_audit_ext(
     let mut local_run = LocalRun::announce(cli, args, site.as_deref());
     // Backfill credentials (hosted-door env vars, then uxlint.toml [credentials]) onto a clone.
     let args = inject_credentials(args, progress);
+    // A config that will audit SIGNED OUT when it plainly meant not to (see `persona_warnings`) is
+    // said BEFORE the crawl the user is about to wait for, and again at the top of the report.
+    let mut config_warnings = crate::project::persona_warnings();
+    for w in &config_warnings {
+        note!(
+            progress,
+            "{}",
+            crate::style::Stream::Err.yellow(&format!("  ⚠ {w}"))
+        );
+    }
     let args = &args;
     // The page-capture code is BAKED INTO THIS BINARY (not fetched from the server), so the CLI
     // ships — and this repo fully vouches for — the exact JS that runs in your pages and decides
@@ -244,6 +260,8 @@ pub(crate) fn run_audit_ext(
         results: Mutex::new(Vec::new()),
         anon: Mutex::new(Vec::new()),
         bot_blocked: Mutex::new(Vec::new()),
+        hung: Mutex::new(Vec::new()),
+        depth_trimmed: std::sync::atomic::AtomicUsize::new(0),
         failed: Mutex::new(Vec::new()),
         throttled: std::sync::atomic::AtomicBool::new(false),
         serial: Mutex::new(()),
@@ -366,6 +384,10 @@ pub(crate) fn run_audit_ext(
     // joined once, right before this function returns.
     let anon_routes: Vec<String> = shared.anon.lock().unwrap().clone();
     let bot_blocked_routes: Vec<String> = shared.bot_blocked.lock().unwrap().clone();
+    let hung_routes: Vec<Value> = shared.hung.lock().unwrap().clone();
+    let depth_trimmed = shared
+        .depth_trimmed
+        .load(std::sync::atomic::Ordering::Relaxed);
     if !bot_blocked_routes.is_empty() {
         note!(progress,
             "\n  ⚠ bot protection intercepted {} route(s): {}\n    uxlint identifies itself as \"uxlint/0.1 (+https://uxlint.net)\" and does not evade bot\n    detection. Allowlist that user agent (or your audit source IP) in your WAF/CDN, or\n    audit a staging host.",
@@ -416,6 +438,18 @@ pub(crate) fn run_audit_ext(
     // Signed-out gating re-check: routes that showed account affordances while signed in should
     // redirect a logged-out visitor, not strand them. Only meaningful when we WERE signed in.
     let was_authed = !args.storage.is_empty() || !args.headers.is_empty();
+    // Signed in (by session OR by form) and most of what it saw was empty: the account's seed data is
+    // too thin to judge the app — see `thin_seed_warning`.
+    if was_authed || args.username.is_some() {
+        if let Some(w) = thin_seed_warning(&pages) {
+            note!(
+                progress,
+                "{}",
+                crate::style::Stream::Err.yellow(&format!("  ⚠ {w}"))
+            );
+            config_warnings.push(w);
+        }
+    }
     let (anon_checks, login_discoverable) =
         run_signed_out_gating(args, &anon_routes, was_authed, deadline, progress);
 
@@ -527,6 +561,7 @@ pub(crate) fn run_audit_ext(
         open_redirect: &open_redirect,
         styleguide: &styleguide_probe,
         bot_blocked_routes: &bot_blocked_routes,
+        hung_routes: &hung_routes,
         labels: &args.labels,
         timed_out,
         crawl: args.crawl,
@@ -549,7 +584,7 @@ pub(crate) fn run_audit_ext(
     if let Some(run) = &local_run {
         payload["job_id"] = json!(run.job_id());
     }
-    let out = send_and_finalize(FinalizeInputs {
+    let mut out = send_and_finalize(FinalizeInputs {
         cli,
         args,
         progress,
@@ -572,7 +607,39 @@ pub(crate) fn run_audit_ext(
             run.finish();
         }
     }
+    if let Ok(report) = &mut out {
+        if !config_warnings.is_empty() {
+            report["config_warnings"] = json!(config_warnings);
+        }
+        if depth_trimmed > 0 {
+            report["depth_trimmed"] = json!(depth_trimmed);
+        }
+    }
     out
+}
+
+/// A signed-in audit whose pages were mostly EMPTY STATES was run against an account with too little
+/// data to judge the app. Field report, 2026-08-31: thin seed data produced a false duplicate-heading
+/// finding (a component echoing the title when a description was empty) AND hid two real ones (line
+/// measure, a missing focus ring) that only appeared once the record held real prose — and the report
+/// gave no sign either way. Not a UX finding (the site isn't wrong; the audit's account is), so it is
+/// a warning at the top of the result. Keyed on the collector's own empty-state detection rather than
+/// a word count, because a dashboard legitimately has little prose and would trip any threshold.
+fn thin_seed_warning(pages: &[Value]) -> Option<String> {
+    let desktop: Vec<&Value> = pages
+        .iter()
+        .filter(|p| p["viewport"].as_str() == Some("desktop"))
+        .collect();
+    let empty = desktop
+        .iter()
+        .filter(|p| p["snapshot"]["emptyState"].as_bool() == Some(true))
+        .count();
+    (desktop.len() >= 2 && empty * 2 >= desktop.len()).then(|| {
+        format!(
+            "{empty} of {} signed-in pages showed an EMPTY state — the account holds too little data to judge lists, tables, density and long text. Seed realistic records and re-run: findings about those may be missing, and some may only exist because the data is thin",
+            desktop.len()
+        )
+    })
 }
 
 /// The `audit_jobs` row that makes THIS run visible in the web while it happens (`POST
@@ -995,6 +1062,43 @@ fn merge_walk_pages(pages: &mut Vec<Value>, walk_pages: Vec<Value>, cap: usize) 
 }
 
 #[cfg(test)]
+mod thin_seed_tests {
+    use super::thin_seed_warning;
+    use serde_json::json;
+
+    fn page(vp: &str, empty: bool) -> serde_json::Value {
+        json!({"viewport": vp, "snapshot": {"emptyState": empty}})
+    }
+
+    #[test]
+    fn mostly_empty_signed_in_pages_warn_and_a_real_account_does_not() {
+        // THE 2026-08-31 report: thin seed data both invented and hid findings, silently.
+        let w = thin_seed_warning(&[
+            page("desktop", true),
+            page("desktop", true),
+            page("desktop", false),
+            page("mobile", true),
+        ]);
+        assert!(
+            w.as_deref()
+                .is_some_and(|w| w.starts_with("2 of 3 signed-in pages showed an EMPTY state")),
+            "{w:?}"
+        );
+        // One empty list among real pages is a page's own empty state, not a thin account.
+        assert_eq!(
+            thin_seed_warning(&[
+                page("desktop", true),
+                page("desktop", false),
+                page("desktop", false)
+            ]),
+            None
+        );
+        // A single page is not evidence about the account.
+        assert_eq!(thin_seed_warning(&[page("desktop", true)]), None);
+    }
+}
+
+#[cfg(test)]
 mod walk_page_merge_tests {
     use super::*;
     use serde_json::json;
@@ -1373,6 +1477,7 @@ mod request_tests {
             open_redirect: &Value::Null,
             styleguide: &Value::Null,
             bot_blocked_routes: &[],
+            hung_routes: &[],
             labels: &[],
             timed_out: false,
             crawl: 8,
