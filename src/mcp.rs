@@ -315,56 +315,73 @@ fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
     // Every distinct rule id shown below — feeds the closing feedback solicitation
     // (deduped, insertion order; empty iff nothing was reported).
     let mut rules_seen: Vec<String> = Vec::new();
-    for page in report["pages"].as_array().unwrap_or(&vec![]) {
-        let route = page["route"].as_str().unwrap_or("");
-        let viewport = page["viewport"].as_str().unwrap_or("");
-        for f in page["findings"]
-            .as_array()
-            .unwrap_or(&vec![])
+    let groups = finding_groups(report);
+    for g in groups.iter().take(MAX_GROUPS) {
+        let f = g.first;
+        // rule name (for verify_fix), location, the problem, and the fix.
+        if !rules_seen.iter().any(|r| *r == g.rule) {
+            rules_seen.push(g.rule.clone());
+        }
+        let sel = f["sel"].as_str().unwrap_or("");
+        // Prefer the source hint (file:line, from the local grep) as the
+        // location; fall back to the DOM selector.
+        let where_ = match (f["source"].as_str(), sel) {
+            (Some(src), _) => format!(" · source: {src}"),
+            (None, s) if !s.is_empty() && s != "page" && s != "site" => {
+                format!(" · selector: {s}")
+            }
+            _ => String::new(),
+        };
+        let places = g
+            .places
             .iter()
-            .take(30)
-        {
-            // rule name (for verify_fix), location, the problem, and the fix.
-            let rule = f["rule"].as_str().unwrap_or("");
-            if !rule.is_empty() && !rules_seen.iter().any(|r| r.as_str() == rule) {
-                rules_seen.push(rule.to_string());
-            }
-            let sel = f["sel"].as_str().unwrap_or("");
-            // Prefer the source hint (file:line, from the local grep) as the
-            // location; fall back to the DOM selector.
-            let where_ = match (f["source"].as_str(), sel) {
-                (Some(src), _) => format!(" · source: {src}"),
-                (None, s) if !s.is_empty() && s != "page" && s != "site" => {
-                    format!(" · selector: {s}")
+            .take(4)
+            .map(|(r, v)| format!("{r}·{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let at = if g.places.len() == 1 {
+            format!("({places})")
+        } else {
+            let more = g.places.len().saturating_sub(4);
+            format!(
+                "— {} places, fix once: {places}{}",
+                g.places.len(),
+                if more > 0 {
+                    format!(" +{more} more")
+                } else {
+                    String::new()
                 }
-                _ => String::new(),
-            };
-            t.push_str(&format!(
-                "[{}] {} ({}·{}){}\n  {}\n  fix: {}\n",
-                f["severity"].as_str().unwrap_or(""),
-                rule,
-                route,
-                viewport,
-                where_,
-                f["msg"].as_str().unwrap_or(""),
-                f["fix"].as_str().unwrap_or(""),
-            ));
-            // The flagged element boxed on its page screenshot — look before you fix.
-            if let Some(url) = shot_url(server, report_id, route, viewport, &f["rect"]) {
-                t.push_str(&format!("  shot: {url}\n"));
-            }
-            // Exact applicable edit for copy findings: a literal find-and-replace
-            // the agent can grep for and apply, then confirm with verify_fix.
-            if let Some(marks) = f["marks"].as_array() {
-                for m in marks {
-                    if m["t"].as_str() == Some("rewrite") {
-                        if let (Some(from), Some(to)) = (m["from"].as_str(), m["to"].as_str()) {
-                            t.push_str(&format!("  edit: replace \"{from}\" with \"{to}\"\n"));
-                        }
+            )
+        };
+        t.push_str(&format!(
+            "[{}] {} {at}{where_}\n  {}\n  fix: {}\n",
+            g.severity,
+            g.rule,
+            f["msg"].as_str().unwrap_or(""),
+            f["fix"].as_str().unwrap_or(""),
+        ));
+        // The flagged element boxed on its page screenshot — look before you fix.
+        let (route, viewport) = &g.places[0];
+        if let Some(url) = shot_url(server, report_id, route, viewport, &f["rect"]) {
+            t.push_str(&format!("  shot: {url}\n"));
+        }
+        // Exact applicable edit for copy findings: a literal find-and-replace
+        // the agent can grep for and apply, then confirm with verify_fix.
+        if let Some(marks) = f["marks"].as_array() {
+            for m in marks {
+                if m["t"].as_str() == Some("rewrite") {
+                    if let (Some(from), Some(to)) = (m["from"].as_str(), m["to"].as_str()) {
+                        t.push_str(&format!("  edit: replace \"{from}\" with \"{to}\"\n"));
                     }
                 }
             }
         }
+    }
+    if groups.len() > MAX_GROUPS {
+        t.push_str(&format!(
+            "…and {} more (lower-severity, narrower) — every finding is in the structured result and on the report page.\n",
+            groups.len() - MAX_GROUPS
+        ));
     }
     // DRY / componentization (local source, never sent to the server): card/panel
     // class clusters retyped across the tree — each a component waiting to be
@@ -508,6 +525,85 @@ fn archive_confirmation(v: &Value) -> String {
         v["outcome"].as_str().unwrap_or("?"),
         v["scope"].as_str().unwrap_or("?"),
     )
+}
+
+/// How many root causes the prose lists before pointing at the rest (the structured half always
+/// carries every finding).
+const MAX_GROUPS: usize = 60;
+
+/// One root cause: the same rule on the same element (or source line, or — for a page-level finding —
+/// the same message with its numbers masked) wherever it turned up, across pages and viewports.
+struct FindingGroup<'a> {
+    rule: String,
+    severity: String,
+    first: &'a Value,
+    places: Vec<(String, String)>,
+}
+
+/// The findings as an agent should work them: grouped by root cause, most severe first, then the ones
+/// that turn up in the most places. The prose used to list them page by page, up to 30 a page, so a
+/// shared header's hover gap was a separate entry on every route — 71 warnings for one run (a field
+/// report, 2026-09-24) — when it is one edit. "Fix once, not N times" is what positive verdicts praise
+/// most; this puts it at the top of the result instead of leaving the agent to discover it.
+fn finding_groups(report: &Value) -> Vec<FindingGroup<'_>> {
+    let rank = |s: &str| match s {
+        "error" => 0,
+        "warn" => 1,
+        _ => 2,
+    };
+    let mut groups: Vec<FindingGroup> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for page in report["pages"].as_array().into_iter().flatten() {
+        let route = page["route"].as_str().unwrap_or("").to_string();
+        let viewport = page["viewport"].as_str().unwrap_or("").to_string();
+        for f in page["findings"].as_array().into_iter().flatten() {
+            let rule = f["rule"].as_str().unwrap_or("").to_string();
+            if rule.is_empty() {
+                continue; // a paywall-locked stub: no rule, nothing to act on
+            }
+            let sel = f["sel"].as_str().unwrap_or("");
+            let key = match f["source"].as_str() {
+                Some(src) => format!("src:{src}"),
+                None if !sel.is_empty() && sel != "page" && sel != "site" => format!("sel:{sel}"),
+                // Page-level: the message IS the identity, but "3 requests failed" and "2 requests
+                // failed" are the same problem on two pages.
+                None => format!(
+                    "msg:{}",
+                    f["msg"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                        .collect::<String>()
+                ),
+            };
+            let sev = f["severity"].as_str().unwrap_or("").to_string();
+            match index.get(&(rule.clone(), key.clone())) {
+                Some(&i) => {
+                    let g = &mut groups[i];
+                    if rank(&sev) < rank(&g.severity) {
+                        g.severity = sev;
+                    }
+                    if !g.places.contains(&(route.clone(), viewport.clone())) {
+                        g.places.push((route.clone(), viewport.clone()));
+                    }
+                }
+                None => {
+                    index.insert((rule.clone(), key), groups.len());
+                    groups.push(FindingGroup {
+                        rule,
+                        severity: sev,
+                        first: f,
+                        places: vec![(route.clone(), viewport.clone())],
+                    });
+                }
+            }
+        }
+    }
+    // Stable: equal groups keep report order, which is the server's own priority within a page.
+    groups.sort_by_key(|g| (rank(&g.severity), std::cmp::Reverse(g.places.len())));
+    groups
 }
 
 /// Compact end-of-result nudge — appended to the PROSE half only (never the structured JSON the
@@ -2135,6 +2231,45 @@ mod report_tool_tests {
         let one = json!({"rule": "contrast", "outcome": "wont_fix", "archived": 1, "suggestions": 0, "scope": "reason"});
         assert!(
             archive_confirmation(&one).starts_with("archived 1 verdict on contrast as wont_fix")
+        );
+    }
+
+    #[test]
+    fn one_cause_on_many_pages_is_one_entry_listed_first() {
+        use super::report_text;
+        // THE 2026-09-24 run: 71 warnings, most of them one shared header control repeated per page.
+        let hover = |route: &str| {
+            json!({"route": route, "viewport": "desktop", "findings": [
+                {"rule": "state-hover-feedback", "severity": "warn", "sel": "A|nav-brand", "msg": "no hover", "fix": "add one", "rect": [1, 2, 3, 4]}
+            ]})
+        };
+        let mut pages: Vec<serde_json::Value> = ["/a", "/b", "/c", "/d", "/e"]
+            .iter()
+            .map(|r| hover(r))
+            .collect();
+        pages.push(json!({"route": "/a", "viewport": "desktop", "findings": [
+            {"rule": "request-failed", "severity": "warn", "sel": "page", "msg": "3 network requests failed", "fix": "check it"},
+        ]}));
+        pages.push(json!({"route": "/b", "viewport": "desktop", "findings": [
+            {"rule": "request-failed", "severity": "warn", "sel": "page", "msg": "2 network requests failed", "fix": "check it"},
+            {"rule": "contrast", "severity": "error", "sel": ".x", "msg": "Low contrast", "fix": "darken"},
+        ]}));
+        let t = report_text(
+            &json!({"report_url": "https://uxlint.net/r/abc", "errors": 1, "warnings": 7, "infos": 0, "pages": pages}),
+            "https://uxlint.net",
+            false,
+        );
+        let lines: Vec<&str> = t.lines().filter(|l| l.starts_with('[')).collect();
+        assert_eq!(lines.len(), 3, "{t}");
+        assert!(
+            lines[0].starts_with("[error] contrast (/b·desktop)"),
+            "errors first: {t}"
+        );
+        assert!(lines[1].starts_with("[warn] state-hover-feedback — 5 places, fix once: /a·desktop, /b·desktop, /c·desktop, /d·desktop +1 more"), "{t}");
+        // Page-level findings with different counts are still one cause.
+        assert!(
+            lines[2].starts_with("[warn] request-failed — 2 places"),
+            "{t}"
         );
     }
 }
