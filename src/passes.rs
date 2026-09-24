@@ -960,13 +960,36 @@ pub(crate) fn states_pass(tab: &headless_chrome::Tab) -> Value {
   const el = document.activeElement;
   if (!el || el === document.body) return null;
   const pick = n => { const cs = getComputedStyle(n); return [cs.boxShadow, cs.outlineStyle, cs.outlineWidth, cs.borderColor, cs.backgroundColor, cs.color].join('|'); };
-  const focused = pick(el);
-  const key = (el.tagName + '|' + (el.getAttribute('class') || '')).slice(0, 80);
-  const label = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  // MEASURE THE SETTLED STATES, not a transition mid-flight. `getComputedStyle` on an element whose
+  // focus ring is animating returns the INTERPOLATED value, so reading immediately after blur() can
+  // land anywhere between the two — and which side of the threshold it lands on depends on how busy
+  // the machine was. That is a verdict that flips between consecutive runs of unchanged code, which
+  // was reported from the field on 2026-08-31 as the thing that "trains people to ignore the whole
+  // report". Suppressing transition/animation for the two reads makes the comparison deterministic;
+  // the inline style is restored either way, so the page is left as we found it.
+  const prevT = el.style.transition, prevA = el.style.animation;
+  let focused, blurred;
+  try {
+    el.style.transition = 'none';
+    el.style.animation = 'none';
+    el.getBoundingClientRect(); // force the suppressed styles to apply before the first read
+    focused = pick(el);
+    el.blur();
+    el.getBoundingClientRect(); // …and again, so `blurred` is the settled unfocused state
+    blurred = pick(el);
+    el.focus();
+  } finally {
+    el.style.transition = prevT;
+    el.style.animation = prevA;
+  }
+  const key = (el.tagName + (el.id ? '#' + el.id : '') + '|' + (el.getAttribute('class') || '')).slice(0, 80);
+  // The widest name we can get. An element with none of these is unnameable, and the server drops it
+  // rather than reporting `"" has no visible focus indicator` — a finding with nothing to go and look
+  // at, which was the other half of the same report.
+  const named = n => (n.getAttribute('aria-label') || n.getAttribute('title') || n.textContent ||
+                      n.getAttribute('placeholder') || n.value || (n.querySelector('img[alt]') || {}).alt || '');
+  const label = String(named(el)).replace(/\s+/g, ' ').trim().slice(0, 40);
   const r = el.getBoundingClientRect();
-  el.blur();
-  const blurred = pick(el);
-  el.focus();
   return JSON.stringify({ key, label, changed: focused !== blurred,
     x: Math.round(r.x + scrollX), y: Math.round(r.y + scrollY) });
 })()"##,
@@ -995,10 +1018,113 @@ pub(crate) fn states_pass(tab: &headless_chrome::Tab) -> Value {
 // Click controls that look like OPENERS (never dangerous labels), watch what appears, and
 // test the component contract live: dialogs → role/aria-modal/label/focus/Escape;
 // disclosures → aria-expanded actually flips.
-// Buttons discovery_pass must NOT click because they can act immediately and irreversibly. NOT
-// including confirm-guarded verbs like rotate/revoke: the native-dialog handler dismisses their
-// confirm() (= Cancel), so clicking them is safe AND lets the native-dialog lint observe the dialog.
-pub(crate) const DANGEROUS_RE: &str = r"(?i)^(delete|remove|pay|buy|checkout|purchase|submit|send|post|sign out|log ?out|export|generate|run|deploy|publish|upgrade|confirm|save)";
+/// Verbs that make a control unclickable for `discovery_pass`, which exists only to see what a click
+/// REVEALS. A control that acts is not an opener, and the two failure modes are not comparable: a
+/// skipped opener costs one dialog probe, a clicked one costs the user their data.
+///
+/// Matched as WHOLE WORDS ANYWHERE in the accessible name, not as a prefix. The prefix rule is what
+/// let a field report happen on 2026-08-31 — "Accept invitation" fired five times, creating an
+/// anonymous account and then deleting it and its data — and the same hole passes "Permanently delete
+/// account", "Yes, delete" and "Cancel subscription" straight through, since none of them BEGINS with
+/// the dangerous word.
+///
+/// The list also used to omit confirm-guarded verbs like rotate/revoke on the reasoning that the
+/// native-dialog handler dismisses their `confirm()`, so clicking was safe and let `native-dialog`
+/// observe the dialog. That reasoning holds for `window.confirm` and for nothing else: an app with a
+/// custom confirm component gets no such dismissal, and an app with no confirm at all — the reported
+/// case — has already acted by the time we look. The coverage that buys `native-dialog` is not worth
+/// the coverage it buys with someone else's records.
+pub(crate) const DANGEROUS_WORDS: &[&str] = &[
+    // Destroy or take away
+    "delete",
+    "remove",
+    "destroy",
+    "erase",
+    "wipe",
+    "purge",
+    "clear",
+    "discard",
+    "revoke",
+    "reset",
+    "disconnect",
+    "unlink",
+    "unpair",
+    "detach",
+    "eject",
+    "kick",
+    "ban",
+    "block",
+    "suspend",
+    "deactivate",
+    "disable",
+    "archive",
+    "unsubscribe",
+    "cancel",
+    "close",
+    "leave",
+    "abandon",
+    // Commit or transfer — irreversible in a different direction
+    "pay",
+    "buy",
+    "checkout",
+    "purchase",
+    "subscribe",
+    "upgrade",
+    "downgrade",
+    "transfer",
+    "withdraw",
+    "refund",
+    "charge",
+    // Decide on someone else's behalf. `accept` is the one the field report turned on.
+    "accept",
+    "decline",
+    "reject",
+    "approve",
+    "deny",
+    "invite",
+    "confirm",
+    "merge",
+    "restore",
+    // Publish or emit
+    "submit",
+    "send",
+    "post",
+    "publish",
+    "deploy",
+    "release",
+    "run",
+    "execute",
+    "generate",
+    "export",
+    "import",
+    "sync",
+    // Session
+    "logout",
+    "signout",
+    // Persist — Add/Create can write immediately even when no form is involved.
+    "add",
+    "create",
+    "save",
+    "apply",
+    "update",
+    "rename",
+];
+
+/// Is this control's accessible name one `discovery_pass` must not click? True when any
+/// [`DANGEROUS_WORDS`] entry appears as a whole word — so "Save view" and "Permanently delete
+/// account" both match, while "Saved searches" and "Preclearance" do not. Non-alphanumeric characters
+/// are word boundaries, which is what makes "Yes, delete" and "sign out" work.
+pub(crate) fn is_dangerous_label(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    // "sign out" / "log out" are two words in the DOM and one verb here; fold them first so the
+    // whole-word pass below sees a single token.
+    let folded = lower
+        .replace("sign out", "signout")
+        .replace("log out", "logout");
+    folded
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| DANGEROUS_WORDS.contains(&w))
+}
 
 pub(crate) const OPENERS_JS: &str = r##"(() => {
   window.__uxr2 = [];
@@ -1008,7 +1134,7 @@ pub(crate) const OPENERS_JS: &str = r##"(() => {
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8 || r.bottom < 0 || r.top > innerHeight) continue;
     if (el.closest('form') && (el.getAttribute('type') || 'submit') === 'submit') continue;
-    const label = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    const label = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
     window.__uxr2.push(el);
     out.push({ i: window.__uxr2.length - 1, label, expanded: el.getAttribute('aria-expanded') });
     if (out.length >= 8) break;
@@ -1044,6 +1170,33 @@ pub(crate) const OVERLAY_JS: &str = r##"(() => {
     out.oversized = out.content_w / r.width < 0.55 && r.width - out.content_w >= 280;
     return out;
   };
+  // Two facts that decide what a MISSING Escape handler actually means, reported from the field on
+  // 2026-08-29 against a multi-step creation wizard whose Escape is deliberately inert:
+  //   • a visible, LABELLED close control — then nobody is trapped, whatever Escape does, and the
+  //     finding must not say they are;
+  //   • whether it is a DATA-ENTRY dialog — then "close on Escape" is the wrong fix outright, because
+  //     a stray keypress would discard a half-completed form. The right advice is to offer to discard.
+  //     Read as "it has fields", not "the fields are filled": the probe opens the dialog fresh, so
+  //     nothing is typed yet, and it is the shape of the dialog that decides what the advice is.
+  // Both are read off the open dialog, so they cost nothing extra.
+  const affordances = (el) => {
+    let hasClose = false, hasInput = false;
+    for (const c of el.querySelectorAll('button, [role="button"], a[href], input, textarea, select')) {
+      const b = c.getBoundingClientRect();
+      if (b.width < 1 || b.height < 1) continue;
+      if (getComputedStyle(c).visibility === 'hidden') continue;
+      const name = ((c.getAttribute('aria-label') || '') + ' ' + (c.getAttribute('title') || '') + ' ' + (c.textContent || '')).toLowerCase();
+      // A LABELLED close: named in words or by the conventional glyph. A bare unlabelled icon button
+      // is not one — that is a different defect, and this guard must not excuse it.
+      if (/\bclose\b|\bcancel\b|\bdismiss\b|\bgo back\b|✕|×/.test(name)) hasClose = true;
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(c.tagName)) {
+        const t = (c.getAttribute('type') || '').toLowerCase();
+        if (t === 'button' || t === 'submit' || t === 'reset' || t === 'hidden') continue;
+        hasInput = true;
+      }
+    }
+    return { has_close: hasClose, has_input: hasInput };
+  };
   // A dialog-ish overlay: declared role, native dialog, or a big fixed layer. Must be VISIBLE
   // — a hidden role=dialog pre-rendered in the DOM is not "open".
   const decl = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]'))
@@ -1058,6 +1211,7 @@ pub(crate) const OVERLAY_JS: &str = r##"(() => {
       focus_inside: el.contains(document.activeElement) && document.activeElement !== document.body,
       scrollLocked: (function(){ var b=getComputedStyle(document.body), h=getComputedStyle(document.documentElement); return b.overflow==='hidden'||b.overflow==='clip'||h.overflow==='hidden'||h.overflow==='clip'||b.position==='fixed'; })(),
       scrollable: document.documentElement.scrollHeight > window.innerHeight + 4,
+      ...affordances(el),
       ...geom(el)
     });
   }
@@ -1074,6 +1228,7 @@ pub(crate) const OVERLAY_JS: &str = r##"(() => {
           focus_inside: el.contains(document.activeElement) && document.activeElement !== document.body,
           scrollLocked: (function(){ var b=getComputedStyle(document.body), h=getComputedStyle(document.documentElement); return b.overflow==='hidden'||b.overflow==='clip'||h.overflow==='hidden'||h.overflow==='clip'||b.position==='fixed'; })(),
           scrollable: document.documentElement.scrollHeight > window.innerHeight + 4,
+          ...affordances(el),
           ...geom(el)
         });
       }
@@ -1088,7 +1243,7 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
     let mut live_gaps = Vec::new();
     const TEXT_LEN: &str = r#"((document.body && document.body.innerText) || '').length"#;
     const HAS_LIVE: &str = r#"!!document.querySelector('[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], output')"#;
-    let dangerous = regex_lite(DANGEROUS_RE);
+    let dangerous = is_dangerous_label;
     let openers: Vec<Value> = tab
         .evaluate(OPENERS_JS, false)
         .ok()
@@ -1189,6 +1344,8 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
                 "labelled": ov["labelled"],
                 "focus_inside": ov["focus_inside"],
                 "escape_closes": escaped,
+                "has_close": ov["has_close"],
+                "has_input": ov["has_input"],
                 "scroll_locked": ov["scrollLocked"],
                 "scrollable": ov["scrollable"],
                 "oversized": ov["oversized"],
@@ -1595,19 +1752,101 @@ pub(crate) fn feedback_pass(tab: &headless_chrome::Tab, base_url: &str) -> Value
     })
 }
 
-/// Tiny anchored case-insensitive prefix matcher (avoids a regex dependency).
-pub(crate) fn regex_lite(pattern: &str) -> impl Fn(&str) -> bool + '_ {
-    let words: Vec<&str> = pattern
-        .trim_start_matches("(?i)^(")
-        .trim_end_matches(')')
-        .split('|')
-        .collect();
-    move |s: &str| {
-        let l = s.to_lowercase();
-        words.iter().any(|w| {
-            let w = w.replace("log ?out", "logout");
-            l.starts_with(&w)
-                || (w == "logout" && (l.starts_with("logout") || l.starts_with("log out")))
-        })
+#[cfg(test)]
+mod danger_tests {
+    use super::is_dangerous_label;
+
+    /// THE 2026-08-31 field report, and the shapes the old prefix rule let through. A run with tests
+    /// disabled and only `--states` set fired "Accept invitation" five times, creating an anonymous
+    /// account and then deleting it and its data — `accept` was not in the list at all — and the
+    /// prefix anchor meant a label had to BEGIN with the verb, which most real ones don't.
+    #[test]
+    fn a_control_that_acts_is_never_an_opener() {
+        for label in [
+            "Accept invitation",
+            "Accept",
+            "Permanently delete account",
+            "Yes, delete",
+            "Delete",
+            "Remove participant",
+            "Leave meeting",
+            "Revoke access",
+            "Cancel subscription",
+            "Transfer ownership",
+            "Archive project",
+            "Reset to defaults",
+            "Disconnect GitHub",
+            "Save changes",
+            "Add participant",
+            "Create project",
+            "Sign out",
+            "Log out",
+            "Publish to production",
+            "Send invites",
+        ] {
+            assert!(is_dangerous_label(label), "must not be clicked: {label}");
+        }
+    }
+
+    /// The other half: this guard costs discovery, so it must not swallow ordinary openers. A word
+    /// that merely CONTAINS a dangerous one is not a match — whole words only, or a menu button
+    /// called "Preclearance" would go unprobed and the rule would lose its reason to exist.
+    #[test]
+    fn an_ordinary_opener_is_still_clickable() {
+        for label in [
+            "Filters",
+            "Open menu",
+            "Show details",
+            "More options",
+            "View report",
+            "Saved searches", // contains "saved", not the word "save"
+            "Preclearance",   // contains "clear"
+            "Removals log",   // contains "removal", not "remove"
+            "Sender profile", // contains "send"
+            "Closest match",  // contains "close"
+            "Team members",
+            "Account settings",
+            "What's new",
+        ] {
+            assert!(!is_dangerous_label(label), "should be probed: {label}");
+        }
+    }
+
+    #[test]
+    fn discovery_checks_action_words_beyond_the_label_preview() {
+        let script = format!(
+            r#"const label = 'For the selected workspace and all its members, permanently delete account';
+const el = {{ disabled: false, textContent: label, closest: () => null,
+  getAttribute: () => null, getBoundingClientRect: () => ({{width:100,height:40,bottom:40,top:0}}) }};
+global.window = {{}}; global.innerHeight = 900;
+global.document = {{querySelectorAll: () => [el]}};
+process.stdout.write({});"#,
+            super::OPENERS_JS
+        );
+        let output = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("node");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let candidates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let label = candidates[0]["label"].as_str().unwrap();
+        assert!(label.len() > 40);
+        assert!(
+            is_dangerous_label(label),
+            "the complete name must reach the guard"
+        );
+    }
+
+    #[test]
+    fn punctuation_and_case_are_word_boundaries() {
+        // The labels that actually appear in a confirm row.
+        assert!(is_dangerous_label("Yes — delete it"));
+        assert!(is_dangerous_label("DELETE"));
+        assert!(is_dangerous_label("Delete/remove"));
+        assert!(!is_dangerous_label(""));
     }
 }

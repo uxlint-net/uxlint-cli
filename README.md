@@ -87,6 +87,30 @@ stylesheet that hides it (`.uxlint-hide { display: none !important; }`) is injec
 browser, before the page's own scripts run. Style your element however you like the rest of the time.
 It applies in every capture path — the crawl, goal-walk tests, and fix previews.
 
+## Does it change anything? (`--allow-mutation`)
+
+Interaction audits navigate, read, and click candidate menu, disclosure, and dialog controls.
+Discovery skips controls whose accessible name contains a recognised action verb: *delete, remove, accept,
+leave, revoke, cancel, transfer, pay, publish, submit, add, create, save*, and their relatives, matched as whole
+words anywhere in the label. A label cannot prove what its click handler does, so run interaction
+audits against an environment you control with disposable data.
+
+Two probes do write, and both need **`--allow-mutation`** on top of `--states`:
+
+- the **action-feedback** probe clicks a constructive action (Add / Create / Save) to check the page
+  says something happened;
+- the **destructive** probe clicks Delete / Remove *and clicks through the confirm dialog*, to check
+  the contract that a destructive action either confirms first or offers undo.
+
+They power `action-no-feedback`, `destructive-no-confirm` and `undo-missing`, and those three rules
+stay quiet without the flag. **Throwaway environments only.** Being signed in as a user who is allowed
+to delete a row is not the same as having asked us to, and this flag is where you say so.
+
+`uxlint mcp` never sets it, and cannot be asked to.
+
+The other way an audit writes is one you wrote yourself: a declared `[[tests]]` walk signs in as a
+persona and exercises real flows, which is what a test does.
+
 ## MCP (use it from a coding agent)
 
 **Claude Code, one command:**
@@ -129,6 +153,34 @@ on one page after an edit), `get_shot` (fetch a finding's annotated screenshot),
 and off by default (§ Privacy) — one tool for three kinds of signal: whether a finding was useful,
 a lint uxlint is missing, or a component library it didn't recognise. The agent audits, reads the
 fixes, edits, and re-audits until green.
+
+### Verification and design memory
+
+`verify_fix` returns `passed`, `failed`, `not_evaluated` or `inconclusive`. Zero findings alone
+never means a fix passed. Passing verification currently covers `page-title-missing`,
+`html-lang-missing` and `horizontal-overflow`, with explicit evidence for the requested route and
+both viewports. Other checks can report failures but need a full audit and evidence review;
+unknown rules, skipped checks and old servers cannot pass. A cleared check never submits an
+automatic acceptance vote.
+
+Keep approved project decisions in `uxlint.design.json` beside `uxlint.toml`. `ux_guidance` reads
+it afresh each time, including in a new agent session. Start with a draft:
+
+```json
+{"version":1,"revision":1,"status":"draft","site":"example.test",
+ "tokens":{"accent":"var(--color-brand)"},
+ "components":{"primary_action":"Reuse PrimaryButton"},
+ "pages":{"/":"Explain the product and offer a clear starting action"},
+ "journeys":["Start the main task from the homepage"],
+ "references":["/styleguide"],"exceptions":[]}
+```
+
+Set `site` to the project's configured site. Review the decisions with the owner before setting
+`status` to `approved` and committing the file. Increment `revision` for subsequent approved
+changes. The tool never approves or writes the contract; drafts do not become guidance. References
+are not automatically fetched, exceptions do not suppress lints, and this initial local memory
+does not yet enforce tokens or compare screenshots. Invalid contracts produce a visible warning.
+Keep the file below 32 KiB and do not put credentials or private customer data in it.
 
 ## Privacy & trust
 

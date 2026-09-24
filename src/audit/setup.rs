@@ -196,9 +196,9 @@ pub(crate) fn prevalidate_org(me: &Value, org: &str, site: Option<&str>) -> Resu
 
 /// The routes to seed the crawl: CLI `--routes` unless it's the bare default "/", in which case the
 /// project's declared routes win (when it declares any). Pure.
-pub(crate) fn effective_routes(cli_routes: &str, toml_routes: Option<&str>) -> String {
+pub(crate) fn effective_routes(cli_routes: &str, toml_routes: Option<&str>, exact: bool) -> String {
     match toml_routes {
-        Some(r) if cli_routes == "/" => r.to_string(),
+        Some(r) if cli_routes == "/" && !exact => r.to_string(),
         _ => cli_routes.to_string(),
     }
 }
@@ -236,8 +236,17 @@ pub(crate) fn compute_seeds(effective_routes: &str, excludes: &[String]) -> Vec<
 
 /// Crawl budget: the largest of `--crawl`, the uxlint.toml `crawl`, and the seed count (never fewer
 /// pages than were explicitly asked for). Pure.
-pub(crate) fn resolve_crawl_cap(cli_crawl: usize, toml_cap: usize, seed_count: usize) -> usize {
-    cli_crawl.max(toml_cap).max(seed_count)
+pub(crate) fn resolve_crawl_cap(
+    cli_crawl: usize,
+    toml_cap: usize,
+    seed_count: usize,
+    exact: bool,
+) -> usize {
+    if exact {
+        seed_count
+    } else {
+        cli_crawl.max(toml_cap).max(seed_count)
+    }
 }
 
 /// Parse `--viewports` ("name:WxH,..." ) into (name, w, h) triples, silently dropping malformed
@@ -496,6 +505,7 @@ pub(crate) fn resolve_target(
     let effective = effective_routes(
         &args.routes,
         project.as_ref().and_then(|p| p.routes.as_deref()),
+        args.exact_routes,
     );
     // Opening banner: what's being audited, then the dimmed setup facts under it.
     {
@@ -581,7 +591,7 @@ pub(crate) fn resolve_target(
             ))
         );
     }
-    let crawl_cap = resolve_crawl_cap(args.crawl, toml_cap, seeds.len());
+    let crawl_cap = resolve_crawl_cap(args.crawl, toml_cap, seeds.len(), args.exact_routes);
     // Goals validate WHOLE-SITE reachability, so only walk them on a full-site audit — a crawl or a
     // multi-route run. A single-route, no-crawl audit (a targeted check / verify) skips them, and
     // --no-goals (also accepted as --no-wayfind) forces off.
@@ -949,6 +959,7 @@ pub(crate) fn spawn_partial_poster(
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default();
+            let mut last_post = std::time::Instant::now();
             loop {
                 // Throttle: ≥2s between posts, but wake in 100ms slices to exit promptly on stop.
                 for _ in 0..20 {
@@ -962,11 +973,19 @@ pub(crate) fn spawn_partial_poster(
                 // on stop. Runs for the WHOLE audit (crawl → walks → server), not just the crawl
                 // window, so the web banner can show phase + walk progress through the ~80s of AI
                 // review between the last crawl tick and the finished report.
-                if ps.dirty.swap(false, Relaxed) || stopping {
+                //
+                // It also posts on a 10s beat with nothing new, and before the first page exists: the
+                // clock is progress too. A run parked in discovery or on one slow route used to post
+                // NOTHING — the dashboard sat on "starting…" for minutes and read as hung (field
+                // report, 2026-09-24) — while the phase and the elapsed time were right here.
+                let beat = last_post.elapsed() >= std::time::Duration::from_secs(10);
+                if ps.dirty.swap(false, Relaxed) || stopping || beat {
                     let pages = ps.pages.lock().unwrap().clone();
-                    if !pages.is_empty() {
+                    let phase = ps.phase.lock().unwrap().clone();
+                    if !pages.is_empty() || !phase.is_empty() {
+                        last_post = std::time::Instant::now();
                         let total = ps.total.load(Relaxed).max(pages.len());
-                        let phase = ps.phase.lock().unwrap().clone();
+                        let (elapsed_secs, cap_secs) = ps.clock();
                         let walks_done = ps.walks_done.load(Relaxed);
                         let walks_total = ps.walks_total.load(Relaxed);
                         let _ = http
@@ -976,6 +995,7 @@ pub(crate) fn spawn_partial_poster(
                                 "partial": true, "pages_done": pages.len(), "pages_total": total, "pages": pages,
                                 "phase": phase, "walks_done": walks_done, "walks_total": walks_total,
                                 "viewports": ps.viewports.load(Relaxed),
+                                "elapsed_secs": elapsed_secs, "cap_secs": cap_secs,
                             }))
                             .send();
                     }

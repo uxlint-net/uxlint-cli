@@ -216,13 +216,18 @@ pub(crate) fn run_audit_ext(
     // can answer "where's the bottleneck?". (`crawl_ms`/`goals_ms` are computed by `run_tests`.)
     let t_crawl = std::time::Instant::now();
     // Live-partial streaming: the background HTTP poster (below) streams progress to
-    // /v1/jobs/{id}/partial ONLY under a hosted job (the audit-worker sets UXLINT_JOB_ID) — strictly
-    // no-op for local/CLI/MCP runs (env unset). The progress STATE itself (`partial_state`) is
-    // broader: an `external_partial` handle (MCP's audit_url) gets the same live crawl/walks/phase
-    // tracking without any job id or HTTP involved — the caller polls the Arc directly.
+    // /v1/jobs/{id}/partial for whichever job this run is on the dashboard as — the hosted one the
+    // audit-worker names in UXLINT_JOB_ID, or the row `LocalRun::announce` created for a CLI/MCP run.
+    // It used to be the hosted one ONLY: a local run announced itself, then never said another word,
+    // so its row read "In progress · starting…" from the first second to the last. That is the
+    // field report of 2026-09-24 — minutes of "starting" that looked exactly like a hang. A
+    // `--dry-run` announces nothing and so still posts nothing. The progress STATE (`partial_state`)
+    // is broader again: an `external_partial` handle (MCP's audit_url) gets the same live
+    // crawl/walks/phase tracking for its own progress notifications — the caller polls the Arc.
     let partial_job = std::env::var("UXLINT_JOB_ID")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or_else(|| local_run.as_ref().map(|r| r.job_id().to_string()));
     let partial_state: Option<std::sync::Arc<crate::worker::PartialState>> =
         external_partial.clone().or_else(|| {
             partial_job
@@ -260,8 +265,22 @@ pub(crate) fn run_audit_ext(
         crawl_total: std::sync::atomic::AtomicUsize::new(0),
     };
     if let Some(ps) = &partial_state {
+        ps.start_clock(timeout_secs);
         ps.set_phase("crawl");
     }
+    // The poster starts BEFORE discovery, not after it. Discovery is the stretch with nothing to
+    // count yet — no route set, no pages — and it used to be invisible: the dashboard read
+    // "starting…" and an MCP caller heard nothing until the first page landed, which on a slow dev
+    // server is minutes. Reported from the field on 2026-09-24 as an audit that "looks hung". The
+    // phase and the clock are enough to show it isn't.
+    let partial_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let partial_poster = spawn_partial_poster(
+        partial_state.as_ref(),
+        partial_job.as_deref(),
+        &partial_stop,
+        &cli.server,
+        cli.api_key.as_deref().unwrap_or(""),
+    );
 
     let mut route_list = discover_and_sample(
         &workers, &shared, args, collector, &viewports, &seeds, crawl_cap, progress,
@@ -281,14 +300,6 @@ pub(crate) fn run_audit_ext(
         ps.viewports
             .store(viewports.len().max(1), std::sync::atomic::Ordering::Relaxed);
     }
-    let partial_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let partial_poster = spawn_partial_poster(
-        partial_state.as_ref(),
-        partial_job.as_deref(),
-        &partial_stop,
-        &cli.server,
-        cli.api_key.as_deref().unwrap_or(""),
-    );
 
     {
         let _s = crate::otel::phase("capture");
@@ -518,6 +529,7 @@ pub(crate) fn run_audit_ext(
         bot_blocked_routes: &bot_blocked_routes,
         labels: &args.labels,
         timed_out,
+        crawl: args.crawl,
         timeout_detail: timeout_detail.as_ref(),
         provenance: &provenance,
         theme: theme.as_ref(),
@@ -1363,6 +1375,7 @@ mod request_tests {
             bot_blocked_routes: &[],
             labels: &[],
             timed_out: false,
+            crawl: 8,
             timeout_detail: None,
             provenance: prov,
             theme: None,
@@ -1394,6 +1407,28 @@ mod request_tests {
         assert!(body.get("timed_out").is_some());
         // The styleguide existence probe rides under its stable key (drives styleguide-missing).
         assert!(body.get("styleguide").is_some());
+        // The crawl budget rides too: the server withholds link-graph findings when the graph it has
+        // is the RUN's rather than the site's, and zero-vs-absent is the whole distinction.
+        assert_eq!(body["crawl"], 8);
+    }
+
+    #[test]
+    fn a_zero_crawl_budget_is_sent_as_zero_not_omitted() {
+        // Reported from the field on 2026-08-31: a run scoped to explicit seeds with the crawl budget
+        // at zero reported a page as an orphan, when no page that might link to it was ever loaded.
+        // The server can only stand the rule down if it can TELL — and "absent" (an old client) has
+        // to stay distinguishable from "zero", or every legacy capture would silence the rule.
+        let prov = AuditProvenance {
+            git_sha: None,
+            git_branch: None,
+            runner: String::new(),
+            change_url: None,
+        };
+        let mut inputs = sample_inputs(&prov);
+        inputs.crawl = 0;
+        let body = build_audit_request(&inputs);
+        assert_eq!(body["crawl"], 0);
+        assert!(body.get("crawl").is_some_and(|v| !v.is_null()));
     }
 
     #[test]
@@ -1542,14 +1577,23 @@ mod decision_tests {
     }
 
     #[test]
+    fn verification_does_not_inherit_project_routes_or_crawl_budget() {
+        assert_eq!(effective_routes("/", Some("/a,/b"), true), "/");
+        assert_eq!(resolve_crawl_cap(1, 30, 1, true), 1);
+    }
+
+    #[test]
     fn effective_routes_prefers_toml_only_for_the_bare_default() {
         // Bare `--routes /` yields to the project's declared routes…
-        assert_eq!(effective_routes("/", Some("/a,/b")), "/a,/b");
+        assert_eq!(effective_routes("/", Some("/a,/b"), false), "/a,/b");
         // …but an explicit --routes always wins, even over declared routes…
-        assert_eq!(effective_routes("/pricing", Some("/a,/b")), "/pricing");
+        assert_eq!(
+            effective_routes("/pricing", Some("/a,/b"), false),
+            "/pricing"
+        );
         // …and with no declared routes, the CLI value stands (including the bare default).
-        assert_eq!(effective_routes("/", None), "/");
-        assert_eq!(effective_routes("/x", None), "/x");
+        assert_eq!(effective_routes("/", None, false), "/");
+        assert_eq!(effective_routes("/x", None, false), "/x");
     }
 
     #[test]
@@ -1596,9 +1640,9 @@ mod decision_tests {
 
     #[test]
     fn resolve_crawl_cap_is_the_max_of_flag_toml_and_seed_count() {
-        assert_eq!(resolve_crawl_cap(12, 0, 3), 12); // flag wins
-        assert_eq!(resolve_crawl_cap(2, 30, 3), 30); // toml wins
-        assert_eq!(resolve_crawl_cap(2, 1, 5), 5); // never fewer than the seeds asked for
+        assert_eq!(resolve_crawl_cap(12, 0, 3, false), 12); // flag wins
+        assert_eq!(resolve_crawl_cap(2, 30, 3, false), 30); // toml wins
+        assert_eq!(resolve_crawl_cap(2, 1, 5, false), 5); // never fewer than the seeds asked for
     }
 
     #[test]

@@ -711,10 +711,11 @@ pub(crate) struct PassQueue {
 }
 
 /// State shared by all workers during the viewport passes.
-/// Live-partial streaming state: the hosted crawl records each captured page here as it lands,
-/// so a background poster in `run_audit` can stream the findings-so-far to the server. Created ONLY
-/// when the audit runs under a hosted job (`UXLINT_JOB_ID`, set by the audit-worker); local/CLI runs
-/// never build one, so the recording below is a strict no-op for them.
+/// Live-partial streaming state: the crawl records each captured page here as it lands, so a
+/// background poster in `run_audit` can stream progress and the findings-so-far to the server. Built
+/// when the run is on the dashboard as a job — hosted (`UXLINT_JOB_ID`) or a local run's announced
+/// row — or when an MCP caller wants progress notifications; otherwise (a `--dry-run`, no API key)
+/// nothing builds one and the recording below is a strict no-op.
 #[derive(Default)]
 pub(crate) struct PartialState {
     /// Captured page snapshots so far, screenshots stripped (the deterministic lints don't need them,
@@ -735,8 +736,31 @@ pub(crate) struct PartialState {
     /// "N of M pages" total — which counts route×viewport CAPTURES — honestly as "pages · viewports"
     /// instead of implying M distinct pages. Set once, alongside `total`.
     pub(crate) viewports: std::sync::atomic::AtomicUsize,
+    /// When the browser phase started and its time cap — so progress can say "1m 40s of 5m" and a
+    /// long silent stretch (discovery, a slow route) still visibly moves. Unset until `start_clock`.
+    pub(crate) started: Mutex<Option<std::time::Instant>>,
+    pub(crate) cap_secs: std::sync::atomic::AtomicU64,
 }
 impl PartialState {
+    /// Start the audit clock against its browser-phase cap (see `started`).
+    pub(crate) fn start_clock(&self, cap_secs: u64) {
+        *self.started.lock().unwrap() = Some(std::time::Instant::now());
+        self.cap_secs
+            .store(cap_secs, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// (seconds since `start_clock`, the cap in seconds) — (0, 0) before the clock starts.
+    pub(crate) fn clock(&self) -> (u64, u64) {
+        let elapsed = self
+            .started
+            .lock()
+            .unwrap()
+            .map_or(0, |t| t.elapsed().as_secs());
+        (
+            elapsed,
+            self.cap_secs.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
     /// Record a freshly-captured page (screenshot dropped) for the next partial post.
     pub(crate) fn note_page(&self, page: &Value) {
         let mut p = page.clone();
@@ -786,7 +810,8 @@ pub(crate) struct PassShared {
     /// a probe/walk skipped in `run_audit`) — the honest signal that the report is incomplete because
     /// time ran out, distinct from routes that merely failed. Drives the report's `timed_out` flag.
     pub(crate) timed_out: std::sync::atomic::AtomicBool,
-    /// Hosted-run live-partial recorder. `None` for local runs — then the crawl records nothing.
+    /// Live-partial recorder (see [`PartialState`]). `None` when nobody is watching this run — then
+    /// the crawl records nothing.
     pub(crate) partial: Option<Arc<PartialState>>,
     pub(crate) queue: Mutex<PassQueue>,
     /// Per route-template discovery coverage: (instances probed, distinct structure fingerprints
@@ -1460,13 +1485,24 @@ pub(crate) fn audit_route(
         let tpf = std::time::Instant::now();
         let forms = forms_pass(tab, &url); // Tab-through: order + trap (sequential, must be complete)
         add_ms(&shared.t_forms, tpf);
-        // Destructive + feedback probes LAST inside the interaction block (they mutate the page):
-        // the feedback probe FIRST (it clicks a constructive action — Add/Create/Save), then the
-        // destructive probe (which deletes through confirm dialogs). uxlint IS a tester — a test run
-        // exercises create-and-delete to check the action-feedback and confirm-or-undo contracts.
-        // Only reaches these controls on an AUTHED view of the user's own app (an anonymous crawl of
-        // a third-party URL hits the login wall first), so it never touches data you don't own.
-        {
+        // The two MUTATING probes, last inside the interaction block: the feedback probe (it clicks a
+        // constructive action — Add/Create/Save) and then the destructive one (it deletes, clicking
+        // THROUGH the confirm dialog). Both are real writes against a real app.
+        //
+        // They need `--allow-mutation`, not merely `--states`. That separation is the fix for a field
+        // report of 2026-08-31: a run with tests explicitly disabled and only the states flag set
+        // removed two seated participants from a live record and fired an accept-invitation five
+        // times, creating and deleting an anonymous account. It took a log investigation to find, and
+        // it silently invalidated every later audit of that record — while the tool's own description
+        // promised that without a declared test plan an audit only navigates and reads.
+        //
+        // The old reasoning was "uxlint IS a tester, and it only reaches these controls on an authed
+        // view of the user's own app". Both halves are true and neither is consent: the person who
+        // typed `--states` asked to see hover and focus states, and being entitled to delete a row is
+        // not the same as having asked to. `destructive-no-confirm`, `undo-missing` and
+        // `action-no-feedback` are the rules that go quiet without the flag — a fair price, and the
+        // report says which rules were withheld and why.
+        if ctx.args.allow_mutation {
             ix["feedback"] = feedback_pass(tab, &url);
             let d = destructive_pass(tab, &url);
             ix["destructive"] = d["destructive"].clone();

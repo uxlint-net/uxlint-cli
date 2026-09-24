@@ -47,6 +47,45 @@ fn report_id_of(report: &Value) -> &str {
         .unwrap_or("")
 }
 
+/// The report id a caller handed `get_report`, and whether it named a DIFFERENT uxlint server than
+/// the one this MCP talks to. Accepts what a person actually pastes: the dashboard URL
+/// (`/sites/{site}/r/{id}`), the legacy `/r/{id}`, either with a query or a trailing path
+/// (`/annot?…`), or the bare id. The other-server check matters because the id is only meaningful on
+/// the server that minted it — a dev.uxlint.net link read against prod would 404 and look like "no
+/// such report" when the report is fine and the question went to the wrong place.
+fn parse_report_ref(raw: &str, server: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let is_id = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if is_id(raw) {
+        return Ok(raw.to_string());
+    }
+    if let Some(rest) = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+    {
+        let host = rest.split('/').next().unwrap_or("");
+        let ours = server
+            .trim_end_matches('/')
+            .split("://")
+            .nth(1)
+            .unwrap_or(server);
+        if !host.eq_ignore_ascii_case(ours) {
+            return Err(format!(
+                "that report is on {host}, but this uxlint MCP is connected to {ours} — a report id only means something on the server that made it. Point the MCP at {host} (UXLINT_SERVER) to read it."
+            ));
+        }
+    }
+    raw.rsplit_once("/r/")
+        .map(|(_, b)| b.split(['/', '?', '#']).next().unwrap_or(b))
+        .filter(|id| is_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| "pass a report URL (…/r/<id>) or a report id".to_string())
+}
+
 /// The annotated-screenshot URL for a finding (the flagged element boxed on its page), when it has a
 /// rect. Points at the server's public-by-report-id /annot endpoint.
 fn shot_url(
@@ -114,6 +153,319 @@ fn audit_structured(report: &Value, server: &str) -> Value {
         // Cross-audit delta vs the previous comparable crawl (resolved/new/persisting + samples);
         // null when there's no comparable prior audit to diff against.
         "delta": report["delta"],
+    })
+}
+
+/// The prose half of an audit result, for the agent: setup asks, the grade, what moved since last
+/// time, a TIMED OUT warning, the action plan, then every finding with its fix and screenshot. Shared
+/// by `audit_url` (a run it just finished) and `get_report` (one that already exists), so a report
+/// read back later is exactly the report the agent would have been handed at the time.
+fn report_text(report: &Value, server: &str, feedback_enabled: bool) -> String {
+    let mut t = String::new();
+    if let Some(blocked) = report["auth_blocked_routes"].as_array() {
+        let routes: Vec<&str> = blocked
+            .iter()
+            .filter_map(|r| r.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !routes.is_empty() {
+            t.push_str(&format!(
+            "AUTH WALL DETECTED on: {}. Only the public/login view was audited.\n\
+             To audit the authenticated app, set up credentials in the project's uxlint.toml \
+             — the local client replays them, so nothing passes through this tool or the chat. \
+             ASK THE USER to add a [personas.<name>] block and point default_persona at it \
+             (put secrets in the environment via ${{VAR}}; throwaway dev creds can sit inline):\n\n\
+             default_persona = \"ci\"\n\
+             [personas.ci]\n\
+             headers = [\"Cookie: session=${{SESSION}}\"]   # or storage = [\"token=...\"]\n\
+             # or sign in via the login form each run:\n\
+             # login_url       = \"/login\"\n\
+             # default_persona = \"user\"\n\
+             # [personas.user]\n\
+             # username = \"dev@example.com\"\n\
+             # password = \"${{DEV_PW}}\"\n\n\
+             Then re-run audit_url. Until then, treat these results as the logged-out experience only.\n\n",
+            routes.join(", ")
+        ));
+        }
+    }
+    if let Some(unrec) = report["unrecognized_widgets"].as_array() {
+        if !unrec.is_empty() {
+            let sigs: Vec<&str> = unrec.iter().filter_map(|s| s.as_str()).collect();
+            t.push_str(&format!(
+                "UNRECOGNIZED CUSTOM CONTROLS (signatures: {}). If you can identify the \
+                 widget set, call report_widget_gap so uxlint learns it.\n\n",
+                sigs.join(", ")
+            ));
+        }
+    }
+    // Lead with the deterministic verdict and the block-grouped action plan
+    // (the synthesis layer). The agent reads "here's what to fix, by block, in
+    // priority order" before wading into the raw finding list.
+    let summary = &report["summary"];
+    // The link goes FIRST, with an instruction to relay it. Everything below this line is
+    // written for the agent — it fixes the code and the user never sees most of it — but
+    // the report itself is for the PERSON: annotated screenshots of their own pages, every
+    // finding, the score over time. Buried as a bare line halfway down a wall of findings
+    // it got summarised away, and people didn't know a report page existed at all.
+    if let Some(url) = report["report_url"].as_str().filter(|u| !u.is_empty()) {
+        t.push_str(&format!(
+            "REPORT: {url}\nGive the user this link — it's the full report on the web \
+             (annotated screenshots of each finding, the whole list, and how this run \
+             compares with their last one).\n\n"
+        ));
+    }
+    if let Some(grade) = summary["grade"].as_str() {
+        t.push_str(&format!(
+            "Grade {grade} ({}/100) — {}\n",
+            summary["score"].as_i64().unwrap_or(0),
+            summary["verdict"].as_str().unwrap_or("")
+        ));
+    }
+    t.push_str(&format!(
+        "{} errors, {} warnings, {} info\n\n",
+        report["errors"], report["warnings"], report["infos"],
+    ));
+    // Cross-audit delta — the iterate-loop signal: what your last round of fixes moved.
+    // Present only when this crawl has a comparable prior crawl to diff against.
+    if let Some(d) = report["delta"].as_object() {
+        let g = |k: &str| d.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        t.push_str(&format!(
+            "Since your last audit: {} resolved, {} new, {} still open.",
+            g("resolved"),
+            g("new"),
+            g("persisting")
+        ));
+        if g("not_verified") > 0 {
+            t.push_str(&format!(" {} previous finding(s) were absent without passing evidence and remain unverified.", g("not_verified")));
+        }
+        if let Some(changes) = d.get("occurrence_changes").and_then(|v| v.as_array()) {
+            for change in changes.iter().take(6) {
+                t.push_str(&format!(
+                    "\n  {} on {} ({}): {} → {} observed occurrences.",
+                    change["rule"].as_str().unwrap_or("?"),
+                    change["route"].as_str().unwrap_or("?"),
+                    change["viewport"].as_str().unwrap_or("?"),
+                    change["before"],
+                    change["after"]
+                ));
+            }
+        }
+        // Name the newly-INTRODUCED findings first — most likely caused by your last edit.
+        if let Some(nf) = d
+            .get("new_findings")
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+        {
+            let list = nf
+                .iter()
+                .take(5)
+                .filter_map(|f| {
+                    Some(format!(
+                        "{} ({})",
+                        f["rule"].as_str()?,
+                        f["route"].as_str()?
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            t.push_str(&format!(
+                " New since last time: {list} — check these are yours."
+            ));
+        }
+        t.push_str("\n\n");
+    }
+    // Warn the agent up front when the audit hit its time cap — the finding set
+    // below may be partial, so "clean" here doesn't mean the whole site was checked.
+    if report["timed_out"].as_bool() == Some(true) {
+        let d = &report["timeout_detail"];
+        t.push_str(&format!(
+            "⚠ TIMED OUT — this audit hit its {}s time cap; results may be incomplete ({}/{} pages captured, {}/{} tests finished). Findings below are what was gathered before the cap.\n\n",
+            d["cap_secs"].as_u64().unwrap_or(0),
+            d["pages_captured"].as_u64().unwrap_or(0), d["pages_planned"].as_u64().unwrap_or(0),
+            d["walks_done"].as_u64().unwrap_or(0), d["walks_planned"].as_u64().unwrap_or(0),
+        ));
+    }
+    // Stay on-script: if the site has a styleguide/design-system page, tell the
+    // agent to build to it BEFORE touching UI, so fixes reuse its components/tokens
+    // instead of drifting.
+    if let Some(sg) = report["styleguide"].as_str().filter(|s| !s.is_empty()) {
+        t.push_str(&format!(
+            "STYLEGUIDE: {sg} — this site documents its components, tokens and patterns here. Before changing any UI, open it and build to what it shows; reuse those components/tokens rather than reinventing styles.\n\n"
+        ));
+    }
+    if let Some(narr) = summary["narrative"].as_str().filter(|n| !n.is_empty()) {
+        t.push_str(&format!(
+            "Action plan (fix by block, in priority order):\n{narr}\n\n"
+        ));
+    }
+    let report_id = report_id_of(report);
+    // Every distinct rule id shown below — feeds the closing feedback solicitation
+    // (deduped, insertion order; empty iff nothing was reported).
+    let mut rules_seen: Vec<String> = Vec::new();
+    for page in report["pages"].as_array().unwrap_or(&vec![]) {
+        let route = page["route"].as_str().unwrap_or("");
+        let viewport = page["viewport"].as_str().unwrap_or("");
+        for f in page["findings"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .take(30)
+        {
+            // rule name (for verify_fix), location, the problem, and the fix.
+            let rule = f["rule"].as_str().unwrap_or("");
+            if !rule.is_empty() && !rules_seen.iter().any(|r| r.as_str() == rule) {
+                rules_seen.push(rule.to_string());
+            }
+            let sel = f["sel"].as_str().unwrap_or("");
+            // Prefer the source hint (file:line, from the local grep) as the
+            // location; fall back to the DOM selector.
+            let where_ = match (f["source"].as_str(), sel) {
+                (Some(src), _) => format!(" · source: {src}"),
+                (None, s) if !s.is_empty() && s != "page" && s != "site" => {
+                    format!(" · selector: {s}")
+                }
+                _ => String::new(),
+            };
+            t.push_str(&format!(
+                "[{}] {} ({}·{}){}\n  {}\n  fix: {}\n",
+                f["severity"].as_str().unwrap_or(""),
+                rule,
+                route,
+                viewport,
+                where_,
+                f["msg"].as_str().unwrap_or(""),
+                f["fix"].as_str().unwrap_or(""),
+            ));
+            // The flagged element boxed on its page screenshot — look before you fix.
+            if let Some(url) = shot_url(server, report_id, route, viewport, &f["rect"]) {
+                t.push_str(&format!("  shot: {url}\n"));
+            }
+            // Exact applicable edit for copy findings: a literal find-and-replace
+            // the agent can grep for and apply, then confirm with verify_fix.
+            if let Some(marks) = f["marks"].as_array() {
+                for m in marks {
+                    if m["t"].as_str() == Some("rewrite") {
+                        if let (Some(from), Some(to)) = (m["from"].as_str(), m["to"].as_str()) {
+                            t.push_str(&format!("  edit: replace \"{from}\" with \"{to}\"\n"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // DRY / componentization (local source, never sent to the server): card/panel
+    // class clusters retyped across the tree — each a component waiting to be
+    // extracted. Call ux_guidance("components") before acting, then extract once.
+    if let Some(dry) = report["source_dry"].as_array().filter(|d| !d.is_empty()) {
+        let total: i64 = dry.iter().map(|d| d["count"].as_i64().unwrap_or(0)).sum();
+        t.push_str(&format!(
+            "\nDRY (local source): {total} inlined card/panel(s) across {} repeated cluster(s) — extract a shared component instead of retyping the classes:\n",
+            dry.len()
+        ));
+        for d in dry.iter().take(5) {
+            t.push_str(&format!(
+                "  ×{} in {} file(s) · from {}: \"{}\"\n",
+                d["count"].as_i64().unwrap_or(0),
+                d["files"].as_i64().unwrap_or(0),
+                d["source"].as_str().unwrap_or("-"),
+                d["cluster"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    // Free-plan upsell: the server withheld the Pro findings and gave us a count
+    // + two real samples. Show the teasers and instruct the model to tell the
+    // user — carefully, without inventing the withheld findings.
+    if let Some(up) = report["upsell"].as_object() {
+        let locked = up.get("locked_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        if locked > 0 {
+            let url = up.get("upgrade_url").and_then(|v| v.as_str()).unwrap_or("");
+            t.push_str(&format!(
+                "\n─── {locked} more finding(s) available on Pro ───\n\
+                 Your free plan covers accessibility. {locked} further findings \
+                 (visual, copy, structure, resilience) plus the AI copy/design judge \
+                 were withheld. Two real examples of what's there:\n"
+            ));
+            if let Some(samples) = up.get("samples").and_then(|s| s.as_array()) {
+                for s in samples {
+                    t.push_str(&format!(
+                        "  [pro] {} ({}): {}\n    fix: {}\n",
+                        s["rule"].as_str().unwrap_or(""),
+                        s["route"].as_str().unwrap_or(""),
+                        s["msg"].as_str().unwrap_or(""),
+                        s["fix"].as_str().unwrap_or(""),
+                    ));
+                }
+            }
+            t.push_str(&format!(
+                "\nNOTIFY THE USER: {locked} additional findings were identified but \
+                 need a Pro plan to view and act on — the two above are only a sample. \
+                 Suggest upgrading at {url}. Do NOT invent or guess the withheld \
+                 findings; only the samples above are real.\n"
+            ));
+        }
+        // A taste of the AI reviewer — one grounded judge finding the server ran
+        // for this free first-audit (best-effort; absent most of the time).
+        if let Some(teaser) = up.get("judge_teaser") {
+            t.push_str(&format!(
+                "\n✨ A taste of Pro's AI reviewer — it read your landing copy and flagged:\n  \
+                 [{}] {}: {}\n    fix: {}\n  This copy/design judgment is Pro-only; mention it to the user.\n",
+                teaser["rule"].as_str().unwrap_or(""),
+                teaser["route"].as_str().unwrap_or(""),
+                teaser["msg"].as_str().unwrap_or(""),
+                teaser["fix"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    // Quota soft-nudge: warn before the hard 402 wall (last ~20% or <=2 left).
+    if let Some(q) = report["quota"].as_object() {
+        let remaining = q.get("remaining").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let cap = q.get("cap").and_then(|v| v.as_i64()).unwrap_or(0);
+        let used = q.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
+        let url = q.get("upgrade_url").and_then(|v| v.as_str()).unwrap_or("");
+        if remaining >= 0 && cap > 0 && remaining <= (cap / 5).max(2) {
+            t.push_str(&format!(
+                "\nQUOTA: {used} of {cap} audits used this month — only {remaining} left. \
+                 Tell the user, and suggest upgrading at {url} before they hit the limit.\n"
+            ));
+        }
+    }
+    t.push_str(
+        "\nFixes and edits are concrete suggestions to apply or adapt to your codebase's voice — guidance, not a mandated redesign. Verify each with verify_fix.\n",
+    );
+    if feedback_enabled && !rules_seen.is_empty() {
+        t.push_str(&feedback_solicitation(report_id, &rules_seen));
+    }
+    t
+}
+
+/// The line an MCP caller sees while an audit runs: what it is doing, how far through, and how long
+/// it has been going against its cap — `crawl: 3/12 pages · 1m 40s of 5m`. Before the route set is
+/// known it still says something ("finding pages to audit"): that silence is what a field report on
+/// 2026-09-24 read as a hung audit. `None` only before the audit has started at all.
+fn progress_message(
+    (pages_done, pages_total, walks_done, walks_total, phase): (usize, usize, usize, usize, String),
+    elapsed: u64,
+    cap: u64,
+) -> Option<String> {
+    let what = match phase.as_str() {
+        "" => return None,
+        "walks" if walks_total > 0 => format!("tests: {walks_done}/{walks_total}"),
+        "server" => "AI review of the captured pages".to_string(),
+        "previews" => "rendering fix previews".to_string(),
+        "done" => "finishing".to_string(),
+        _ if pages_total > 0 => format!("crawl: {pages_done}/{pages_total} pages"),
+        _ => "finding pages to audit".to_string(),
+    };
+    let dur = |s: u64| match (s / 60, s % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
+    };
+    Some(if cap > 0 && elapsed <= cap {
+        format!("{what} · {} of {}", dur(elapsed), dur(cap))
+    } else {
+        format!("{what} · {}", dur(elapsed))
     })
 }
 
@@ -582,6 +934,13 @@ struct GetShotArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct GetReportArgs {
+    /// The report to read: its URL as the dashboard shows it (`https://uxlint.net/sites/8/r/abc123`),
+    /// a `/r/…` path, or the bare report id.
+    report: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct GetFeedbackArgs {
     /// How far back to look, and the size of the window it is compared against: `7d`, `14d`
     /// (default), `30d`, `90d`, or `all`.
@@ -607,7 +966,8 @@ struct GetFeedbackArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct ArchiveFeedbackArgs {
-    /// The rule whose complaints you have dealt with.
+    /// The rule whose complaints you have dealt with — or `new lint` for an idea the digest shows as
+    /// `[new lint]` (it has no rule yet; pass its exact text as `reason`).
     rule: String,
     /// The exact reason text as `get_feedback` printed it — closes just that complaint. Omit to close
     /// EVERY complaint on the rule, which is a much bigger claim: only do it when you have read them.
@@ -663,22 +1023,66 @@ pub(crate) struct UxlintMcp {
     key_is_explicit: bool,
 }
 
-/// The text of a PASSING verify — and the scope of the claim it is making.
-///
-/// Reported from the field: `verify_fix` said a rule was cleared with zero hits on the page it
-/// loaded, and a full audit immediately afterwards fired it again, listing MORE components than
-/// before. It was a site-scoped rule (`styleguide-coverage`, whose input is the whole site's
-/// component inventory), which a single-route pass cannot settle either way. The reply was not
-/// wrong about the page; it was wrong about what the page proves. A confident "cleared" that a
-/// full pass contradicts is worse than no answer, because it ends the fix loop early — so the
-/// verdict now names its own scope, every time, rather than only when other findings happen to
-/// give `others_line` something to say.
+/// Only an explicit execution receipt can establish a pass. Old servers, unknown rule names,
+/// site/judge/interaction checks and missing captures must never turn zero hits into success.
+fn verification_status(
+    report: &Value,
+    rule: &str,
+    route: &str,
+    hits: usize,
+    withheld: bool,
+) -> &'static str {
+    if hits > 0 || withheld {
+        return "failed";
+    }
+    let Some(checks) = report["verification"]["checks"]
+        .as_array()
+        .filter(|_| report["verification"]["schema"] == 1)
+    else {
+        return "not_evaluated";
+    };
+    let matching: Vec<_> = checks
+        .iter()
+        .filter(|c| c["rule"] == rule && c["route"] == route)
+        .collect();
+    if matching.iter().any(|c| c["status"] == "failed") {
+        return "failed";
+    }
+    if report["timed_out"] == true {
+        return "inconclusive";
+    }
+    if matching.is_empty() {
+        return "not_evaluated";
+    }
+    if matching.iter().any(|c| c["status"] != "passed") {
+        return "inconclusive";
+    }
+    // verify_fix requests both viewports. A missing mobile capture is not a mobile pass.
+    for viewport in ["desktop", "mobile"] {
+        let Some(pages) = report["pages"].as_array() else {
+            return "inconclusive";
+        };
+        let pages: Vec<_> = pages
+            .iter()
+            .filter(|p| p["route"] == route && p["viewport"] == viewport)
+            .collect();
+        if pages.is_empty()
+            || pages.iter().any(|p| {
+                !matching.iter().any(|c| {
+                    c["viewport"] == viewport
+                        && c["state"].as_str().unwrap_or("anonymous")
+                            == p["state"].as_str().unwrap_or("anonymous")
+                })
+            })
+        {
+            return "inconclusive";
+        }
+    }
+    "passed"
+}
+
 fn cleared_text(rule: &str, route: &str, others: &str) -> String {
-    format!(
-        "✓ {rule} is CLEAR on {route} — verified for THIS PAGE (one route, deterministic pass). \
-A rule whose input is the whole SITE (a component inventory, the link graph, cross-page \
-consistency) cannot be settled by one page — re-run audit_url for those.{others}"
-    )
+    format!("✓ {rule} is CLEAR on {route} — verified for THIS PAGE in the captured desktop/mobile states. This confirms the check cleared; it does not establish that the edit improved the UX. Re-run audit_url to check the wider site.{others}")
 }
 
 #[tool_router(router = tool_router)]
@@ -742,7 +1146,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) Iterate until green. If a lint_feedback tool is in your tool list, also send a verdict for each finding you act on — it's how rules get kept, tuned or retired. It is absent unless the project set `feedback = true` (via `uxlint init`), so don't go looking for it: this result tells you when it's there.\n\nSAFETY: with no test plan declared, audit_url only NAVIGATES and READS. If the project's uxlint.toml declares tests that sign in as a persona, running them may SUBMIT forms and DELETE items on the target — that's what a test does (it exercises create/delete flows on your own app). Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
+        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) Iterate until green. If a lint_feedback tool is in your tool list, also send a verdict for each finding you act on — it's how rules get kept, tuned or retired. It is absent unless the project set `feedback = true` (via `uxlint init`), so don't go looking for it: this result tells you when it's there.\n\nSAFETY: interaction probes navigate, read, and click candidate menu/disclosure/dialog controls. Discovery skips recognised action words — delete, remove, accept, leave, revoke, pay, publish, add, create, save — using the full label. Labels cannot guarantee a click has no side effects; use an environment you control with disposable data. the write probes (which click Add/Create, and Delete through its confirm dialog) need the CLI's own --allow-mutation flag, which is not reachable from here. Declared tests are the exception and the only one: if the project's uxlint.toml declares tests that sign in as a persona, running them will SUBMIT forms and may DELETE items — that's what a test does, and it exercises create/delete flows on your own app. Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
     )]
     async fn audit_url(
         &self,
@@ -809,6 +1213,7 @@ impl UxlintMcp {
         let args = AuditArgs {
             base,
             routes: a.routes.unwrap_or_else(|| "/".to_string()),
+            exact_routes: false,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call —
             // secrets stay out of the tool args and the transcript.
@@ -820,6 +1225,11 @@ impl UxlintMcp {
             // Interaction states ON by default for the MCP: an agent auditing its own UI
             // should get the hover/focus/keyboard checks without asking. Explicit false skips.
             states: a.states.unwrap_or(true),
+            // …but NEVER the mutating half. States are something you look at; Add/Create/Delete are
+            // something you do, and an agent calling this tool has made no such choice on its user's
+            // behalf. This is the surface whose own description promised "only NAVIGATES and READS",
+            // and it is now the surface that keeps that promise unconditionally.
+            allow_mutation: false,
             crawl: a.crawl.unwrap_or(12) as usize,
             parallel: None, // auto: full throttle locally, polite on public hosts
             probe_errors: false,
@@ -871,23 +1281,26 @@ impl UxlintMcp {
             run_audit_ext(&cli, &args, &crate::progress::Silent, partial_for_audit)
         });
         let report = if let (Some(token), Some(partial)) = (progress_token, partial) {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let (pages_done, pages_total, walks_done, walks_total, phase) = partial.snapshot();
-                        let (done, total, message) = if phase == "walks" && walks_total > 0 {
-                            (walks_done as f64, walks_total as f64, format!("tests: {walks_done}/{walks_total}"))
-                        } else if pages_total > 0 {
-                            let label = if phase.is_empty() { "crawl".to_string() } else { phase.clone() };
-                            (pages_done as f64, pages_total as f64, format!("{label}: {pages_done}/{pages_total} pages"))
-                        } else {
+                        let (elapsed, cap) = partial.clock();
+                        let Some(message) = progress_message(partial.snapshot(), elapsed, cap) else {
                             continue;
                         };
-                        let _ = client
-                            .notify_progress(ProgressNotificationParam::new(token.clone(), done).with_total(total).with_message(message))
-                            .await;
+                        // `progress` is the CLOCK, not the page count: MCP requires it to rise with
+                        // every notification, and the clock is the one measure that always does — a
+                        // page count sits still through discovery and through one slow route, which
+                        // is exactly when a caller decides the audit has hung. The cap is the
+                        // honest total while the browser phase runs; past it (the server's AI
+                        // review) there is no bound to promise, so none is sent.
+                        let mut n = ProgressNotificationParam::new(token.clone(), elapsed as f64).with_message(message);
+                        if cap > elapsed {
+                            n = n.with_total(cap as f64);
+                        }
+                        let _ = client.notify_progress(n).await;
                     }
                     res = &mut audit_task => break res,
                 }
@@ -899,274 +1312,8 @@ impl UxlintMcp {
         let mut structured = Value::Null;
         let text = match report {
             Ok(report) => {
-                let mut t = String::new();
-                if let Some(blocked) = report["auth_blocked_routes"].as_array() {
-                    let routes: Vec<&str> = blocked
-                        .iter()
-                        .filter_map(|r| r.as_str())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !routes.is_empty() {
-                        t.push_str(&format!(
-                        "AUTH WALL DETECTED on: {}. Only the public/login view was audited.\n\
-                         To audit the authenticated app, set up credentials in the project's uxlint.toml \
-                         — the local client replays them, so nothing passes through this tool or the chat. \
-                         ASK THE USER to add a [personas.<name>] block and point default_persona at it \
-                         (put secrets in the environment via ${{VAR}}; throwaway dev creds can sit inline):\n\n\
-                         default_persona = \"ci\"\n\
-                         [personas.ci]\n\
-                         headers = [\"Cookie: session=${{SESSION}}\"]   # or storage = [\"token=...\"]\n\
-                         # or sign in via the login form each run:\n\
-                         # login_url       = \"/login\"\n\
-                         # default_persona = \"user\"\n\
-                         # [personas.user]\n\
-                         # username = \"dev@example.com\"\n\
-                         # password = \"${{DEV_PW}}\"\n\n\
-                         Then re-run audit_url. Until then, treat these results as the logged-out experience only.\n\n",
-                        routes.join(", ")
-                    ));
-                    }
-                }
-                if let Some(unrec) = report["unrecognized_widgets"].as_array() {
-                    if !unrec.is_empty() {
-                        let sigs: Vec<&str> = unrec.iter().filter_map(|s| s.as_str()).collect();
-                        t.push_str(&format!(
-                            "UNRECOGNIZED CUSTOM CONTROLS (signatures: {}). If you can identify the \
-                             widget set, call report_widget_gap so uxlint learns it.\n\n",
-                            sigs.join(", ")
-                        ));
-                    }
-                }
-                // Lead with the deterministic verdict and the block-grouped action plan
-                // (the synthesis layer). The agent reads "here's what to fix, by block, in
-                // priority order" before wading into the raw finding list.
-                let summary = &report["summary"];
-                // The link goes FIRST, with an instruction to relay it. Everything below this line is
-                // written for the agent — it fixes the code and the user never sees most of it — but
-                // the report itself is for the PERSON: annotated screenshots of their own pages, every
-                // finding, the score over time. Buried as a bare line halfway down a wall of findings
-                // it got summarised away, and people didn't know a report page existed at all.
-                if let Some(url) = report["report_url"].as_str().filter(|u| !u.is_empty()) {
-                    t.push_str(&format!(
-                        "REPORT: {url}\nGive the user this link — it's the full report on the web \
-                         (annotated screenshots of each finding, the whole list, and how this run \
-                         compares with their last one).\n\n"
-                    ));
-                }
-                if let Some(grade) = summary["grade"].as_str() {
-                    t.push_str(&format!(
-                        "Grade {grade} ({}/100) — {}\n",
-                        summary["score"].as_i64().unwrap_or(0),
-                        summary["verdict"].as_str().unwrap_or("")
-                    ));
-                }
-                t.push_str(&format!(
-                    "{} errors, {} warnings, {} info\n\n",
-                    report["errors"], report["warnings"], report["infos"],
-                ));
-                // Cross-audit delta — the iterate-loop signal: what your last round of fixes moved.
-                // Present only when this crawl has a comparable prior crawl to diff against.
-                if let Some(d) = report["delta"].as_object() {
-                    let g = |k: &str| d.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-                    t.push_str(&format!(
-                        "Since your last audit: {} resolved, {} new, {} still open.",
-                        g("resolved"),
-                        g("new"),
-                        g("persisting")
-                    ));
-                    // Name the newly-INTRODUCED findings first — most likely caused by your last edit.
-                    if let Some(nf) = d
-                        .get("new_findings")
-                        .and_then(|v| v.as_array())
-                        .filter(|a| !a.is_empty())
-                    {
-                        let list = nf
-                            .iter()
-                            .take(5)
-                            .filter_map(|f| {
-                                Some(format!(
-                                    "{} ({})",
-                                    f["rule"].as_str()?,
-                                    f["route"].as_str()?
-                                ))
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        t.push_str(&format!(
-                            " New since last time: {list} — check these are yours."
-                        ));
-                    }
-                    t.push_str("\n\n");
-                }
-                // Warn the agent up front when the audit hit its time cap — the finding set
-                // below may be partial, so "clean" here doesn't mean the whole site was checked.
-                if report["timed_out"].as_bool() == Some(true) {
-                    let d = &report["timeout_detail"];
-                    t.push_str(&format!(
-                        "⚠ TIMED OUT — this audit hit its {}s time cap; results may be incomplete ({}/{} pages captured, {}/{} tests finished). Findings below are what was gathered before the cap.\n\n",
-                        d["cap_secs"].as_u64().unwrap_or(0),
-                        d["pages_captured"].as_u64().unwrap_or(0), d["pages_planned"].as_u64().unwrap_or(0),
-                        d["walks_done"].as_u64().unwrap_or(0), d["walks_planned"].as_u64().unwrap_or(0),
-                    ));
-                }
-                // Stay on-script: if the site has a styleguide/design-system page, tell the
-                // agent to build to it BEFORE touching UI, so fixes reuse its components/tokens
-                // instead of drifting.
-                if let Some(sg) = report["styleguide"].as_str().filter(|s| !s.is_empty()) {
-                    t.push_str(&format!(
-                        "STYLEGUIDE: {sg} — this site documents its components, tokens and patterns here. Before changing any UI, open it and build to what it shows; reuse those components/tokens rather than reinventing styles.\n\n"
-                    ));
-                }
-                if let Some(narr) = summary["narrative"].as_str().filter(|n| !n.is_empty()) {
-                    t.push_str(&format!(
-                        "Action plan (fix by block, in priority order):\n{narr}\n\n"
-                    ));
-                }
-                let report_id = report_id_of(&report);
-                // Every distinct rule id shown below — feeds the closing feedback solicitation
-                // (deduped, insertion order; empty iff nothing was reported).
-                let mut rules_seen: Vec<String> = Vec::new();
-                for page in report["pages"].as_array().unwrap_or(&vec![]) {
-                    let route = page["route"].as_str().unwrap_or("");
-                    let viewport = page["viewport"].as_str().unwrap_or("");
-                    for f in page["findings"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .take(30)
-                    {
-                        // rule name (for verify_fix), location, the problem, and the fix.
-                        let rule = f["rule"].as_str().unwrap_or("");
-                        if !rule.is_empty() && !rules_seen.iter().any(|r| r.as_str() == rule) {
-                            rules_seen.push(rule.to_string());
-                        }
-                        let sel = f["sel"].as_str().unwrap_or("");
-                        // Prefer the source hint (file:line, from the local grep) as the
-                        // location; fall back to the DOM selector.
-                        let where_ = match (f["source"].as_str(), sel) {
-                            (Some(src), _) => format!(" · source: {src}"),
-                            (None, s) if !s.is_empty() && s != "page" && s != "site" => {
-                                format!(" · selector: {s}")
-                            }
-                            _ => String::new(),
-                        };
-                        t.push_str(&format!(
-                            "[{}] {} ({}·{}){}\n  {}\n  fix: {}\n",
-                            f["severity"].as_str().unwrap_or(""),
-                            rule,
-                            route,
-                            viewport,
-                            where_,
-                            f["msg"].as_str().unwrap_or(""),
-                            f["fix"].as_str().unwrap_or(""),
-                        ));
-                        // The flagged element boxed on its page screenshot — look before you fix.
-                        if let Some(url) =
-                            shot_url(&self.cli.server, report_id, route, viewport, &f["rect"])
-                        {
-                            t.push_str(&format!("  shot: {url}\n"));
-                        }
-                        // Exact applicable edit for copy findings: a literal find-and-replace
-                        // the agent can grep for and apply, then confirm with verify_fix.
-                        if let Some(marks) = f["marks"].as_array() {
-                            for m in marks {
-                                if m["t"].as_str() == Some("rewrite") {
-                                    if let (Some(from), Some(to)) =
-                                        (m["from"].as_str(), m["to"].as_str())
-                                    {
-                                        t.push_str(&format!(
-                                            "  edit: replace \"{from}\" with \"{to}\"\n"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // DRY / componentization (local source, never sent to the server): card/panel
-                // class clusters retyped across the tree — each a component waiting to be
-                // extracted. Call ux_guidance("components") before acting, then extract once.
-                if let Some(dry) = report["source_dry"].as_array().filter(|d| !d.is_empty()) {
-                    let total: i64 = dry.iter().map(|d| d["count"].as_i64().unwrap_or(0)).sum();
-                    t.push_str(&format!(
-                        "\nDRY (local source): {total} inlined card/panel(s) across {} repeated cluster(s) — extract a shared component instead of retyping the classes:\n",
-                        dry.len()
-                    ));
-                    for d in dry.iter().take(5) {
-                        t.push_str(&format!(
-                            "  ×{} in {} file(s) · from {}: \"{}\"\n",
-                            d["count"].as_i64().unwrap_or(0),
-                            d["files"].as_i64().unwrap_or(0),
-                            d["source"].as_str().unwrap_or("-"),
-                            d["cluster"].as_str().unwrap_or(""),
-                        ));
-                    }
-                }
-                // Free-plan upsell: the server withheld the Pro findings and gave us a count
-                // + two real samples. Show the teasers and instruct the model to tell the
-                // user — carefully, without inventing the withheld findings.
-                if let Some(up) = report["upsell"].as_object() {
-                    let locked = up.get("locked_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                    if locked > 0 {
-                        let url = up.get("upgrade_url").and_then(|v| v.as_str()).unwrap_or("");
-                        t.push_str(&format!(
-                            "\n─── {locked} more finding(s) available on Pro ───\n\
-                             Your free plan covers accessibility. {locked} further findings \
-                             (visual, copy, structure, resilience) plus the AI copy/design judge \
-                             were withheld. Two real examples of what's there:\n"
-                        ));
-                        if let Some(samples) = up.get("samples").and_then(|s| s.as_array()) {
-                            for s in samples {
-                                t.push_str(&format!(
-                                    "  [pro] {} ({}): {}\n    fix: {}\n",
-                                    s["rule"].as_str().unwrap_or(""),
-                                    s["route"].as_str().unwrap_or(""),
-                                    s["msg"].as_str().unwrap_or(""),
-                                    s["fix"].as_str().unwrap_or(""),
-                                ));
-                            }
-                        }
-                        t.push_str(&format!(
-                            "\nNOTIFY THE USER: {locked} additional findings were identified but \
-                             need a Pro plan to view and act on — the two above are only a sample. \
-                             Suggest upgrading at {url}. Do NOT invent or guess the withheld \
-                             findings; only the samples above are real.\n"
-                        ));
-                    }
-                    // A taste of the AI reviewer — one grounded judge finding the server ran
-                    // for this free first-audit (best-effort; absent most of the time).
-                    if let Some(teaser) = up.get("judge_teaser") {
-                        t.push_str(&format!(
-                            "\n✨ A taste of Pro's AI reviewer — it read your landing copy and flagged:\n  \
-                             [{}] {}: {}\n    fix: {}\n  This copy/design judgment is Pro-only; mention it to the user.\n",
-                            teaser["rule"].as_str().unwrap_or(""),
-                            teaser["route"].as_str().unwrap_or(""),
-                            teaser["msg"].as_str().unwrap_or(""),
-                            teaser["fix"].as_str().unwrap_or(""),
-                        ));
-                    }
-                }
-                // Quota soft-nudge: warn before the hard 402 wall (last ~20% or <=2 left).
-                if let Some(q) = report["quota"].as_object() {
-                    let remaining = q.get("remaining").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    let cap = q.get("cap").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let used = q.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let url = q.get("upgrade_url").and_then(|v| v.as_str()).unwrap_or("");
-                    if remaining >= 0 && cap > 0 && remaining <= (cap / 5).max(2) {
-                        t.push_str(&format!(
-                            "\nQUOTA: {used} of {cap} audits used this month — only {remaining} left. \
-                             Tell the user, and suggest upgrading at {url} before they hit the limit.\n"
-                        ));
-                    }
-                }
-                t.push_str(
-                    "\nFixes and edits are concrete suggestions to apply or adapt to your codebase's voice — guidance, not a mandated redesign. Verify each with verify_fix.\n",
-                );
-                if self.feedback_enabled && !rules_seen.is_empty() {
-                    t.push_str(&feedback_solicitation(report_id, &rules_seen));
-                }
                 structured = audit_structured(&report, &self.cli.server);
-                t
+                report_text(&report, &self.cli.server, self.feedback_enabled)
             }
             Err(e) => format!("audit failed: {e}"),
         };
@@ -1188,7 +1335,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). It's a fast deterministic pass: for the whole-page picture incl. judge/state checks, re-run audit_url. SCOPE: a clear verdict covers the ONE page it loads. A rule whose input is the whole site — a component inventory, the link graph, cross-page consistency — can pass here and still fire in a full audit, so confirm those with audit_url before calling them done."
+        description = "After editing to fix a finding, re-check ONE rule on ONE page — the 'did my fix land?' loop, far quicker than a full re-audit (one route, no crawl, no judge). Returns whether the rule still fires, AND names any OTHER deterministic findings now on that page (the regression guard — so a fix that clears your rule but breaks something else here doesn't read as all-clear). Returns status passed, failed, not_evaluated or inconclusive. A pass requires explicit server evidence for the requested route and both viewports. Currently supported passing checks: page-title-missing, html-lang-missing, horizontal-overflow. Other rules can report observed failures but cannot pass without execution evidence; re-run audit_url for judge, interaction and site checks. Unknown rules and missing evidence never clear. A cleared finding is not a user endorsement of the fix."
     )]
     async fn verify_fix(
         &self,
@@ -1199,6 +1346,7 @@ impl UxlintMcp {
         let args = AuditArgs {
             base: resolve_base(a.base, self.default_base.as_deref()),
             routes: route.clone(),
+            exact_routes: true,
             viewports: "desktop:1440x900,mobile:390x844".into(),
             // Auth (if any) comes from uxlint.toml [personas], never from the MCP call.
             headers: Vec::new(),
@@ -1207,6 +1355,7 @@ impl UxlintMcp {
             username: None,
             password: None,
             states: a.states.unwrap_or(false),
+            allow_mutation: false, // verify_fix re-checks a page; it never rehearses its delete flow
             crawl: 1,
             rule: None,
             // Crops scoped to the rule under test; the audit still reports everything it finds on
@@ -1246,8 +1395,7 @@ impl UxlintMcp {
         let rule_for_task = rule.clone();
         let route_for_task = route.clone();
         let feedback_enabled = self.feedback_enabled;
-        // Run the audit AND the best-effort "accept" POST on the blocking pool — both are
-        // blocking, and keeping them together lets the POST fire while off the transport thread.
+        // Browser capture and report submission block; keep them off the MCP transport thread.
         let outcome = tokio::task::spawn_blocking(move || {
             let rule = rule_for_task;
             let route = route_for_task;
@@ -1262,6 +1410,7 @@ impl UxlintMcp {
                         .unwrap_or(false);
                     let up_url = report["upsell"]["upgrade_url"].as_str().unwrap_or("").to_string();
                     let hits = report["pages"].as_array().map(|ps| ps.iter()
+                        .filter(|p| p["route"] == route)
                         .flat_map(|p| p["findings"].as_array().cloned().unwrap_or_default())
                         .filter(|f| f["rule"].as_str() == Some(rule.as_str()))
                         .count()).unwrap_or(0);
@@ -1283,6 +1432,7 @@ impl UxlintMcp {
                     {
                         let empty = vec![];
                         for p in report["pages"].as_array().unwrap_or(&empty) {
+                            if p["route"] != route { continue; }
                             let r = p["route"].as_str().unwrap_or("");
                             let vp = p["viewport"].as_str().unwrap_or("");
                             for f in p["findings"].as_array().unwrap_or(&empty) {
@@ -1313,11 +1463,12 @@ impl UxlintMcp {
                         .iter()
                         .map(|(rr, sev, n)| json!({"rule": rr, "severity": sev, "count": n}))
                         .collect();
+                    let status = verification_status(&report, &rule, &route, hits, withheld);
                     structured = json!({
                         "report_url": report["report_url"], "report_id": report_id,
                         // `scope` is the caveat in machine-readable form: `cleared` is a claim about
                         // this PAGE, and a site-scoped rule needs a full audit to be settled.
-                        "rule": rule, "route": route, "cleared": hits == 0 && !withheld, "scope": "page", "hits": hits, "withheld": withheld,
+                        "rule": rule, "route": route, "cleared": status == "passed", "status": status, "execution": report["verification"], "scope": "page", "hits": hits, "withheld": withheld,
                         "remaining": remaining, "other_findings": others_json,
                     });
                     // One compact line naming the other rules still on the page (worst first, capped).
@@ -1347,21 +1498,14 @@ impl UxlintMcp {
                     };
                     if withheld {
                         format!("▲ {rule} is a Pro finding and still fires on {route} — it's withheld on the free plan, so it can't be fully verified here. Upgrade at {up_url} to see every occurrence and confirm the fix. (Tell the user.)")
-                    } else if hits == 0 {
-                        // A verified fix is an implicit "accept" — the finding was worth acting
-                        // on. Best-effort, stable-keyed (source "fix"), never blocks the reply.
-                        if let Some(key) = &cli.api_key {
-                            let _ = reqwest::blocking::Client::new()
-                                .post(format!("{}/v1/feedback", cli.server))
-                                .bearer_auth(key)
-                                .json(&json!({"rule": rule, "verdict": "accept", "source": "fix", "reason": "verified via verify_fix"}))
-                                .send();
-                        }
+                    } else if status == "not_evaluated" || status == "inconclusive" {
+                        format!("▲ {rule}: {status} on {route}. No passing execution evidence covers this rule on both requested viewports. The finding is NOT verified as cleared. Re-run audit_url with the original routes, personas and required probes; inspect its evidence before declaring the fix complete.{}", others_line("Also:"))
+                    } else if status == "passed" {
                         // Cleared — but name any OTHER findings still on the page so this isn't read
                         // as "the page is done." That's the whack-a-mole guard.
                         cleared_text(&rule, &route, &others_line("Heads-up:"))
                     } else {
-                        let mut m = format!("▲ {rule} STILL FIRES on {route} ({hits} occurrence(s)) — the fix hasn't landed yet.");
+                        let mut m = format!("▲ {rule} STILL FIRES on {route} — the check observed a failure ({hits} visible occurrence(s); grouped findings may appear elsewhere in the report).");
                         for rf in &remaining {
                             if let Some(u) = rf["screenshot_url"].as_str() {
                                 m.push_str(&format!("\n  shot: {u}"));
@@ -1462,6 +1606,61 @@ impl UxlintMcp {
         }
     }
 
+    #[tool(
+        description = "Read an EXISTING report's findings — one the user started from the dashboard, a run whose audit_url call you lost, or one that TIMED OUT (it keeps whatever it found before the cap, and says so). Pass the report's URL as the user sees it (…/r/<id>) or its id. Returns the same thing audit_url does: the grade, what moved since the last run, and every finding with its rule, location, source hint, fix and screenshot_url — so you can act on it and confirm each fix with verify_fix. Reports are private; this reads them with your uxlint login."
+    )]
+    async fn get_report(
+        &self,
+        Parameters(a): Parameters<GetReportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.call_cli().api_key.is_none() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                signup_hint(&self.cli.server),
+            )]));
+        }
+        let cli = self.call_cli();
+        let result = tokio::task::spawn_blocking(move || {
+            let server = cli.server.trim_end_matches('/').to_string();
+            let id = parse_report_ref(&a.report, &server)?;
+            // The id is the ONLY thing taken from the caller: the request always goes to our own
+            // server, so the login token can't be steered at another host by a crafted URL.
+            let resp = reqwest::blocking::Client::new()
+                .get(format!("{server}/v1/reports/{id}"))
+                .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
+                .send();
+            let mut report: Value = match resp {
+                Ok(r) if r.status().is_success() => r
+                    .json()
+                    .map_err(|e| format!("the report came back unreadable: {e}"))?,
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    return Err(credential_rejected(&cli.server))
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND || r.status() == reqwest::StatusCode::FORBIDDEN => {
+                    return Err(format!("no report {id} that this login can read — check the id, and that you're signed in to the org that owns it"))
+                }
+                Ok(r) => return Err(failure_text(r)),
+                Err(e) => return Err(format!("could not fetch the report: {e}")),
+            };
+            // The stored report doesn't always carry its own URL (it's minted when the POST
+            // returns), and the screenshot links and verify_fix hints are keyed off it.
+            if report["report_url"].as_str().is_none_or(str::is_empty) {
+                report["report_url"] = json!(format!("{server}/r/{id}"));
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("get_report task panicked: {e}"), None))?;
+        match result {
+            Ok(report) => {
+                let text = report_text(&report, &self.cli.server, self.feedback_enabled);
+                let mut r = CallToolResult::success(vec![ContentBlock::text(text)]);
+                r.structured_content = Some(audit_structured(&report, &self.cli.server));
+                Ok(r)
+            }
+            Err(msg) => Ok(CallToolResult::success(vec![ContentBlock::text(msg)])),
+        }
+    }
+
     // uxlint STAFF only, and absent from the router unless the server was launched with `--admin`
     // (`UXLINT_ADMIN_TOOLS=1`) — the same `remove_route` mechanism `lint_feedback` uses, so the tool
     // is hidden from `list_tools` AND rejected by `call_tool` with no second enforcement point. The
@@ -1543,7 +1742,7 @@ impl UxlintMcp {
     // The write half of the staff loop, behind the same `--admin` switch as `get_feedback`.
     #[tool(
         name = "archive_feedback",
-        description = "uxlint STAFF: close a lint complaint you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes a feedback row. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT complaint; omitting `reason` closes every complaint on the rule, which is a much bigger claim — only do it when you have read them all. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
+        description = "uxlint STAFF: close a lint complaint OR a lint idea you have EVALUATED — record what you did about it so it stops coming back.\n\nNothing else closes one. A complaint you fixed last month is still in the digest, indistinguishable from one filed this morning, and re-triaging already-answered rows is the single biggest waste in this loop. Archive it and the next digest is only what's actually open.\n\nCALL IT after you have acted, once per thing you dealt with: `rule` plus the exact `reason` text from the digest closes THAT item — a verdict's reason or a suggestion's text, both matched the same way (an idea the digest shows as `[new lint]` has no rule yet: pass `rule=\"new lint\"`, and its text is then required); omitting `reason` closes every complaint AND idea on the rule, which is a much bigger claim — only do it when you have read them all.\n\nIt REFUSES (404) when nothing matches, rather than reporting success for having closed nothing: if you get that, check the rule name and that `reason` is the exact text the digest printed — it is matched whole, never by substring. `outcome` is fixed | wont_fix | retired, and `note` (required, a real sentence) says what you actually did: which guard you added and where, or why the rule is right on that element after all.\n\nSAFE BY DESIGN: nothing is deleted. The rows stay, `get_feedback include_archived=true` shows what the archive is hiding, `revert: true` undoes an entry — and a complaint REFILED after you archived it comes back live on its own, which is exactly the signal you want if the guard didn't work."
     )]
     async fn archive_feedback(
         &self,
@@ -1618,16 +1817,18 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
+        description = "Project design memory and best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Reads the nearest project’s uxlint.design.json on each call; only explicitly approved versioned decisions guide edits. Never auto-approve or rewrite that contract to silence a lint. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
     )]
     async fn ux_guidance(
         &self,
         Parameters(a): Parameters<UxGuidanceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let topic = a.topic.as_deref().unwrap_or("");
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            crate::guidance::guidance(topic),
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "{}{}",
+            crate::design_memory::guidance(),
+            crate::guidance::guidance(topic)
+        ))]))
     }
 
     // ONE feedback tool, gated by ONE opt-in setting (`feedback = true` in uxlint.toml,
@@ -1778,6 +1979,109 @@ pub(crate) fn run_mcp(cli: &Cli, base: Option<String>, admin_tools: bool) -> any
         service.waiting().await?;
         Ok::<_, anyhow::Error>(())
     })
+}
+
+#[cfg(test)]
+mod report_tool_tests {
+    use super::{parse_report_ref, report_text};
+    use serde_json::json;
+
+    const PROD: &str = "https://uxlint.net";
+
+    #[test]
+    fn takes_what_a_person_actually_pastes() {
+        // THE 2026-09-24 report: the agent was handed this exact dashboard link and had no tool that
+        // could read it — get_shot on it returned the SPA shell.
+        assert_eq!(
+            parse_report_ref("https://uxlint.net/sites/8/r/wmwtdtwoa5sa", PROD).unwrap(),
+            "wmwtdtwoa5sa"
+        );
+        assert_eq!(
+            parse_report_ref("wmwtdtwoa5sa", PROD).unwrap(),
+            "wmwtdtwoa5sa"
+        );
+        assert_eq!(parse_report_ref("  /r/abc123  ", PROD).unwrap(), "abc123");
+        // A screenshot link or a query on the end still names the same report.
+        assert_eq!(
+            parse_report_ref("https://uxlint.net/r/abc123/annot?route=/x", PROD).unwrap(),
+            "abc123"
+        );
+        assert_eq!(
+            parse_report_ref("https://uxlint.net/sites/8/r/abc123?tab=all#f3", PROD).unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn a_report_on_another_server_says_so_instead_of_404ing() {
+        let err = parse_report_ref("https://dev.uxlint.net/sites/2/r/abc123", PROD).unwrap_err();
+        assert!(
+            err.contains("dev.uxlint.net") && err.contains("uxlint.net"),
+            "{err}"
+        );
+        // …and a local server's own links are accepted against the local server.
+        assert_eq!(
+            parse_report_ref("http://127.0.0.1:49800/r/abc123", "http://127.0.0.1:49800/").unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn junk_is_refused_before_anything_is_fetched() {
+        assert!(parse_report_ref("", PROD).is_err());
+        assert!(parse_report_ref("https://uxlint.net/dashboard", PROD).is_err());
+        assert!(
+            parse_report_ref("../../v1/me", PROD).is_err(),
+            "a path must never become the id"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_report_reads_back_with_its_findings_and_the_warning() {
+        // What get_report exists for: the run hit its cap, but what it found is in the report.
+        let report = json!({
+            "report_url": "https://uxlint.net/sites/8/r/abc123",
+            "timed_out": true,
+            "timeout_detail": {"cap_secs": 300, "pages_captured": 3, "pages_planned": 9, "walks_done": 0, "walks_planned": 2},
+            "errors": 1, "warnings": 0, "infos": 0,
+            "pages": [{"route": "/timeline", "viewport": "desktop", "findings": [
+                {"rule": "contrast", "severity": "error", "msg": "Low contrast", "fix": "darken it", "sel": ".x", "rect": [1, 2, 3, 4]}
+            ]}]
+        });
+        let t = report_text(&report, PROD, false);
+        assert!(t.contains("TIMED OUT") && t.contains("3/9 pages"), "{t}");
+        assert!(t.contains("[error] contrast (/timeline·desktop)"), "{t}");
+        assert!(
+            t.contains("https://uxlint.net/r/abc123/annot?route=/timeline"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn progress_speaks_before_the_first_page_and_always_shows_the_clock() {
+        use super::progress_message;
+        let snap = |d, t, phase: &str| (d, t, 0, 0, phase.to_string());
+        // THE 2026-09-24 report: minutes of silence before any page landed read as a hang.
+        assert_eq!(
+            progress_message(snap(0, 0, "crawl"), 12, 300).unwrap(),
+            "finding pages to audit · 12s of 5m"
+        );
+        assert_eq!(
+            progress_message(snap(3, 24, "crawl"), 100, 300).unwrap(),
+            "crawl: 3/24 pages · 1m 40s of 5m"
+        );
+        assert_eq!(
+            progress_message((24, 24, 1, 2, "walks".into()), 200, 300).unwrap(),
+            "tests: 1/2 · 3m 20s of 5m"
+        );
+        // Past the cap the server is still working — no "of 5m" it has already overrun.
+        assert_eq!(
+            progress_message(snap(12, 24, "server"), 330, 300).unwrap(),
+            "AI review of the captured pages · 5m 30s"
+        );
+        // Nothing has started: say nothing rather than something made up.
+        assert_eq!(progress_message(snap(0, 0, ""), 0, 0), None);
+    }
 }
 
 #[cfg(test)]
@@ -2107,11 +2411,8 @@ mod cleared_text_tests {
         // THE report: a site-scoped rule "cleared" on one page, then fired again in the full pass —
         // and the agent had already stopped fixing. The verdict must carry its own scope even on the
         // happy path, where there is no other finding to hang the "re-run audit_url" advice on.
-        let t = cleared_text("styleguide-coverage", "/styleguide", "");
-        assert!(
-            t.starts_with("✓ styleguide-coverage is CLEAR on /styleguide"),
-            "{t}"
-        );
+        let t = cleared_text("page-title-missing", "/", "");
+        assert!(t.starts_with("✓ page-title-missing is CLEAR on /"), "{t}");
         assert!(t.contains("THIS PAGE"), "{t}");
         assert!(
             t.contains("audit_url"),
@@ -2131,6 +2432,77 @@ mod cleared_text_tests {
         assert!(
             t.contains("Heads-up: 2 other deterministic finding(s)"),
             "{t}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verification_status_tests {
+    use super::*;
+    fn report() -> Value {
+        json!({"verification":{"schema":1,"checks":[
+            {"route":"/","viewport":"desktop","state":"anonymous","rule":"page-title-missing","status":"passed"},
+            {"route":"/","viewport":"mobile","state":"anonymous","rule":"page-title-missing","status":"passed"}
+        ]}, "pages":[{"route":"/","viewport":"desktop"},{"route":"/","viewport":"mobile"}]})
+    }
+    #[test]
+    fn requires_positive_evidence_on_both_requested_viewports() {
+        let mut r = report();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "passed"
+        );
+        r["verification"]["checks"].as_array_mut().unwrap().pop();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
+        );
+    }
+    #[test]
+    fn unknown_rules_old_servers_and_other_routes_do_not_clear() {
+        for rule in [
+            "typo",
+            "styleguide-coverage",
+            "prose-clarity",
+            "dialog-escape",
+        ] {
+            assert_eq!(
+                verification_status(&report(), rule, "/", 0, false),
+                "not_evaluated"
+            );
+        }
+        assert_eq!(
+            verification_status(&json!({}), "page-title-missing", "/", 0, false),
+            "not_evaluated"
+        );
+        assert_eq!(
+            verification_status(&report(), "page-title-missing", "/settings", 0, false),
+            "not_evaluated"
+        );
+    }
+    #[test]
+    fn withheld_grouped_and_incomplete_checks_do_not_clear() {
+        let mut r = report();
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, true),
+            "failed"
+        );
+        r["verification"]["checks"][0]["status"] = json!("failed");
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "failed"
+        );
+        let mut r = report();
+        r["timed_out"] = json!(true);
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
+        );
+        let mut r = report();
+        r["pages"][0]["state"] = json!("member");
+        assert_eq!(
+            verification_status(&r, "page-title-missing", "/", 0, false),
+            "inconclusive"
         );
     }
 }
