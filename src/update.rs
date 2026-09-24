@@ -525,6 +525,117 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// the SAME directory, `chmod +x`, `rename` over the current path). A checksum mismatch aborts
 /// before any of that — the installed binary is left untouched. `--check` never installs. The
 /// `--to` argument is validated by `sanitize_version` before it reaches a URL.
+/// Download `url` (a release tarball), verify it against its `.sha256` sidecar, extract `uxlint`, and
+/// install it at `dest` by atomic rename (staged next to it, so the rename can't cross filesystems).
+/// Returns the verified digest. Nothing touches `dest` unless every check passed. Shared by
+/// `uxlint update` (dest = the running binary) and the MCP supervisor's in-place upgrade (dest = a
+/// version-scoped path in the plugin's data directory).
+pub(crate) fn install_verified(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    target: &str,
+    base: &str,
+    wanted: &str,
+    dest: &Path,
+) -> Result<String> {
+    let dest_dir = dest
+        .parent()
+        .context("install destination has no parent directory")?;
+    std::fs::create_dir_all(dest_dir).context("could not create the install directory")?;
+    let tarball = http
+        .get(url)
+        .send()
+        .with_context(|| format!("download failed: {url}"))?
+        .error_for_status()
+        .with_context(|| {
+            format!("no {target} build published for uxlint {wanted} at {base}/releases/{wanted}/")
+        })?
+        .bytes()
+        .context("reading tarball body")?;
+    // Verify against the standalone `.sha256` sidecar — the same file install.sh fetches and checks.
+    let sum_url = format!("{url}.sha256");
+    let sidecar_text = http
+        .get(&sum_url)
+        .send()
+        .with_context(|| format!("checksum download failed: {sum_url}"))?
+        .text()
+        .context("reading .sha256 body")?;
+    let expected = parse_sha256_sidecar(&sidecar_text)
+        .with_context(|| format!("empty/malformed checksum file: {sum_url}"))?;
+    let actual = sha256_hex(&tarball);
+    if actual != expected {
+        bail!(
+            "checksum mismatch for {target} tarball — expected {expected}, got {actual}. \
+             Not installing; the currently installed binary is untouched."
+        );
+    }
+    // Extract via the system `tar` — the same tool install.sh assumes. The ONLY code from this
+    // tarball that ever runs is `uxlint` itself, after it has been moved into place.
+    let work_dir = std::env::temp_dir().join(format!(
+        "uxlint-update-{}-{}",
+        std::process::id(),
+        unix_now()
+    ));
+    std::fs::create_dir_all(&work_dir)
+        .context("could not create a scratch directory to extract into")?;
+    let tarball_path = work_dir.join(format!("uxlint-{target}.tar.gz"));
+    std::fs::write(&tarball_path, &tarball)
+        .context("could not write tarball to scratch directory")?;
+    let status = std::process::Command::new("tar")
+        .args([
+            "xzf",
+            tarball_path.to_str().unwrap_or_default(),
+            "-C",
+            work_dir.to_str().unwrap_or_default(),
+            "uxlint",
+        ])
+        .status()
+        .context("'tar' is required to extract the release but was not found on PATH")?;
+    anyhow::ensure!(
+        status.success(),
+        "tar extraction failed (unexpected tarball layout)"
+    );
+    let extracted = work_dir.join("uxlint");
+    anyhow::ensure!(
+        extracted.is_file(),
+        "extracted archive has no 'uxlint' binary — unexpected tarball layout"
+    );
+    // Atomic replace: stage NEXT TO the destination (same filesystem), chmod, rename. Renaming over a
+    // running binary is fine on Unix — the process keeps its already-open inode.
+    let tmp_path = dest_dir.join(format!(".uxlint-update-{}.tmp", std::process::id()));
+    std::fs::copy(&extracted, &tmp_path)
+        .context("could not stage the new binary next to the destination")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .context("could not mark the new binary executable")?;
+    }
+    std::fs::rename(&tmp_path, dest).context("could not move the new binary into place")?;
+    let _ = std::fs::remove_dir_all(&work_dir);
+    Ok(actual)
+}
+
+/// Install uxlint `version` (verified) at `dest` — the MCP supervisor's entry point, which has a
+/// version and a place to put it, and nothing else.
+pub(crate) fn install_version_at(version: &str, dest: &Path) -> Result<()> {
+    let target = current_target()?;
+    let origin = update_origin();
+    let base = origin.trim_end_matches('/').to_string();
+    let wanted =
+        sanitize_version(version).with_context(|| format!("not a version: {version:?}"))?;
+    let url = asset_url(&base, &update_repo(), target, Some(&wanted));
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    install_verified(&http, &url, target, &base, &wanted, dest).map(|_| ())
+}
+
+/// `a` is a strictly newer version than `b` (prerelease suffixes ignored, as everywhere here).
+pub(crate) fn version_newer(a: &str, b: &str) -> bool {
+    is_newer(b, a)
+}
+
 pub(crate) fn run_update(check_only: bool, to: Option<&str>) -> Result<()> {
     let target = current_target()?;
     let origin = update_origin();
@@ -557,11 +668,8 @@ pub(crate) fn run_update(check_only: bool, to: Option<&str>) -> Result<()> {
             (latest, url)
         }
     };
-    // The old self-hosted channel published a second, inline copy of each digest in latest.json,
-    // which this code cross-checked against the sidecar. GitHub Releases publishes one `.sha256`
-    // per asset and nothing else, so there is no second copy to disagree with — the sidecar is the
-    // digest, and it is still verified before anything touches disk.
-    let inline_sha: Option<String> = None;
+    // GitHub Releases publishes one `.sha256` per asset, so the sidecar IS the digest, verified in
+    // `install_verified` before anything touches disk.
     let pinned = to.is_some();
 
     if !install_needed(CARGO_PKG_VERSION, &wanted, pinned) {
@@ -593,95 +701,8 @@ pub(crate) fn run_update(check_only: bool, to: Option<&str>) -> Result<()> {
     }
 
     println!("uxlint update: downloading {wanted} ({target}) from {origin}");
-    let tarball = http
-        .get(&url)
-        .send()
-        .with_context(|| format!("download failed: {url}"))?
-        .error_for_status()
-        .with_context(|| {
-            format!("no {target} build published for uxlint {wanted} at {base}/releases/{wanted}/")
-        })?
-        .bytes()
-        .context("reading tarball body")?;
-
-    // Verify against the standalone `.sha256` sidecar (the same file install.sh fetches and
-    // checks) — not just latest.json's inline field — so a tampered tarball is caught even if
-    // latest.json and the sidecar disagree; either mismatch aborts.
-    let sum_url = format!("{url}.sha256");
-    let sidecar_text = http
-        .get(&sum_url)
-        .send()
-        .with_context(|| format!("checksum download failed: {sum_url}"))?
-        .text()
-        .context("reading .sha256 body")?;
-    let expected = parse_sha256_sidecar(&sidecar_text)
-        .with_context(|| format!("empty/malformed checksum file: {sum_url}"))?;
-    let actual = sha256_hex(&tarball);
-    if actual != expected {
-        bail!(
-            "checksum mismatch for {target} tarball — expected {expected}, got {actual}. \
-             Not installing; the currently installed binary is untouched."
-        );
-    }
-    if let Some(inline) = inline_sha.as_deref() {
-        if !inline.eq_ignore_ascii_case(&actual) {
-            bail!(
-                "checksum mismatch: latest.json's inline sha256 for {target} disagrees with the .sha256 \
-                 sidecar. Not installing; the currently installed binary is untouched."
-            );
-        }
-    }
+    let actual = install_verified(&http, &url, target, &base, &wanted, &current_exe)?;
     println!("uxlint update: checksum OK ({actual})");
-
-    // Extract via the system `tar` — same tool install.sh assumes is present, and the ONLY code
-    // from this tarball that ever runs is `uxlint` itself, after this process (not the tarball)
-    // has invoked it via `mv`/`rename`. No tar-parsing crate, no code execution from the archive.
-    let work_dir = std::env::temp_dir().join(format!(
-        "uxlint-update-{}-{}",
-        std::process::id(),
-        unix_now()
-    ));
-    std::fs::create_dir_all(&work_dir)
-        .context("could not create a scratch directory to extract into")?;
-    let tarball_path = work_dir.join(format!("uxlint-{target}.tar.gz"));
-    std::fs::write(&tarball_path, &tarball)
-        .context("could not write tarball to scratch directory")?;
-    let status = std::process::Command::new("tar")
-        .args([
-            "xzf",
-            tarball_path.to_str().unwrap_or_default(),
-            "-C",
-            work_dir.to_str().unwrap_or_default(),
-            "uxlint",
-        ])
-        .status()
-        .context("'tar' is required to extract the release but was not found on PATH")?;
-    anyhow::ensure!(
-        status.success(),
-        "tar extraction failed (unexpected tarball layout)"
-    );
-    let extracted = work_dir.join("uxlint");
-    anyhow::ensure!(
-        extracted.is_file(),
-        "extracted archive has no 'uxlint' binary — unexpected tarball layout"
-    );
-
-    // Atomic replace: write to a temp file NEXT TO the running binary (same filesystem, so the
-    // final rename is atomic), chmod it executable, then rename over the current path. Renaming
-    // over a running binary is fine on Unix — the process keeps its already-open inode; the next
-    // invocation resolves the new directory entry.
-    let tmp_path = exe_dir.join(format!(".uxlint-update-{}.tmp", std::process::id()));
-    std::fs::copy(&extracted, &tmp_path)
-        .context("could not stage the new binary next to the running one")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
-            .context("could not mark the new binary executable")?;
-    }
-    std::fs::rename(&tmp_path, &current_exe).context("could not replace the running binary")?;
-    let _ = std::fs::remove_dir_all(&work_dir);
-
     println!(
         "uxlint update: {CARGO_PKG_VERSION} → {wanted} installed at {}",
         current_exe.display()

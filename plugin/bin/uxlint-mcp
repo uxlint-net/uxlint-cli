@@ -13,6 +13,18 @@ set -euo pipefail
 
 log() { printf 'uxlint: %s\n' "$*" >&2; }
 
+# Start `$1` as the MCP supervisor (step 5 below) when it has one. A build older than the supervisor
+# — the fallback in step 4 can land on one while a release is still building — rejects the flag
+# outright, so it runs as a plain server instead: no in-place upgrades, but a working session.
+serve() {
+	local bin="$1"
+	shift
+	if "$bin" mcp --help 2>/dev/null | grep -q -- '--supervise'; then
+		exec "$bin" mcp --supervise "$@"
+	fi
+	exec "$bin" mcp "$@"
+}
+
 # 1. An explicit override wins — a developer testing a local build.
 if [ -n "${UXLINT_BIN:-}" ] && [ -x "${UXLINT_BIN}" ]; then
 	exec "${UXLINT_BIN}" mcp "$@"
@@ -36,7 +48,7 @@ if command -v uxlint >/dev/null 2>&1; then
 	have="$(uxlint --version 2>/dev/null | awk '{print $2}')"
 	newest="$(printf '%s\n%s\n' "$have" "$version" | sort -V 2>/dev/null | tail -1)"
 	if [ -z "$version" ] || [ "$have" = "$version" ] || [ "$newest" = "$have" ]; then
-		exec uxlint mcp "$@"
+		serve "$(command -v uxlint)" "$@"
 	fi
 	log "uxlint ${have:-?} on PATH is older than this plugin's $version — using the pinned build instead"
 fi
@@ -83,4 +95,9 @@ if [ ! -x "$bin" ]; then
 	fi
 fi
 
-exec "$bin" mcp "$@"
+# 5. Run it as the SUPERVISOR, not the server itself. It holds this session and relays it to a child
+#    `uxlint mcp`; when Claude Code auto-updates the plugin, it installs the new version into the same
+#    data directory as step 4 and swaps the child under the live session — the old process finishes
+#    what it was doing and exits. Without it an update reached nobody until Claude was restarted, and
+#    the old process lived on until then (2026-09-24). See src/supervise.rs.
+serve "$bin" "$@"
