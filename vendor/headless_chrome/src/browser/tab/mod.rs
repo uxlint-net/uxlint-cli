@@ -165,6 +165,9 @@ pub struct Tab {
     loading_failed_handler: Arc<Mutex<HashMap<String, LoadingFailedHandler>>>,
     auth_handler: Arc<Mutex<AuthChallengeResponse>>,
     default_timeout: Arc<RwLock<Duration>>,
+    /// uxlint patch: how long ONE protocol call may wait for its answer (`None`: the browser's idle
+    /// timeout). See `Transport::call_method_within`.
+    call_timeout: Arc<RwLock<Option<Duration>>>,
     page_bindings: Arc<Mutex<FunctionBinding>>,
     event_listeners: Arc<Mutex<Vec<Arc<SyncSendEvent>>>>,
     slow_motion_multiplier: Arc<RwLock<f64>>, // there's no AtomicF64, otherwise would use that
@@ -245,6 +248,7 @@ impl Tab {
                 password: None,
             })),
             default_timeout: Arc::new(RwLock::new(Duration::from_secs(20))),
+            call_timeout: Arc::new(RwLock::new(None)),
             event_listeners: Arc::new(Mutex::new(Vec::new())),
             slow_motion_multiplier: Arc::new(RwLock::new(0.0)),
         };
@@ -514,9 +518,10 @@ impl Tab {
         C: Method + serde::Serialize + std::fmt::Debug,
     {
         trace!("Calling method: {method:?}");
-        let result = self
-            .transport
-            .call_method_on_target(self.session_id.clone(), method);
+        let within = *self.call_timeout.read().unwrap();
+        let result =
+            self.transport
+                .call_method_on_target_within(self.session_id.clone(), method, within);
         let result_string = format!("{result:?}");
         trace!(
             "Got result: {:?}",
@@ -581,6 +586,12 @@ impl Tab {
     /// # Ok(())
     /// # }
     /// ```
+    /// uxlint patch: cap how long each protocol call waits for its answer (`None` restores the
+    /// browser's idle timeout). Returns the previous cap so a caller can put it back.
+    pub fn set_call_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+        std::mem::replace(&mut *self.call_timeout.write().unwrap(), timeout)
+    }
+
     pub fn set_default_timeout(&self, timeout: Duration) -> &Self {
         let mut current_timeout = self.default_timeout.write().unwrap();
         *current_timeout = timeout;

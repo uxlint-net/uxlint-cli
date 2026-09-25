@@ -422,6 +422,60 @@ function collectSnapshot() {
 		} catch (_) { return { bytes: 0, count: 0, domNodes: 0 }; }
 	})();
 
+	// The page's requests, from the ledger the audit injects before any page script (worker.rs
+	// NET_LEDGER_JS), grouped by identical request (method + URL + body). Only groups that say
+	// something leave the page: a request made more than once, or a JSON collection whose own strings
+	// were checked against what is on screen. `rendered` is whether ANY of that collection's sampled
+	// strings is visible (text, or an alt/title/label/option/value a person would read) — null when the
+	// response landed too recently to have been rendered yet, so a slow fetch is never called unused.
+	// Paths only: the query string is someone's data, and the server needs the endpoint, not its args.
+	const net = (() => {
+		try {
+			const log = window.__uxNet;
+			if (!Array.isArray(log) || !log.length) return { requests: [], capped: false };
+			const now = performance.now();
+			const norm = (t) => (t || '').toLowerCase().replace(/\s+/g, ' ');
+			let seen = null;
+			const onScreen = () => {
+				if (seen === null) {
+					const bits = [document.body ? document.body.innerText : ''];
+					for (const e of document.querySelectorAll('[alt],[title],[aria-label],option,input,textarea')) {
+						bits.push(e.getAttribute('alt') || '', e.getAttribute('title') || '', e.getAttribute('aria-label') || '', e.value || '', e.tagName === 'OPTION' ? e.textContent : '');
+					}
+					seen = norm(bits.join(' \n '));
+				}
+				return seen;
+			};
+			const groups = new Map();
+			for (const r of log) {
+				let g = groups.get(r.k);
+				if (!g) {
+					let path = r.u, same = false;
+					try { const u = new URL(r.u); path = u.pathname + (u.search ? '?…' : ''); same = u.origin === location.origin; } catch (_) {}
+					g = { method: r.m, path, sameOrigin: same, count: 0, fails: 0, status: 0, firstMs: r.t0, lastMs: r.t0, bytes: 0, items: 0, rendered: null };
+					groups.set(r.k, g);
+				}
+				g.count++;
+				g.lastMs = r.t0;
+				if (r.s === 0 || r.s >= 400) g.fails++;
+				if (r.s >= 0) g.status = r.s;
+				g.bytes = Math.max(g.bytes, r.n || 0);
+				if (r.samples && r.samples.length >= 5 && r.tj && now - r.tj > 500) {
+					g.items = r.items;
+					const text = onScreen();
+					const hit = r.samples.some((v) => text.includes(v));
+					g.rendered = g.rendered === true || hit;
+				}
+			}
+			const requests = [...groups.values()]
+				.filter((g) => g.count >= 2 || g.rendered !== null)
+				.map((g) => ({ ...g, spanMs: Math.round(g.lastMs - g.firstMs), firstMs: Math.round(g.firstMs), lastMs: undefined }))
+				.sort((a, b) => b.count - a.count)
+				.slice(0, 20);
+			return { requests, capped: !!log.capped };
+		} catch (_) { return { requests: [], capped: false }; }
+	})();
+
 	const framework = (() => {
 		try {
 			if (document.querySelector('[ng-version]')) return 'angular';
@@ -3322,6 +3376,7 @@ function collectSnapshot() {
 		widgetLib,
 		css,
 		js,
+		net,
 		metaDescription,
 		ogTags,
 		ogImage,
