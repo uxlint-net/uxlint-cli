@@ -130,6 +130,21 @@ impl Transport {
     where
         C: Method + serde::Serialize,
     {
+        self.call_method_within(method, destination, None)
+    }
+
+    /// uxlint patch: `call_method` with its own deadline. Every call otherwise waits the browser's
+    /// whole idle timeout, so asking a tab whose page froze its renderer ANYTHING cost 30s — with no
+    /// way for a caller to ask "are you alive?" in less. `None` keeps the idle timeout.
+    pub fn call_method_within<C>(
+        &self,
+        method: C,
+        destination: MethodDestination,
+        within: Option<Duration>,
+    ) -> Result<C::ReturnObject>
+    where
+        C: Method + serde::Serialize,
+    {
         // TODO: use get_mut to get exclusive access for entire block... maybe.
         if !self.open.load(Ordering::SeqCst) {
             return Err(ConnectionClosed {}.into());
@@ -176,7 +191,8 @@ impl Transport {
             params_string.chars().take(400).collect::<String>()
         );
 
-        let response_result = util::Wait::new(self.idle_browser_timeout, Duration::from_millis(5))
+        let wait = within.map_or(self.idle_browser_timeout, |w| w.min(self.idle_browser_timeout));
+        let response_result = util::Wait::new(wait, Duration::from_millis(5))
             .until(|| response_rx.try_recv().ok());
         trace!("received response for: {} {:?}", &call_id, params_string);
         // uxlint patch: a timed-out call must unregister itself — otherwise its LATE
@@ -202,6 +218,19 @@ impl Transport {
     {
         // TODO: remove clone
         self.call_method(method, MethodDestination::Target(session_id))
+    }
+
+    /// uxlint patch: `call_method_on_target` with its own deadline — see `call_method_within`.
+    pub fn call_method_on_target_within<C>(
+        &self,
+        session_id: SessionId,
+        method: C,
+        within: Option<Duration>,
+    ) -> Result<C::ReturnObject>
+    where
+        C: Method + serde::Serialize,
+    {
+        self.call_method_within(method, MethodDestination::Target(session_id), within)
     }
 
     pub fn call_method_on_browser<C>(&self, method: C) -> Result<C::ReturnObject>

@@ -470,6 +470,86 @@ const UXLINT_HIDE_JS: &str = r#"(() => { try {
   else document.addEventListener('readystatechange', inject, { once: true });
 } catch (_) {} })();"#;
 
+// The page's own REQUEST LEDGER — every fetch/XHR it makes, recorded from before its first script
+// runs, so the collector can see three things the rendered DOM never shows (field reports,
+// 2026-08-31): the same request re-issued in a tight loop (a reactive effect whose guard reads the
+// state it writes hammered one failing endpoint thousands of times), the same request made more than
+// once per load (an effect re-running), and a collection fetched on load that nothing on the page
+// ever renders (a role-gated view fetched for every visitor). Transparent to the page: it calls the
+// real fetch / XHR and hands back the same response; a clone is read for JSON collections only.
+//
+// Only a small SAMPLE of a response's own strings is kept, and only in the page — the collector
+// reports whether any of them is on screen, never the values themselves. Dev-server traffic (HMR
+// pings, module requests) is skipped: it is tooling, not the app's data. Capped so a runaway loop
+// can't grow the ledger without bound (the cap itself is then the evidence).
+const NET_LEDGER_JS: &str = r#"(() => { try {
+  if (window.__uxNet) return;
+  const log = []; const CAP = 3000; let parsed = 0;
+  Object.defineProperty(window, '__uxNet', { value: log, enumerable: false });
+  const tooling = /\/@vite|\/@fs\/|\/@id\/|__vite|hot-update|webpack-hmr|__webpack|_next\/webpack|\/sockjs-node|livereload/;
+  const hash = (b) => { if (typeof b !== 'string' || !b) return ''; let h = 0; for (let i = 0; i < b.length && i < 4096; i++) h = (h * 31 + b.charCodeAt(i)) | 0; return String(h); };
+  // A JSON body's biggest array of objects (depth ≤ 3): its length, and up to 20 of its own
+  // distinctive strings — words a person would read, not ids, urls, dates or hashes.
+  const sample = (j) => {
+    let best = null;
+    const walk = (v, d) => { if (!v || d > 3) return; if (Array.isArray(v)) { if (v.length >= 3 && typeof v[0] === 'object' && v[0] && (!best || v.length > best.length)) best = v; v.slice(0, 5).forEach((x) => walk(x, d + 1)); } else if (typeof v === 'object') { for (const k in v) walk(v[k], d + 1); } };
+    walk(j, 0);
+    if (!best) return null;
+    const out = [];
+    for (const item of best.slice(0, 12)) {
+      if (!item || typeof item !== 'object') continue;
+      for (const k in item) {
+        const v = item[k];
+        if (typeof v !== 'string') continue;
+        const t = v.replace(/\s+/g, ' ').trim();
+        if (t.length < 4 || t.length > 80 || !/[a-z]{3}/i.test(t) || /^(https?:|\/|data:)|^[0-9a-f-]{16,}$|^\d{4}-\d\d-\d\d/i.test(t)) continue;
+        out.push(t.toLowerCase());
+        if (out.length >= 20) break;
+      }
+      if (out.length >= 20) break;
+    }
+    return { items: best.length, samples: out };
+  };
+  const record = (method, url, body) => {
+    if (log.length >= CAP) { log.capped = true; return null; }
+    let u; try { u = new URL(url, location.href).href; } catch (_) { return null; }
+    if (tooling.test(u)) return null;
+    const e = { m: (method || 'GET').toUpperCase(), u, k: '', t0: performance.now(), t1: 0, s: -1, n: 0 };
+    e.k = e.m + ' ' + u + ' ' + hash(body);
+    log.push(e); return e;
+  };
+  const take = (e, status, ctype, len, read) => {
+    e.t1 = performance.now(); e.s = status; e.n = len || 0;
+    if (status >= 200 && status < 300 && /json/i.test(ctype || '') && parsed < 30 && (len || 0) < 2e6) {
+      parsed++;
+      read().then((j) => { const r = sample(j); if (r) { e.items = r.items; e.samples = r.samples; e.tj = performance.now(); } }).catch(() => {});
+    }
+  };
+  const of = window.fetch;
+  if (of) window.fetch = function (input, init) {
+    let e = null;
+    try { const url = typeof input === 'string' ? input : (input && input.url) || String(input); e = record((init && init.method) || (input && input.method), url, init && init.body); } catch (_) {}
+    const p = of.apply(this, arguments);
+    if (e) p.then((r) => { try { const len = +r.headers.get('content-length') || 0; take(e, r.status, r.headers.get('content-type'), len, () => r.clone().json()); } catch (_) {} }, () => { e.t1 = performance.now(); e.s = 0; });
+    return p;
+  };
+  const X = window.XMLHttpRequest && XMLHttpRequest.prototype;
+  if (X) {
+    const open = X.open, send = X.send;
+    X.open = function (m, u) { try { this.__ux = [m, u]; } catch (_) {} return open.apply(this, arguments); };
+    X.send = function (body) {
+      try {
+        const a = this.__ux; const e = a && record(a[0], a[1], body);
+        if (e) this.addEventListener('loadend', () => { try {
+          const txt = (this.responseType === '' || this.responseType === 'text') ? this.responseText : null;
+          take(e, this.status, this.getResponseHeader('content-type'), txt ? txt.length : 0, () => Promise.resolve(this.responseType === 'json' ? this.response : JSON.parse(txt)));
+        } catch (_) {} });
+      } catch (_) {}
+      return send.apply(this, arguments);
+    };
+  }
+} catch (_) {} })();"#;
+
 /// Register the `.uxlint-hide` opt-out on a freshly-created tab, BEFORE it navigates, so author-
 /// tagged chrome is display:none from first paint in every capture path — the crawl, goal walks,
 /// and fix previews alike (each opens its own tab).
@@ -500,6 +580,16 @@ pub(crate) fn setup_tab(browser: &Browser, args: &AuditArgs) -> Result<TabSlot> 
     }
     // Hide author-opted-out chrome (`.uxlint-hide`) before the page paints — see UXLINT_HIDE_JS.
     hide_opted_out_chrome(&tab);
+    // Record the page's own requests from its first script on — see NET_LEDGER_JS.
+    {
+        use headless_chrome::protocol::cdp::Page::AddScriptToEvaluateOnNewDocument;
+        let _ = tab.call_method(AddScriptToEvaluateOnNewDocument {
+            source: NET_LEDGER_JS.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: Some(true),
+        });
+    }
     // The discovery pass clicks safe buttons, which include copy-to-clipboard ones —
     // grant clipboard write so the page behaves as it would for a real user (writeText
     // resolves, the "Copied" state renders) instead of stalling on a permission request.
@@ -894,6 +984,88 @@ pub(crate) struct PassShared {
     pub(crate) crawl_total: std::sync::atomic::AtomicUsize,
 }
 
+/// A route that LOADED and then failed: did it take the tab down with it? Field report, 2026-08-31: a
+/// page aborted the browser's renderer a couple of seconds after it was entered, reproducibly — the
+/// load had finished, so the load-hang check never fired, the capture errored, and the route vanished
+/// from the report as if it had never been visited. The most severe failure a page can have read as a
+/// clean audit. So on any post-load failure, ask the tab a trivial question with a short fuse: if it
+/// can't answer, the page crashed or froze it — record that for `page-hung` and give the worker a
+/// fresh tab (the dead one would fail every route after this one too).
+fn died_after_load(wk: &AuditWorker, ctx: &PassCtx, shared: &PassShared, route: &str, err: &str) {
+    let tab = wk.slot.lock().unwrap().tab.clone();
+    if responsive(&tab) {
+        return; // an ordinary error on a healthy page — not this finding
+    }
+    let crashed = crashed_error(err);
+    note!(
+        ctx.progress,
+        "  {} {route} … the page {} the browser tab after loading — replacing the tab",
+        ctx.name,
+        if crashed { "crashed" } else { "froze" }
+    );
+    shared.hung.lock().unwrap().push(json!({
+        "route": route,
+        "stage": if crashed { "crash" } else { "after-load" },
+    }));
+    if let Ok(fresh) = setup_tab(&wk.browser, ctx.args) {
+        *wk.slot.lock().unwrap() = fresh;
+    }
+}
+
+/// How long each protocol call may wait while a loaded page is asked small questions (see
+/// `audit_route`); the normal wait comes back when this drops, on every return path.
+struct PostLoadFuse<'a>(&'a headless_chrome::Tab);
+
+const POST_LOAD_CALL: std::time::Duration = std::time::Duration::from_secs(4);
+
+impl<'a> PostLoadFuse<'a> {
+    fn new(tab: &'a headless_chrome::Tab) -> Self {
+        tab.set_call_timeout(Some(POST_LOAD_CALL));
+        PostLoadFuse(tab)
+    }
+
+    /// For a navigation inside the short-fuse stretch: the normal wait while the guard lives.
+    fn full(tab: &'a headless_chrome::Tab) -> FullFuse<'a> {
+        tab.set_call_timeout(None);
+        FullFuse(tab)
+    }
+}
+
+impl Drop for PostLoadFuse<'_> {
+    fn drop(&mut self) {
+        self.0.set_call_timeout(None);
+    }
+}
+
+struct FullFuse<'a>(&'a headless_chrome::Tab);
+
+impl Drop for FullFuse<'_> {
+    fn drop(&mut self) {
+        self.0.set_call_timeout(Some(POST_LOAD_CALL));
+    }
+}
+
+/// Can the tab still answer a trivial question, within 3 seconds?
+fn responsive(tab: &headless_chrome::Tab) -> bool {
+    let before = tab.set_call_timeout(Some(std::time::Duration::from_secs(3)));
+    let alive = tab.evaluate("1", false).is_ok();
+    tab.set_call_timeout(before);
+    alive
+}
+
+/// Does a CDP error say the renderer itself died (vs. merely stopped answering)?
+fn crashed_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    [
+        "crash",
+        "target closed",
+        "session closed",
+        "inspected target navigated or closed",
+    ]
+    .iter()
+    .any(|w| e.contains(w))
+}
+
 /// Decide whether a native dialog is worth recording for the native-dialog lint. alert/confirm/
 /// prompt are UI that should be a styled in-page dialog; `beforeunload` is a legitimate unsaved-
 /// changes guard (browser-owned, not restylable) and is never flagged. Message is truncated.
@@ -1022,6 +1194,9 @@ pub(crate) fn worker_loop(wk: &AuditWorker, ctx: &PassCtx, shared: &PassShared) 
                             "  {} {route} … skipped (error: {e})",
                             ctx.name
                         );
+                        // Discovery too: its dead tab would cost the next route a timeout, and the
+                        // server keeps one finding per route and stage however often it's recorded.
+                        died_after_load(wk, ctx, shared, &route, &e.to_string());
                         shared.failed.lock().unwrap().push(route.clone());
                     }
                 }
@@ -1202,6 +1377,11 @@ pub(crate) fn audit_route(
     };
     let tab = &tab;
     let logbuf = &logbuf;
+    // From here to the capture every call is a small question to a page that has loaded — answered in
+    // milliseconds by a healthy one. A page that froze its renderer after loading answered none of
+    // them, and each waited out the full navigation timeout: measured, 152s lost before the settle
+    // even noticed. A short fuse until the collector, restored however this function returns.
+    let post_load = PostLoadFuse::new(tab);
     let nav_status = || {
         tab.evaluate(
             "(performance.getEntriesByType('navigation')[0]||{}).responseStatus||0",
@@ -1223,11 +1403,13 @@ pub(crate) fn audit_route(
             );
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
-        if tab
-            .navigate_to(&url)
-            .and_then(|t| t.wait_until_navigated().map(|_| ()))
-            .is_err()
-        {
+        // A navigation, not a small question: it gets the full timeout back while it runs.
+        let renav = {
+            let _full = PostLoadFuse::full(tab);
+            tab.navigate_to(&url)
+                .and_then(|t| t.wait_until_navigated().map(|_| ()))
+        };
+        if renav.is_err() {
             return Ok(None);
         }
         status = nav_status();
@@ -1317,6 +1499,12 @@ pub(crate) fn audit_route(
                                // min 150ms so buffered shifts land), capped at 600ms.
     let tp = std::time::Instant::now();
     if tab.evaluate(SETTLE_JS, true).is_err() {
+        // A page that froze or crashed its renderer after loading fails here first — and every later
+        // call would wait out the full timeout too (measured: a minute each for settle and capture).
+        // Stop now; the caller's `died_after_load` records it.
+        if !responsive(tab) {
+            anyhow::bail!("the page stopped responding after it loaded");
+        }
         std::thread::sleep(std::time::Duration::from_millis(600)); // fallback: fixed settle
     }
     // Still LOADING? A client-rendered page can settle its layout while it still shows its loading
@@ -1363,6 +1551,7 @@ pub(crate) fn audit_route(
             serde_json::json!({ "route": route, "layoutSkeleton": skel }),
         ));
     }
+    drop(post_load); // the collector walks the whole DOM — a big page needs the full timeout
     let tp = std::time::Instant::now();
     let result = tab.evaluate(ctx.collector, false)?;
     add_ms(&shared.t_capture, tp);
@@ -2067,6 +2256,22 @@ mod capture_retry_tests {
         assert!(!capture_looks_unrendered(&json!({"count": 1})));
         assert!(!capture_looks_unrendered(
             &json!({"elements": [{"tag": "h1"}]})
+        ));
+    }
+}
+
+#[cfg(test)]
+mod died_after_load_tests {
+    use super::crashed_error;
+
+    /// A dead renderer and a frozen one are different advice (find the crash vs. find the loop), so
+    /// the CDP error decides which the finding says.
+    #[test]
+    fn a_dead_renderer_is_told_apart_from_a_frozen_one() {
+        assert!(crashed_error("Target crashed"));
+        assert!(crashed_error("Inspected target navigated or closed"));
+        assert!(!crashed_error(
+            "The event waited for never came (timeout after 3s)"
         ));
     }
 }
