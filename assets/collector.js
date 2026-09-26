@@ -651,7 +651,7 @@ function collectSnapshot() {
 	const headingEls = []; // DOM node per section, parallel to `sections`, for structural attribution
 	try {
 		let cur = null;
-		for (const el of document.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,dl,table,pre,figure,img,svg,canvas,iframe,video,progress,meter,[role="progressbar"],[role="meter"],input,select,textarea,button')) {
+		for (const el of document.querySelectorAll('h1,h2,h3,h4,p,li,blockquote,dl,table,pre,figure,img,svg,canvas,iframe,video,progress,meter,[role="progressbar"],[role="meter"],input,select,textarea,button,a[href]')) {
 			// Only what's actually RENDERED is part of the page's outline. A closed <dialog> (and any
 			// display:none subtree) still holds its markup, and innerText falls back to textContent for
 			// unrendered nodes — so without this a modal's heading joins every page's section list and
@@ -663,19 +663,29 @@ function collectSnapshot() {
 				if (sections.length >= 60) break;
 				const t = redactSecrets((el.innerText || '').trim());
 				if (!t) continue;
-				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false, card: false, buttons: 0 };
+				cur = { level: +el.tagName[1], text: t.slice(0, 80), id: el.id || '', words: 0, gist: '', hasMedia: false, card: false, buttons: 0, action: null };
 				sections.push(cur);
 				headingEls.push(el);
 			} else if (cur && (tag === 'PROGRESS' || tag === 'METER' || el.matches('[role="progressbar"],[role="meter"]'))) {
 				// A gauge/progress meter (storage used, quota, completion) IS the section's content —
 				// a "Storage" heading over a usage bar keeps its promise even with no prose words.
 				cur.hasMedia = true;
+			} else if (cur && tag === 'A') {
+				// A LINK is an action like a button — a "Recent renders" heading over linked rows, each a
+				// name and a status chip ("Fully rendered", "Not started"), is a list whose rows are the
+				// content; counting only the <li> words (two rows, six words) called it empty (field
+				// report, 2026-09-26). Not a link inside prose (its sentence is already counted), in
+				// site chrome (a footer's links would otherwise pad the page's last section), or one
+				// wrapping the next card's heading (that belongs to the section it opens).
+				if (el.closest('p, nav, header, footer, [role="navigation"], [role="contentinfo"]') || el.querySelector('h1,h2,h3,h4')) continue;
+				if (!cur.action) cur.action = el;
+				if (++cur.buttons >= 2) cur.hasMedia = true;
 			} else if (cur && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(tag)) {
 				// CONTROLS are a section's content too — an "Account" heading over its fields, a "Cast
 				// in this scene" heading over a row of chips. Word count under the heading is the wrong
 				// measure there (field report, 2026-09-24: section-empty on form sections and item rows).
-				// One real field is content; buttons only as a group, so a lone action isn't a section.
-				if (tag === 'BUTTON') { if (++cur.buttons >= 2) cur.hasMedia = true; }
+				// One real field is content; actions as a group — or ONE beside a fact, see `factBesideAction`.
+				if (tag === 'BUTTON') { if (!cur.action) cur.action = el; if (++cur.buttons >= 2) cur.hasMedia = true; }
 				else if (!(tag === 'INPUT' && /^(hidden|submit|button|reset)$/i.test(el.type || ''))) cur.hasMedia = true;
 			} else if (cur && /^(DL|TABLE|PRE|FIGURE|IMG|SVG|CANVAS|IFRAME|VIDEO)$/.test(tag)) {
 				// A section's content can be a list, table, code block, figure, image or diagram — not
@@ -690,8 +700,26 @@ function collectSnapshot() {
 				if (cur.gist.length < 400) cur.gist += t.slice(0, 400 - cur.gist.length) + ' ';
 			}
 		}
-		for (const sec of sections) { sec.gist = sec.gist.trim(); delete sec.buttons; }
+		sections.forEach((sec, i) => {
+			if (!sec.hasMedia && sec.action) sec.hasMedia = factBesideAction(headingEls[i], sec.action);
+			sec.gist = sec.gist.trim();
+			delete sec.buttons;
+			delete sec.action; // a DOM node — never serialised
+		});
 	} catch (_) { /* ignore */ }
+	// A SHORT FACT PLUS AN ACTION is a complete section: "Payment method" over "Visa •••• 4242" and
+	// an Update button, a plan card saying "Free · 3 of 5 sites" beside "Manage billing" (field report,
+	// 2026-09-26). The fact is rarely a <p> — a card puts it in a <div> or <span> the word count never
+	// sees — so read it off the heading's OWN container: the nearest ancestor holding both heading and
+	// action, provided it holds no other heading (else it's a page region, not this section's card).
+	// A heading over a lone button with nothing to say beside it still counts as empty.
+	function factBesideAction(h, act) {
+		let box = h.parentElement;
+		for (let up = 0; box && up < 4 && !box.contains(act); up++) box = box.parentElement;
+		if (!box || box === document.body || !box.contains(act) || box.querySelectorAll('h1,h2,h3,h4').length > 1) return false;
+		const rest = (box.innerText || '').replace(h.innerText || '', '').replace(act.innerText || '', '');
+		return /[\p{L}\p{N}]{2,}/u.test(rest);
+	}
 
 	// Is a heading a section PROMISE, or just the LABEL on one repeated item? A card title in a grid
 	// ("Ada Lovelace" over a profession and a ruleset chip) promises nothing — the card beside it says
@@ -891,6 +919,13 @@ function collectSnapshot() {
 	function pointClippedOut(cx, cy, clips) {
 		return clips.some((c) => cx < c.left || cx > c.right || cy < c.top || cy > c.bottom);
 	}
+	// Can the page scroll a control whose bottom edge is at `ctrlBottom` up clear of `bar` — a pinned
+	// bar along the viewport's BOTTOM edge (not a full-height rail: its top is in the lower half) —
+	// given `room` px of scroll left below? Plain data in, so it's exercised without a DOM; the
+	// occlusion probe below says why it asks.
+	function scrollsClearOfBottomBar(bar, ctrlBottom, vh, room) {
+		return bar.bottom >= vh - 2 && bar.top > vh / 2 && room >= ctrlBottom - bar.top;
+	}
 	// Is this element's own subtree COLLAPSED — inside a closed <details>, or under a
 	// content-visibility:hidden ancestor a custom disclosure uses for the same effect? Takes the
 	// ancestor chain as plain data (tag, open, content-visibility) so it can be exercised without a
@@ -940,6 +975,23 @@ function collectSnapshot() {
 	// prevents those element findings and palette contributions. Same WeakSet trick as
 	// `floatingSet` above: document order means a child sees its ancestor's tag without a parent walk.
 	const ignoredSet = new WeakSet();
+	// VISUALLY HIDDEN subtrees — the screen-reader-only CLIP. The classic sr-only rule also shrinks
+	// the box to 1×1, which geometry shows the server; the sr-only-until-FOCUSED skip link does not:
+	// its `px-4 py-2` outweighs the rule's `padding: 0`, so its box measures 32×16 while `clip` paints
+	// none of it. Field report, 2026-09-26: `occluded-control` (the hit test at its centre lands on
+	// the header beneath the clip) and `text-clipping` (nowrap text overflowing a clipped box) both
+	// fired on a "Skip to content" link. Read the clip itself; a child inherits it, as with
+	// `floatingSet` above.
+	const srOnlySet = new WeakSet();
+	function clippedToNothing(cs) {
+		// `clip` applies only to absolutely positioned boxes; computed as `rect(0px, 0px, 0px, 0px)`.
+		if ((cs.position === 'absolute' || cs.position === 'fixed') && /^rect\(/.test(cs.clip)) {
+			const [t, r, b, l] = cs.clip.slice(5, -1).split(/[\s,]+/).map(parseFloat);
+			if (r - l <= 1 || b - t <= 1) return true;
+		}
+		// The modern spelling (Tailwind v4, Bootstrap 5.3): `clip-path: inset(50%)` meets in the middle.
+		return /^inset\((50|100)%\)$/.test(cs.clipPath);
+	}
 	let motionEls = 0; // elements with a non-zero animation/transition duration
 	const nodes = document.body.querySelectorAll('*');
 	let n = 0;
@@ -967,6 +1019,8 @@ function collectSnapshot() {
 			cs.position === 'sticky' ||
 			(el.parentElement !== null && floatingSet.has(el.parentElement));
 		if (inFloating) floatingSet.add(el);
+		const srOnly = (el.parentElement !== null && srOnlySet.has(el.parentElement)) || clippedToNothing(cs);
+		if (srOnly) srOnlySet.add(el);
 		const rect = el.getBoundingClientRect();
 
 		let text = '';
@@ -1254,6 +1308,26 @@ function collectSnapshot() {
 						occluded = false;
 						break;
 					}
+				}
+			}
+			// The mirror image, at ANY scroll position: a bar pinned to the viewport's BOTTOM edge (a
+			// mobile tab bar, an action bar) covers whatever the first screen ends on, and the page
+			// scrolls that content up past it — which is what bottom padding is for. Field report,
+			// 2026-09-26: list-row controls under a fixed bottom tab bar, reported covered at the
+			// initial scroll position, fully usable one flick later. Rather than scroll the page mid-
+			// capture to look, ask the document: is there enough scroll left below to lift the
+			// control's bottom edge above the bar's top? Then the cover is where we happened to look.
+			// The last row of a page with NO room for it — stuck under the bar however far you
+			// scroll — is the real defect, and still fires. (A top bar at scrollY 0 is not mirrored:
+			// nothing scrolls a control down from under a header that the page starts beneath.)
+			if (occluded) {
+				for (let a = top; a && a !== document.body; a = a.parentElement) {
+					const ap = getComputedStyle(a).position;
+					if (ap !== 'fixed' && ap !== 'sticky') continue;
+					const se = document.scrollingElement || document.documentElement;
+					const room = se.scrollHeight - window.innerHeight - window.scrollY;
+					if (scrollsClearOfBottomBar(a.getBoundingClientRect(), orect.bottom, vh, room)) occluded = false;
+					break; // the nearest pinned ancestor is the bar that covers it
 				}
 			}
 		}
@@ -1643,6 +1717,8 @@ function collectSnapshot() {
 			nearLabelOwner,
 			iconOnly,
 			ariaHidden,
+			// Sparse: the server reads an absent key as false (see `srOnlySet`).
+			srOnly: srOnly || undefined,
 			radius: parseFloat(cs.borderTopLeftRadius) || 0,
 			borderW: cs.borderTopStyle !== 'none' ? parseFloat(cs.borderTopWidth) || 0 : 0,
 			borderBW: cs.borderBottomStyle !== 'none' ? parseFloat(cs.borderBottomWidth) || 0 : 0,

@@ -464,6 +464,12 @@ pub(crate) const TARGETS_JS: &str = r##"(() => {
   for (const el of candidates) {
     if (el.closest('[aria-hidden="true"]')) continue;
     if (el.getAttribute('aria-current') !== null || el.getAttribute('role') === 'tab' || el.disabled === true) continue;
+    // The CURRENTLY SELECTED option — the active segment of a segmented control, the chosen thumbnail
+    // in a picker (its state often on the option wrapping it) — already wears a selected style, and
+    // clicking it does nothing, so no hover change is owed. Field report, 2026-09-26:
+    // state-hover-feedback on exactly those two. Skipping it also spends the 18-target budget on
+    // the options that DO owe one.
+    if (el.closest('[aria-selected="true"],[aria-pressed="true"],[aria-checked="true"],[aria-current]:not([aria-current="false"])')) continue;
     const key = el.tagName + '|' + (el.getAttribute('class') || '');
     if (seen.has(key)) continue;
     const r = el.getBoundingClientRect();
