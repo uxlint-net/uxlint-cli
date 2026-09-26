@@ -478,13 +478,15 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                     walk_page_sink.lock().unwrap().append(&mut pages);
                 }
             };
-            // One walk → its goal outcome (None if it couldn't run — e.g. a role task with no login page).
+            // One walk → its goal outcome, or WHY it couldn't run. That used to be `None`, printed
+            // always as "no login page for this persona" — so a walk that errored for any other reason
+            // (anonymous ones included, which need no login) said something false and hid the cause.
             let run_one = |goal: &str,
                            expect: &str,
                            importance: &str,
                            persona: &str,
                            viewport: &str|
-             -> Option<Value> {
+             -> Result<Value, String> {
                 let mk =
                     |base: String,
                      headers: Vec<String>,
@@ -508,7 +510,9 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                     // A persona task: become that persona, then pursue the goal. A form persona signs
                     // in through the login page; a session persona replays its headers/storage.
                     let wf = if p.is_form() {
-                        let url = login_url.clone()?;
+                        let url = login_url
+                            .clone()
+                            .ok_or_else(|| "no login page for this persona".to_string())?;
                         mk(
                             url.clone(),
                             Vec::new(),
@@ -528,7 +532,7 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                             stash(wp);
                             (s, h, f, lr, format!("a signed-in {}", p.name))
                         }
-                        Err(_) => return None,
+                        Err(e) => return Err(e.to_string()),
                     }
                 } else if persona == "anonymous" {
                     // A logged-out visitor task: no session, from the public entry.
@@ -541,7 +545,7 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                             stash(wp);
                             (s, h, f, lr, "a logged-out visitor".to_string())
                         }
-                        Err(_) => return None,
+                        Err(e) => return Err(e.to_string()),
                     }
                 } else {
                     // Unspecified audience — a logged-out visitor first, then (if the audit holds a
@@ -551,7 +555,7 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                         &mk(args.base.clone(), Vec::new(), Vec::new(), None),
                         progress,
                     )
-                    .ok()?;
+                    .map_err(|e| e.to_string())?;
                     stash(wp0);
                     let mut who = "a logged-out visitor".to_string();
                     if !s && was_authed && !past_deadline() {
@@ -573,61 +577,107 @@ pub(crate) fn run_tests(input: TestRunInputs) -> TestRunOutcome {
                     }
                     (s, h, f, lr, who)
                 };
-                Some(json!({
+                Ok(json!({
                     "test": goal, "importance": importance, "viewport": viewport,
                     "outcome": if success { "success" } else { "lost" },
                     "hops": hops, "flow_url": flow_url, "surface": surface,
                     "lost_reason": lost_reason,
                 }))
             };
+            // A plan refusal (the server's 402 — goal walks need a paid plan) is the same answer for
+            // every walk, so the first one stops the rest instead of each opening a browser to hear it
+            // again: all 18 walks of a free-plan dogfood run did exactly that, 20s for nothing.
+            let refused: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
             std::thread::scope(|sc| {
                 for _ in 0..conc {
                     sc.spawn(|| loop {
+                        if refused.lock().unwrap().is_some() {
+                            break;
+                        }
                         if past_deadline() {
                             // A timeout only if walks are still UNCLAIMED — if the last one just
                             // finished a hair past the deadline, that's late, not incomplete.
                             if next.load(std::sync::atomic::Ordering::Relaxed) < walk_tasks.len() {
-                                shared.timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+                                shared
+                                    .timed_out
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             break;
                         }
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((goal, expect, importance, persona, viewport)) = walk_tasks.get(i) else {
+                        let Some((goal, expect, importance, persona, viewport)) = walk_tasks.get(i)
+                        else {
                             break;
                         };
-                        note!(progress,
+                        note!(
+                            progress,
                             "  {} {}",
-                            crate::style::Stream::Err.bold(&format!("[walk {}/{}] \"{goal}\"", i + 1, walk_tasks.len())),
+                            crate::style::Stream::Err.bold(&format!(
+                                "[walk {}/{}] \"{goal}\"",
+                                i + 1,
+                                walk_tasks.len()
+                            )),
                             crate::style::Stream::Err.dim(&format!(
                                 "({importance}, {}, {viewport}) …",
-                                if persona.is_empty() { "unspecified" } else { persona.as_str() }
+                                if persona.is_empty() {
+                                    "unspecified"
+                                } else {
+                                    persona.as_str()
+                                }
                             ))
                         );
                         let outcome = run_one(goal, expect, importance, persona, viewport);
                         // Walks run CONCURRENTLY, so "done" is a completion counter,
                         // not tied to start order — fed to both the stderr line and the hosted partial.
-                        let done_n = walks_done_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let done_n =
+                            walks_done_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if let Some(ps) = partial_state {
                             ps.note_walk_done();
                         }
                         let st = crate::style::Stream::Err;
                         match outcome {
-                            Some(o) => {
+                            Ok(o) => {
                                 let reached = o["outcome"] == "success";
                                 let hops = o["hops"].as_u64().unwrap_or(0);
-                                note!(progress, "  {} walk {done_n}/{} \"{goal}\" — {} in {hops} hop(s)",
-                                    if reached { st.green("✓") } else { st.red("✖") },
+                                note!(
+                                    progress,
+                                    "  {} walk {done_n}/{} \"{goal}\" — {} in {hops} hop(s)",
+                                    if reached {
+                                        st.green("✓")
+                                    } else {
+                                        st.red("✖")
+                                    },
                                     walk_tasks.len(),
                                     if reached { "reached" } else { "lost" },
                                 );
                                 outcomes.lock().unwrap().push(o);
                             }
-                            None => note!(progress, "  {} walk {done_n}/{} \"{goal}\" — couldn't run (no login page for this persona)",
-                                st.yellow("·"), walk_tasks.len()),
+                            Err(why) => {
+                                note!(
+                                    progress,
+                                    "  {} walk {done_n}/{} \"{goal}\" — couldn't run ({why})",
+                                    st.yellow("·"),
+                                    walk_tasks.len()
+                                );
+                                if why.contains("step failed: 402") {
+                                    refused.lock().unwrap().get_or_insert(why);
+                                }
+                            }
                         }
                     });
                 }
             });
+            if let Some(why) = refused.into_inner().unwrap() {
+                let ran = walks_done_ctr.load(std::sync::atomic::Ordering::Relaxed);
+                if ran < walk_tasks.len() {
+                    note!(
+                        progress,
+                        "  {} the other {} walk(s) skipped — the server refused them ({why})",
+                        crate::style::Stream::Err.yellow("·"),
+                        walk_tasks.len() - ran
+                    );
+                }
+            }
             test_outcomes = outcomes.into_inner().unwrap();
             walk_pages = walk_page_sink.into_inner().unwrap();
         }

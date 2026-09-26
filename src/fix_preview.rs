@@ -509,6 +509,131 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
         return Ok(0);
     }
 
+    let (browser, tab) = open_preview_browser(args)?;
+    // Process desktop findings then mobile ones. Capture at a viewport TALLER than the layout height
+    // (fx.vh) so a target low on the page renders into frame; the extra height is just headroom below
+    // the fold, and the annotation's clip keeps the crop tight around the element regardless.
+    let cap_h = |vh: f64| vh + CAPTURE_PAD;
+    // Per viewport, grow the capture surface to reach the LOWEST element on any page (capped so a
+    // pathological rect can't blow up memory). One resize per viewport, not per finding.
+    let mut max_h: HashMap<String, f64> = HashMap::new();
+    for fx in &fixes {
+        let e = max_h.entry(fx.vp.clone()).or_insert(0.0);
+        *e = e.max(cap_h(fx.vh).max(fx.y + fx.h + 200.0)).min(10000.0);
+    }
+    // PARALLEL, one page per navigation. Previews were the slowest phase of an audit — 95s of a 2:39
+    // dogfood run (2026-09-26), longer than the crawl, tests and server together — because every
+    // finding was shot on ONE tab, each after a fresh navigation and a fixed settle, even when the
+    // previous finding was on the same page. Now findings are grouped by (viewport, route), the groups
+    // are spread over a few tabs of this browser (cookies and storage — the sign-in above — are shared
+    // by every tab), and a page is reloaded only when the last shot left it changed.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let lanes = plan_lanes(&fixes, cores.clamp(1, PREVIEW_TABS));
+    // One BROWSER per lane, not a tab: tabs share a browser's six connections per host, and an app
+    // that holds a live stream open on every page (see `worker::base_chrome_flags`) fills them with
+    // six tabs. The first lane reuses the browser opened above; the rest open their own in parallel.
+    let first = (browser, tab);
+    let mut shots: Vec<Shot> = std::thread::scope(|sc| {
+        let fixes = &fixes;
+        let max_h = &max_h;
+        let mut handles = Vec::new();
+        let mut lanes_it = lanes.iter();
+        if let Some(lane) = lanes_it.next() {
+            let (_b, t) = &first;
+            handles.push(sc.spawn(move || shoot_lane(t, args, fixes, lane, max_h)));
+        }
+        for lane in lanes_it {
+            handles.push(sc.spawn(move || match open_preview_browser(args) {
+                Ok((_b, t)) => shoot_lane(&t, args, fixes, lane, max_h),
+                Err(e) => {
+                    eprintln!("  warning: a preview browser failed to start ({e}) — its findings will have no preview");
+                    Vec::new()
+                }
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    shots.sort_by_key(|s| s.idx);
+    let mut previews: Vec<Value> = Vec::new();
+    // Content-hash of every image we've already buffered → the finding-key that carries its bytes.
+    // A page-wide/absence finding falls back to the whole-viewport rect (server rules.rs), so many
+    // findings render the SAME full-page crop. Rather than hold and upload that identical image once
+    // per finding — the report can have 100+ findings — we hash each capture and, on a repeat, buffer
+    // a tiny reference instead of the bytes. Bounds both this process's memory and the upload to the
+    // set of DISTINCT images; the server stores one blob and points the duplicates' keys at it.
+    let mut seen_content: HashMap<[u8; 32], String> = HashMap::new();
+    for Shot {
+        key: fx_key,
+        before,
+        after,
+        w: cw,
+        h: ch,
+        ..
+    } in shots
+    {
+        use base64::Engine;
+        // Fingerprint the exact bytes (before, then after — with a separator so a byte shifting across
+        // the boundary can't collide two distinct pairs). SHA-256 makes a false duplicate — which would
+        // show the wrong image — astronomically unlikely.
+        let digest: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(&before);
+            h.update([0u8]);
+            h.update(&after);
+            h.finalize().into()
+        };
+        if let Some(src_key) = seen_content.get(&digest) {
+            // Identical to an image we've already buffered: reference it, drop these bytes. `has_after`
+            // travels so the server's row matches the shared blob (before-only vs before/after).
+            previews.push(json!({
+                "key": fx_key, "same_as": src_key, "has_after": !after.is_empty(), "w": cw, "h": ch,
+            }));
+        } else {
+            seen_content.insert(digest, fx_key.clone());
+            let enc = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+            previews.push(
+                json!({ "key": fx_key, "before": enc(before), "after": enc(after), "w": cw, "h": ch }),
+            );
+        }
+    }
+    if previews.is_empty() {
+        return Ok(0);
+    }
+    let n = previews.len();
+    let http = reqwest::blocking::Client::new();
+    let _ = http
+        .post(format!("{}/v1/reports/{}/previews", cli.server, id))
+        .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
+        .json(&previews)
+        .send();
+    Ok(n)
+}
+
+/// Dismiss any native dialog the page opens (alert/confirm/prompt/beforeunload), as the audit's own
+/// tabs do (`worker::setup_tab`): a dialog left open blocks the renderer, and every later call on the
+/// tab — the next finding's navigation included — waits out its timeout.
+fn dismiss_dialogs(tab: &std::sync::Arc<headless_chrome::Tab>) {
+    use headless_chrome::protocol::cdp::types::Event;
+    let weak = std::sync::Arc::downgrade(tab);
+    let _ = tab.add_event_listener(std::sync::Arc::new(move |e: &Event| {
+        if let Event::PageJavascriptDialogOpening(_) = e {
+            if let Some(tab) = weak.upgrade() {
+                let _ = tab.get_dialog().dismiss();
+            }
+        }
+    }));
+}
+
+/// A signed-in browser and tab for shooting previews: the same headers, storage and form login the
+/// audit browser used, so gated routes render as the audit saw them.
+fn open_preview_browser(
+    args: &AuditArgs,
+) -> Result<(Browser, std::sync::Arc<headless_chrome::Tab>)> {
     let browser = Browser::new(
         LaunchOptions::default_builder()
             .headless(true)
@@ -529,6 +654,7 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
     .with_context(missing_browser_message)?;
     let tab = browser.new_tab()?;
     crate::worker::hide_opted_out_chrome(&tab);
+    dismiss_dialogs(&tab);
     if !args.headers.is_empty() {
         let mut hdrs = HashMap::new();
         for hd in &args.headers {
@@ -579,6 +705,64 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
         }
     }
 
+    Ok((browser, tab))
+}
+
+/// Split findings into lanes of whole pages: each (viewport, route) group stays in one lane — so a
+/// page is loaded once for all its findings — biggest page first onto the least-loaded lane, and each
+/// lane ordered by (viewport, route) so its tab resizes once per viewport. At most `max` lanes, and
+/// never more lanes than pages.
+fn plan_lanes(fixes: &[Fix], max: usize) -> Vec<Vec<usize>> {
+    let mut by_page: Vec<((String, String), Vec<usize>)> = Vec::new();
+    for (i, fx) in fixes.iter().enumerate() {
+        let k = (fx.vp.clone(), fx.route.clone());
+        match by_page.iter_mut().find(|(pk, _)| *pk == k) {
+            Some((_, v)) => v.push(i),
+            None => by_page.push((k, vec![i])),
+        }
+    }
+    let n = max.max(1).min(by_page.len());
+    let mut lanes: Vec<Vec<usize>> = vec![Vec::new(); n];
+    by_page.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    for (_, g) in by_page {
+        if let Some(lane) = lanes.iter_mut().min_by_key(|l| l.len()) {
+            lane.extend(g);
+        }
+    }
+    for lane in &mut lanes {
+        lane.sort_by(|&a, &b| {
+            (&fixes[a].vp, &fixes[a].route, a).cmp(&(&fixes[b].vp, &fixes[b].route, b))
+        });
+    }
+    lanes
+}
+
+/// How many browsers the preview pass shoots with at once (bounded by the machine's cores) — one lane each.
+const PREVIEW_TABS: usize = 6;
+
+/// One finding's captured crop(s), tagged with its index in the pass's finding list so the results
+/// of parallel lanes can be put back in a stable order before deduplication.
+#[derive(Default)]
+struct Shot {
+    idx: usize,
+    key: String,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    w: f64,
+    h: f64,
+}
+
+/// Shoot one lane of findings on one tab — sorted by (viewport, route), so a page is loaded once for
+/// all of its findings. The page is reloaded only when it may no longer be the page the audit saw: a
+/// fix patch or copy rewrite mutated it (and the "after" annotation stays drawn), or the window was
+/// resized for a floating target.
+fn shoot_lane(
+    tab: &headless_chrome::Tab,
+    args: &AuditArgs,
+    fixes: &[Fix],
+    lane: &[usize],
+    max_h: &HashMap<String, f64>,
+) -> Vec<Shot> {
     let clip = |x: f64, y: f64, w: f64, h: f64| Viewport {
         x,
         y,
@@ -595,39 +779,20 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
         tab.capture_screenshot(CaptureScreenshotFormatOption::Jpeg, Some(82), Some(c), true)
             .ok()
     };
-
-    // Process desktop findings then mobile ones, resizing the window once per viewport switch;
-    // reload the page per finding so a patch doesn't leak into the next capture.
-    let mut order: Vec<&Fix> = fixes.iter().collect();
-    order.sort_by(|a, b| a.vp.cmp(&b.vp).then(a.route.cmp(&b.route)));
+    let mut out = Vec::new();
     let mut cur_vp = String::new();
-    let mut previews: Vec<Value> = Vec::new();
-    // Content-hash of every image we've already buffered → the finding-key that carries its bytes.
-    // A page-wide/absence finding falls back to the whole-viewport rect (server rules.rs), so many
-    // findings render the SAME full-page crop. Rather than hold and upload that identical image once
-    // per finding — the report can have 100+ findings — we hash each capture and, on a repeat, buffer
-    // a tiny reference instead of the bytes. Bounds both this process's memory and the upload to the
-    // set of DISTINCT images; the server stores one blob and points the duplicates' keys at it.
-    let mut seen_content: HashMap<[u8; 32], String> = HashMap::new();
-    // Capture at a viewport TALLER than the layout height (fx.vh) so a target low on the page
-    // renders into frame; the extra height is just headroom below the fold, and the annotation's
-    // clip keeps the crop tight around the element regardless.
-    let cap_h = |vh: f64| vh + CAPTURE_PAD;
-    // Per viewport, grow the capture surface to reach the LOWEST element on any page (capped so a
-    // pathological rect can't blow up memory). One resize per viewport, not per finding.
-    let mut max_h: HashMap<String, f64> = HashMap::new();
-    for fx in &order {
-        let e = max_h.entry(fx.vp.clone()).or_insert(0.0);
-        *e = e.max(cap_h(fx.vh).max(fx.y + fx.h + 200.0)).min(10000.0);
-    }
     let mut cur_h = 0.0_f64;
     // A floating finding (below) shrinks the window to viewport height for its own shot; this flag
     // makes the NEXT finding restore the tall surface before it navigates, so one floating target
     // can't leave a later below-the-fold target rendering into a too-short window.
     let mut shrunk = false;
-    for fx in order {
+    // What this tab is showing, and whether it's still pristine.
+    let mut loaded: Option<(String, String)> = None;
+    let mut dirty = false;
+    for &idx in lane {
+        let fx = &fixes[idx];
         if fx.vp != cur_vp {
-            cur_h = *max_h.get(&fx.vp).unwrap_or(&cap_h(fx.vh));
+            cur_h = *max_h.get(&fx.vp).unwrap_or(&(fx.vh + CAPTURE_PAD));
             let _ = tab.set_bounds(headless_chrome::types::Bounds::Normal {
                 left: None,
                 top: None,
@@ -637,6 +802,7 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
             std::thread::sleep(std::time::Duration::from_millis(200));
             cur_vp = fx.vp.clone();
             shrunk = false;
+            dirty = true;
         } else if shrunk {
             let _ = tab.set_bounds(headless_chrome::types::Bounds::Normal {
                 left: None,
@@ -646,16 +812,23 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
             });
             std::thread::sleep(std::time::Duration::from_millis(200));
             shrunk = false;
+            dirty = true;
         }
-        let url = format!("{}{}", args.base.trim_end_matches('/'), fx.route);
-        if tab
-            .navigate_to(&url)
-            .and_then(|t| t.wait_until_navigated().map(|_| ()))
-            .is_err()
-        {
-            continue;
+        let here = (fx.vp.clone(), fx.route.clone());
+        if dirty || loaded.as_ref() != Some(&here) {
+            let url = format!("{}{}", args.base.trim_end_matches('/'), fx.route);
+            if tab
+                .navigate_to(&url)
+                .and_then(|t| t.wait_until_navigated().map(|_| ()))
+                .is_err()
+            {
+                loaded = None;
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            loaded = Some(here);
+            dirty = false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(600));
         // A FLOATING (fixed/sticky) target re-pins when the capture window is resized: in the tall
         // surface it sits at the bottom of ~1600px, not where the finding's viewport coords put it,
         // so its annotation box would land on empty page. Shrink to the real viewport height so it
@@ -679,6 +852,7 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 eff_h = fx.vh;
                 shrunk = true;
+                dirty = true;
             }
         }
         // Draw the architect-style dimension annotation INTO the page (baked into the pixels, so
@@ -722,11 +896,13 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
         let has_rewrite = fx.marks.contains("\"t\":\"rewrite\"");
         let mut after: Vec<u8> = Vec::new();
         if fx.fixable || has_suggest || has_rewrite {
+            // Whatever happens next draws on or patches the page: the next finding reloads it.
+            dirty = true;
             let mut ok = true;
             if fx.fixable {
                 // Apply the fix to EVERY affected element (all marks), not just the one at the centre.
                 let targets = fix_targets(&fx.marks, (fx.x + fx.w / 2.0, fx.y + fx.h / 2.0));
-                let before_m = measure(&tab, &targets);
+                let before_m = measure(tab, &targets);
                 ok = patch_js_multi(&fx.rule, &targets)
                     .and_then(|js| tab.evaluate(&js, false).ok())
                     .and_then(|r| r.value)
@@ -736,7 +912,7 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
                 // or made the control collide with a neighbour, suppress the "after" — the report
                 // shows the outlined issue alone rather than a preview that regressed the layout.
                 if ok {
-                    if let (Some(b), Some(a)) = (before_m, measure(&tab, &targets)) {
+                    if let (Some(b), Some(a)) = (before_m, measure(tab, &targets)) {
                         if a.0 > b.0 + 2.0 || a.1 > b.1 {
                             eprintln!(
                                 "  note: {} fix on {} [{}] regressed the layout (overflow/overlap) — showing the issue only, no after",
@@ -750,7 +926,7 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
             if has_rewrite {
                 // Inject each rewrite (replace `from` text with `to`) so the after shows the copy in
                 // place. If nothing else made this fixable and no rewrite landed, skip the after.
-                let rewrote = apply_rewrites(&tab, &fx.marks);
+                let rewrote = apply_rewrites(tab, &fx.marks);
                 if !fx.fixable && !has_suggest {
                     ok = rewrote;
                 }
@@ -761,48 +937,56 @@ pub(crate) fn run(cli: &Cli, args: &AuditArgs, report: &Value) -> Result<usize> 
                 after = shoot(clip(cx, cy, cw, ch)).unwrap_or_default();
             }
         }
-        use base64::Engine;
-        // Fingerprint the exact bytes (before, then after — with a separator so a byte shifting across
-        // the boundary can't collide two distinct pairs). SHA-256 makes a false duplicate — which would
-        // show the wrong image — astronomically unlikely.
-        let digest: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(&before);
-            h.update([0u8]);
-            h.update(&after);
-            h.finalize().into()
-        };
-        if let Some(src_key) = seen_content.get(&digest) {
-            // Identical to an image we've already buffered: reference it, drop these bytes. `has_after`
-            // travels so the server's row matches the shared blob (before-only vs before/after).
-            previews.push(json!({
-                "key": fx.key, "same_as": src_key, "has_after": !after.is_empty(), "w": cw, "h": ch,
-            }));
-        } else {
-            seen_content.insert(digest, fx.key.clone());
-            let enc = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
-            previews.push(
-                json!({ "key": fx.key, "before": enc(before), "after": enc(after), "w": cw, "h": ch }),
-            );
-        }
+        out.push(Shot {
+            idx,
+            key: fx.key.clone(),
+            before,
+            after,
+            w: cw,
+            h: ch,
+        });
     }
-    if previews.is_empty() {
-        return Ok(0);
-    }
-    let n = previews.len();
-    let http = reqwest::blocking::Client::new();
-    let _ = http
-        .post(format!("{}/v1/reports/{}/previews", cli.server, id))
-        .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
-        .json(&previews)
-        .send();
-    Ok(n)
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{floating_probe_js, make_fix, patch_body};
+    use super::{floating_probe_js, make_fix, patch_body, plan_lanes};
     use serde_json::json;
+
+    /// A page's findings stay together (one load serves them all), lanes stay balanced, and there are
+    /// never more lanes than pages.
+    #[test]
+    fn preview_lanes_keep_pages_whole_and_balanced() {
+        let rect = json!([10.0, 10.0, 100.0, 40.0]);
+        let fx =
+            |route: &str, vp: &str| make_fix(route, vp, "contrast", &rect, None, None).unwrap();
+        let fixes = vec![
+            fx("/a", "desktop"),
+            fx("/b", "desktop"),
+            fx("/a", "desktop"),
+            fx("/c", "mobile"),
+            fx("/a", "desktop"),
+            fx("/b", "desktop"),
+        ];
+        let lanes = plan_lanes(&fixes, 6);
+        assert_eq!(lanes.len(), 3, "three pages, three lanes: {lanes:?}");
+        for page in [("desktop", "/a"), ("desktop", "/b"), ("mobile", "/c")] {
+            let holders = lanes
+                .iter()
+                .filter(|l| {
+                    l.iter()
+                        .any(|&i| (fixes[i].vp.as_str(), fixes[i].route.as_str()) == page)
+                })
+                .count();
+            assert_eq!(holders, 1, "{page:?} split across lanes: {lanes:?}");
+        }
+        let two = plan_lanes(&fixes, 2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two.iter().map(Vec::len).sum::<usize>(), fixes.len());
+        assert!(two.iter().all(|l| l.len() == 3), "balanced: {two:?}");
+        assert!(plan_lanes(&[], 4).is_empty());
+    }
 
     #[test]
     fn make_fix_carries_a_real_selector_and_drops_whole_page_sentinels() {

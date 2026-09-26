@@ -165,6 +165,16 @@ pub(crate) fn base_chrome_flags() -> Vec<&'static std::ffi::OsStr> {
         "--disable-sync",
         "--disable-extensions",
     ];
+    // No back/forward cache. A page kept in it keeps its connections — and an app holding a live
+    // stream (server-sent events, a long poll) keeps that socket open after we've navigated away.
+    // Chrome allows six HTTP/1.1 connections per host, shared by every tab in a browser, so after
+    // six such pages every request to the site queued behind dead pages' streams: the navigation
+    // never finished (20s), the next was never even answered (30s), and a whole audit crawled.
+    // Measured 2026-09-26 on our own app (an SSE stream on every signed-in page): previews of six
+    // routes 72s → 22s with this flag and nothing else changed — and the field report of audits of
+    // local dev servers "sitting for many minutes" named exactly this shape. The audit never uses
+    // the cache itself: the back-button probe checks where Back LANDS, which a reload answers too.
+    flags.push("--disable-features=BackForwardCache");
     // In a locked-down container (unprivileged, restricted user-namespaces / no setuid sandbox — the
     // SAME capability restriction that stops the worker's egress firewall loading) Chrome's own sandbox
     // can't initialize: it crashes on boot before opening its DevTools port, so headless_chrome times
@@ -507,6 +517,20 @@ const NET_LEDGER_JS: &str = r#"(() => { try {
         if (out.length >= 20) break;
       }
       if (out.length >= 20) break;
+    }
+    // …and the response's OWN top-level strings: a record fetched by a shared layout (its name in
+    // the breadcrumb, its children in a list elsewhere) is in use when its name is on screen, even
+    // where its array isn't (field report, 2026-09-26).
+    if (j && typeof j === 'object' && !Array.isArray(j)) {
+      let top = 0;
+      for (const k in j) {
+        const v = j[k];
+        if (typeof v !== 'string') continue;
+        const t = v.replace(/\s+/g, ' ').trim();
+        if (t.length < 4 || t.length > 80 || !/[a-z]{3}/i.test(t) || /^(https?:|\/|data:)|^[0-9a-f-]{16,}$|^\d{4}-\d\d-\d\d/i.test(t)) continue;
+        out.push(t.toLowerCase());
+        if (++top >= 5) break;
+      }
     }
     return { items: best.length, samples: out };
   };
@@ -2257,6 +2281,18 @@ mod capture_retry_tests {
         assert!(!capture_looks_unrendered(
             &json!({"elements": [{"tag": "h1"}]})
         ));
+    }
+}
+
+#[cfg(test)]
+mod chrome_flag_tests {
+    /// Every browser the CLI launches runs without the back/forward cache: a cached page keeps its
+    /// live stream's socket, and six of them stall every request to the site (see `base_chrome_flags`).
+    #[test]
+    fn no_browser_keeps_pages_in_the_back_forward_cache() {
+        assert!(super::base_chrome_flags()
+            .iter()
+            .any(|f| *f == "--disable-features=BackForwardCache"));
     }
 }
 
