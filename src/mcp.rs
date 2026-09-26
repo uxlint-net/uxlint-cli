@@ -247,9 +247,16 @@ fn fill_where(text: &str, report: &Value) -> String {
     {
         let finding = &report["pages"][w["page"].as_u64().unwrap_or(0) as usize]["findings"]
             [w["finding"].as_u64().unwrap_or(0) as usize];
-        let at = match finding["source"].as_str() {
-            Some(src) => format!(" · source: {src}"),
-            None => w["fallback"].as_str().unwrap_or("").to_string(),
+        let at = match (
+            finding["source"].as_str(),
+            finding["source_matches"].as_u64(),
+        ) {
+            // The needle is in several files: say so, so a guess isn't read as the answer.
+            (Some(src), Some(n)) if n > 1 => {
+                format!(" · source (likely — 1 of {n} files with this text): {src}")
+            }
+            (Some(src), _) => format!(" · source: {src}"),
+            (None, _) => w["fallback"].as_str().unwrap_or("").to_string(),
         };
         body = body.replace(&format!("{{{{where:{n}}}}}"), &at);
     }

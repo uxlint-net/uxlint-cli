@@ -1052,6 +1052,33 @@ pub(crate) fn states_pass(tab: &headless_chrome::Tab) -> Value {
 // ── dialog/disclosure discovery (client clicks safely, server judges) ─────────
 // Click controls that look like OPENERS (never dangerous labels), watch what appears, and
 // test the component contract live: dialogs → role/aria-modal/label/focus/Escape;
+/// The links an OPEN menu is showing: anchors inside a `role=menu`, menuitems carrying an href, and
+/// links inside whatever an expanded control opened (`aria-controls`, a Radix/Headless UI open
+/// state). `[{href, text}]`, deduped, at most 12 per open.
+const MENU_LINKS_JS: &str = r#"(() => { try {
+  const sel = '[role="menu"] a[href], a[role="menuitem"][href], [role="menu"] [role="menuitem"][href], [data-state="open"] a[href], [data-headlessui-state~="open"] a[href]';
+  const pool = [...document.querySelectorAll(sel)];
+  for (const b of document.querySelectorAll('[aria-expanded="true"][aria-controls]')) {
+    for (const id of (b.getAttribute('aria-controls') || '').split(/\s+/)) {
+      const t = id && document.getElementById(id);
+      if (t) pool.push(...t.querySelectorAll('a[href]'));
+    }
+  }
+  const out = [], seen = new Set();
+  for (const a of pool) {
+    const r = a.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    const href = a.getAttribute('href') || '';
+    const text = (a.getAttribute('aria-label') || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    const k = href + '|' + text;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ href, text });
+    if (out.length >= 12) break;
+  }
+  return JSON.stringify(out);
+} catch (_) { return '[]'; } })()"#;
+
 // disclosures → aria-expanded actually flips.
 /// Verbs that make a control unclickable for `discovery_pass`, which exists only to see what a click
 /// REVEALS. A control that acts is not an opener, and the two failure modes are not comparable: a
@@ -1287,6 +1314,7 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
     let mut dialogs = Vec::new();
     let mut disclosures = Vec::new();
     let mut live_gaps = Vec::new();
+    let mut menu_links: Vec<Value> = Vec::new();
     const TEXT_LEN: &str = r#"((document.body && document.body.innerText) || '').length"#;
     const HAS_LIVE: &str = r#"!!document.querySelector('[aria-live]:not([aria-live="off"]), [role="status"], [role="alert"], output')"#;
     let dangerous = is_dangerous_label;
@@ -1355,6 +1383,27 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
             let _ = tab.wait_until_navigated();
             std::thread::sleep(std::time::Duration::from_millis(500));
             continue;
+        }
+        // What an opened MENU shows: an account menu's "Help & support" (mailto) or "Terms" lives only
+        // there, unrendered until opened, so the site checks that look for a support channel or legal
+        // links never saw it and reported them missing (field report, 2026-09-26). Links only — the
+        // destination and its label — capped.
+        if menu_links.len() < 24 {
+            if let Some(found) = tab
+                .evaluate(MENU_LINKS_JS, false)
+                .ok()
+                .and_then(|r| r.value)
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+                })
+            {
+                for l in found {
+                    if menu_links.len() < 24 && !menu_links.contains(&l) {
+                        menu_links.push(l);
+                    }
+                }
+            }
         }
         let ov = overlay(tab);
         if ov["present"].as_bool() == Some(true) {
@@ -1455,7 +1504,7 @@ pub(crate) fn discovery_pass(tab: &headless_chrome::Tab, base_url: &str) -> Valu
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let _ = base_url; // reserved for future reset logic
-    json!({ "dialogs": dialogs, "disclosures": disclosures, "liveGaps": live_gaps })
+    json!({ "dialogs": dialogs, "disclosures": disclosures, "liveGaps": live_gaps, "menuLinks": menu_links })
 }
 
 // ── context-switch probe (org/workspace/project selector actually updates the page?) ──────────

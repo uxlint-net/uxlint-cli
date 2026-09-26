@@ -1773,6 +1773,7 @@ pub(crate) fn audit_route(
         ix["dialogs"] = disc["dialogs"].clone();
         ix["disclosures"] = disc["disclosures"].clone();
         ix["liveGaps"] = disc["liveGaps"].clone();
+        ix["menuLinks"] = disc["menuLinks"].clone();
         // The shell's context switcher (org/workspace select) repeats on every route — probe it on
         // the first desktop page that actually HAS one, once per audit (a candidate-less page — the
         // marketing homepage, a login screen — must not burn the slot). Server-side dedup keeps a
