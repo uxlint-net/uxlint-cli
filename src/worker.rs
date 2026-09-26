@@ -518,6 +518,20 @@ const NET_LEDGER_JS: &str = r#"(() => { try {
       }
       if (out.length >= 20) break;
     }
+    // …and the response's OWN top-level strings: a record fetched by a shared layout (its name in
+    // the breadcrumb, its children in a list elsewhere) is in use when its name is on screen, even
+    // where its array isn't (field report, 2026-09-26).
+    if (j && typeof j === 'object' && !Array.isArray(j)) {
+      let top = 0;
+      for (const k in j) {
+        const v = j[k];
+        if (typeof v !== 'string') continue;
+        const t = v.replace(/\s+/g, ' ').trim();
+        if (t.length < 4 || t.length > 80 || !/[a-z]{3}/i.test(t) || /^(https?:|\/|data:)|^[0-9a-f-]{16,}$|^\d{4}-\d\d-\d\d/i.test(t)) continue;
+        out.push(t.toLowerCase());
+        if (++top >= 5) break;
+      }
+    }
     return { items: best.length, samples: out };
   };
   const record = (method, url, body) => {

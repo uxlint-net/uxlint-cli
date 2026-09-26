@@ -1135,7 +1135,12 @@ function collectSnapshot() {
 				overlayStretch = near(orect.left, pr.left) && near(orect.top, pr.top) && near(orect.width, pr.width) && near(orect.height, pr.height);
 			}
 		}
-		if (interactive && !inlineProseLink && !overlayStretch && rects.length === 1 && orect.width > 2 && orect.height > 2 && cx >= 0 && cy >= 0 && cx <= vw && cy <= vh) {
+		// A control that is not a POINTER target by design (`pointer-events: none` on itself) can't be
+		// "covered" for the mouse — Apple's global nav stacks a keyboard-only menu trigger under the
+		// Store link it duplicates, and the hit test reported it buried (usefulness review, 2026-09-13).
+		// Keyboard reach is focus's business, not this probe's.
+		const notPointerTarget = cs.pointerEvents === 'none';
+		if (interactive && !notPointerTarget && !inlineProseLink && !overlayStretch && rects.length === 1 && orect.width > 2 && orect.height > 2 && cx >= 0 && cy >= 0 && cx <= vw && cy <= vh) {
 			// A covering element must actually be THERE: elementFromPoint returns null for a point that
 			// isn't hit-testable — chiefly a control straddling the fold, whose centre lands on the
 			// viewport's bottom edge (cy === innerHeight). Null is INCONCLUSIVE, not "covered", so
@@ -1802,6 +1807,22 @@ function collectSnapshot() {
 					(el.getAttribute('name') || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('class') || '')
 				).toLowerCase();
 				if (/\b(filter|sort|search)\b/.test(name)) { searchable = true; break; }
+			}
+		}
+		if (!searchable) {
+			// A plain text box in a SEARCH FORM — the convention every search form follows even when
+			// nothing says type=search: its query field is named q / query / s / keyword, or the form
+			// labels itself "Search". Hacker News' footer `Search: <input name="q">` (posting to
+			// Algolia) was missed and the front page was told it had no search (usefulness review,
+			// 2026-09-13).
+			for (const form of document.forms) {
+				const box = form.querySelector('input:not([type]),input[type=text]');
+				if (!box || box.offsetParent === null) continue;
+				const nm = (box.getAttribute('name') || '').toLowerCase();
+				if (['q', 'query', 's', 'keyword', 'keywords', 'term'].includes(nm) || /\bsearch\b/i.test(form.textContent || '')) {
+					searchable = true;
+					break;
+				}
 			}
 		}
 	} catch (_) { /* ignore */ }
@@ -2502,9 +2523,12 @@ function collectSnapshot() {
 	let ogImage = false;
 	let iconLink = false;
 	try {
-		metaDescription = !!document.querySelector('meta[name="description"][content]');
-		ogTags = document.querySelectorAll('meta[property^="og:"]').length;
-		ogImage = !!document.querySelector('meta[property="og:image"][content], meta[name="twitter:image"][content]');
+		// `i`: a meta NAME is matched case-insensitively by the things that read it (search engines,
+		// unfurlers), and Apple's home page writes `name="Description"` — the case-sensitive selector
+		// reported a description that was there (usefulness review, 2026-09-13).
+		metaDescription = !!document.querySelector('meta[name="description" i][content]');
+		ogTags = document.querySelectorAll('meta[property^="og:" i]').length;
+		ogImage = !!document.querySelector('meta[property="og:image" i][content], meta[name="twitter:image" i][content]');
 		iconLink = !!document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]');
 	} catch (_) {
 		/* ignore */
@@ -2594,6 +2618,12 @@ function collectSnapshot() {
 			const r = a.getBoundingClientRect();
 			if (r.width < 4 || r.height < 4 || a.offsetParent === null) continue;
 			if (a.closest('nav,[role="navigation"]')) continue; // nav items stand out by POSITION — colour-only is fine there
+			// A DELIMITED LIST of links — "new | past | comments | ask", "Docs · Blog · Status" — is a
+			// menu set out by its separators, not a link hiding in prose: the text right beside it is a
+			// bare separator, where prose would have words. Hacker News' top bar and item rows were
+			// reported as colour-only prose links (usefulness review, 2026-09-13).
+			const sepOnly = (n) => !!n && n.nodeType === 3 && /^\s*[|·•\/–—-]\s*$/.test(n.textContent || '');
+			if (sepOnly(a.previousSibling) || sepOnly(a.nextSibling)) continue;
 			if (hoverChanges(a)) continue; // underlines/changes on hover (Google-style) — acceptable
 			const cs = getComputedStyle(a);
 			// WCAG 1.4.1 is about links set in a RUN OF PROSE. A whole clickable card/row (a
@@ -3045,6 +3075,8 @@ function collectSnapshot() {
 			// Semantic containers count anchors anywhere inside; a bare <div> only qualifies as a nav
 			// when its OWN row of links is the anchor set (a chip/jump bar) — not any div that merely
 			// contains scattered same-page links. Keeps it tight enough to avoid false positives.
+			// A footer's same-page links (a locale list, "back to top") aren't a section nav.
+			if (el.closest('footer, [role="contentinfo"]')) continue;
 			const semantic = el.matches('nav, [role="navigation"], aside, ol, ul');
 			const linkSel = semantic ? 'a[href]' : ':scope > a[href], :scope > * > a[href]';
 			const anchorSel = semantic ? 'a[href^="#"]' : ':scope > a[href^="#"], :scope > * > a[href^="#"]';
@@ -3267,7 +3299,11 @@ function collectSnapshot() {
 			const aria = (a.getAttribute('aria-label') || '').trim();
 			const name = (aria || a.getAttribute('title') || a.textContent || '').replace(/\s+/g, ' ').trim();
 			const low = name.toLowerCase().replace(/[.!?→›»↗⧉↗⧉]+$/g, '').trim();
-			if (name && VAGUE.has(low) && vagueLinks.length < 6) { vagueLinks.push(name.slice(0, 40)); var vr=a.getBoundingClientRect(); vagueLinkRects.push([Math.round(vr.left),Math.round(vr.top),Math.round(vr.width),Math.round(vr.height)]); }
+			// An anchor that presents as a BUTTON (role=button) isn't in a screen reader's links list —
+			// it's announced as a button, where "Continue" is an ordinary name (Apple's country-switch
+			// banner, usefulness review 2026-09-13). The rule is about links.
+			const asButton = (a.getAttribute('role') || '').toLowerCase() === 'button';
+			if (name && !asButton && VAGUE.has(low) && vagueLinks.length < 6) { vagueLinks.push(name.slice(0, 40)); var vr=a.getBoundingClientRect(); vagueLinkRects.push([Math.round(vr.left),Math.round(vr.top),Math.round(vr.width),Math.round(vr.height)]); }
 			if ((a.getAttribute('target') || '') === '_blank') {
 				const warned = /\bnew (tab|window)\b/i.test(name) ||
 					a.querySelector('svg, img, [class*="external" i], [class*="new-tab" i]') !== null ||
