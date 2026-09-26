@@ -53,6 +53,8 @@ pub(crate) struct AuditRequestInputs<'a> {
     /// classification. Empty ⇒ the server's reading stands.
     pub(crate) page_kinds: &'a [(String, String)],
     pub(crate) glossary: &'a [(String, Vec<String>)],
+    /// uxlint.toml `[[suppress]]` — applied server-side before the grade, as acknowledgements.
+    pub(crate) suppress: &'a [crate::project::Suppress],
     /// File under NO site (`AuditArgs::unfiled`) — the server skips attaching the report anywhere.
     pub(crate) unfiled: bool,
 }
@@ -97,6 +99,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "desktop_only": i.desktop_only,
         "page_kinds": i.page_kinds.iter().map(|(route, kind)| json!({"route": route, "kind": kind})).collect::<Vec<_>>(),
         "glossary": i.glossary.iter().map(|(say, never)| json!({"say": say, "never": never})).collect::<Vec<_>>(),
+        "suppress": i.suppress.iter().map(|s| json!({"rule": s.rule, "paths": s.paths, "reason": s.reason})).collect::<Vec<_>>(),
     })
 }
 
