@@ -526,6 +526,8 @@ pub(crate) struct Suppress {
     pub(crate) rule: String,
     /// Path patterns (same matching as `exclude`: exact or prefix). Empty = every path.
     pub(crate) paths: Vec<String>,
+    /// Why — shown beside the acknowledged finding in the report.
+    pub(crate) reason: String,
 }
 
 /// Findings to drop from the report: issues you've reviewed and won't fix. Unlike `exclude`
@@ -554,7 +556,16 @@ pub(crate) fn suppressions() -> Vec<Suppress> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(Suppress { rule, paths })
+            let reason = s
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(Suppress {
+                rule,
+                paths,
+                reason,
+            })
         })
         .collect()
 }

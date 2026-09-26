@@ -1273,6 +1273,25 @@ struct GetReportArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AcknowledgeArgs {
+    /// The report the finding is in: its URL (…/r/<id>) or its id.
+    report: String,
+    /// The finding's rule, exactly as the report names it.
+    rule: String,
+    /// The finding's selector (`selector` in the structured result); `site` for a site-wide finding.
+    #[serde(default)]
+    selector: String,
+    /// Why the finding is wrong HERE — shown beside it in every later report, so whoever reads the
+    /// report can see why it isn't counted. Required to acknowledge (20+ characters); not needed to
+    /// undo.
+    #[serde(default)]
+    reason: String,
+    /// true to withdraw an earlier acknowledgement, putting the finding back.
+    #[serde(default)]
+    undo: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct GetFeedbackArgs {
     /// How far back to look, and the size of the window it is compared against: `7d`, `14d`
     /// (default), `30d`, `90d`, or `all`.
@@ -1483,7 +1502,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) Iterate until green. If a lint_feedback tool is in your tool list, also send a verdict for each finding you act on — it's how rules get kept, tuned or retired. It is absent unless the project set `feedback = true` (via `uxlint init`), so don't go looking for it: this result tells you when it's there.\n\nSAFETY: interaction probes navigate, read, and click candidate menu/disclosure/dialog controls. Discovery skips recognised action words — delete, remove, accept, leave, revoke, pay, publish, add, create, save — using the full label. Labels cannot guarantee a click has no side effects; use an environment you control with disposable data. the write probes (which click Add/Create, and Delete through its confirm dialog) need the CLI's own --allow-mutation flag, which is not reachable from here. Declared tests are the exception and the only one: if the project's uxlint.toml declares tests that sign in as a persona, running them will SUBMIT forms and may DELETE items — that's what a test does, and it exercises create/delete flows on your own app. Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
+        description = "Audit a website's UX/design: contrast, tap targets, type scale, colour discipline, copy clarity, scan patterns. Each finding returns its RULE name (pass it to verify_fix), a SOURCE file:line hint (for local audits, grepped from the project you're in), the SELECTOR, the concrete FIX, and — for copy issues — the exact text EDIT (replace X with Y).\n\nWORKFLOW: (1) Before you change anything, call ux_guidance for the area(s) the findings touch (forms, lists, layout, copy, …) so you fix toward the idiomatic, DRY pattern — not a one-off patch. If the result names a STYLEGUIDE, open it first and build to the components/tokens it shows. (2) Open the source line and apply the SMALLEST fix that reuses the project's existing components/tokens and voice (don't add a new one-off to silence the finding) without regressing the quality floor — responsive, visible keyboard focus, reduced motion, no new layout shift — then verify_fix. (3) Iterate until green. A finding you've checked and found WRONG on this page (the rule misread it)? acknowledge_finding marks it a known false positive for the site, so it stops coming back and stops counting against the grade — it stays visible in the report, with your reason. If a lint_feedback tool is in your tool list, also send a verdict for each finding you act on — it's how rules get kept, tuned or retired. It is absent unless the project set `feedback = true` (via `uxlint init`), so don't go looking for it: this result tells you when it's there.\n\nSAFETY: interaction probes navigate, read, and click candidate menu/disclosure/dialog controls. Discovery skips recognised action words — delete, remove, accept, leave, revoke, pay, publish, add, create, save — using the full label. Labels cannot guarantee a click has no side effects; use an environment you control with disposable data. the write probes (which click Add/Create, and Delete through its confirm dialog) need the CLI's own --allow-mutation flag, which is not reachable from here. Declared tests are the exception and the only one: if the project's uxlint.toml declares tests that sign in as a persona, running them will SUBMIT forms and may DELETE items — that's what a test does, and it exercises create/delete flows on your own app. Point it only at an app you own / a throwaway env, never a site you don't control.\n\nSETUP: in a project with no uxlint.toml, this returns the exact config to write first (org/site/base/routes) — write that file, check it in, then call again. Without it a local target can't be audited at all and a public one files its report under a site nobody chose.\n\nAUTH: for a logged-in site, DON'T pass secrets here — credentials come from the project's uxlint.toml [personas] (the local client replays them; nothing touches this tool call or the transcript). If the audit hits a login wall, this tool returns the exact setup instructions."
     )]
     async fn audit_url(
         &self,
@@ -2019,6 +2038,65 @@ impl UxlintMcp {
             }
             Err(msg) => Ok(CallToolResult::success(vec![ContentBlock::text(msg)])),
         }
+    }
+
+    #[tool(
+        name = "acknowledge_finding",
+        description = "Mark ONE finding as a known false positive for this site, so later audits stop counting it — it moves out of the findings, the counts and the grade into the report's `acknowledged` list, where it stays visible with your reason. Use it only after you've checked the finding is wrong on this page (the rule misread it), never to silence a real problem you'd rather not fix. Pass the report (URL or id), the rule and the selector exactly as the finding gives them, and a reason. undo=true puts it back. Works on reports filed under a site."
+    )]
+    async fn acknowledge_finding(
+        &self,
+        Parameters(a): Parameters<AcknowledgeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if self.call_cli().api_key.is_none() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                signup_hint(&self.cli.server),
+            )]));
+        }
+        let cli = self.call_cli();
+        let text = tokio::task::spawn_blocking(move || {
+            let server = cli.server.trim_end_matches('/').to_string();
+            let id = parse_report_ref(&a.report, &server)?;
+            let resp = reqwest::blocking::Client::new()
+                .post(format!("{server}/v1/findings/acknowledge"))
+                .bearer_auth(cli.api_key.as_deref().unwrap_or(""))
+                .json(&json!({
+                    "report_id": id, "rule": a.rule.trim(), "sel": a.selector,
+                    "reason": a.reason, "undo": a.undo,
+                }))
+                .send()
+                .map_err(|e| format!("could not reach {server}: {e}"))?;
+            let status = resp.status();
+            let body: Value = resp.json().unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(credential_rejected(&cli.server));
+            }
+            if !status.is_success() {
+                return Err(body["error"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("the server said {status}")));
+            }
+            let ack = &body["acknowledgement"];
+            Ok(if ack["acknowledged"] == true {
+                format!(
+                    "Acknowledged {} as a false positive on {} — later audits of this site list it under \
+                     `acknowledged` (with your reason) instead of counting it.",
+                    a.rule.trim(),
+                    ack["routes"]
+                        .as_array()
+                        .map(|r| r.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default()
+                )
+            } else {
+                format!("Withdrawn — {} counts again from the next audit.", a.rule.trim())
+            })
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("acknowledge task panicked: {e}"), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            text.unwrap_or_else(|e| e),
+        )]))
     }
 
     // uxlint STAFF only, and absent from the router unless the server was launched with `--admin`

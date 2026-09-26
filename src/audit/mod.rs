@@ -579,6 +579,7 @@ pub(crate) fn run_audit_ext(
         .as_ref()
         .map(|p| p.desktop_only.clone())
         .unwrap_or_default();
+    let suppress = crate::project::suppressions();
     let glossary = project
         .as_ref()
         .map(|p| p.glossary.clone())
@@ -620,6 +621,7 @@ pub(crate) fn run_audit_ext(
         desktop_only: &desktop_only,
         page_kinds: &page_kinds,
         glossary: &glossary,
+        suppress: &suppress,
         unfiled: args.unfiled,
     });
     // --dry-run: this is the whole point of the flag — write the EXACT payload we would POST to disk
@@ -1006,8 +1008,19 @@ fn send_and_finalize(input: FinalizeInputs) -> Result<Value> {
     );
     // Drop findings the project has reviewed and suppressed (uxlint.toml [[suppress]]) before
     // anything else looks at them.
-    let suppressed =
+    // The server applies them itself now (acknowledged, before the grade — cli 0.1.45); this client
+    // pass is the fallback for an older server, and a no-op otherwise.
+    let mut suppressed =
         crate::project::apply_suppressions(&mut report, &crate::project::suppressions());
+    for a in report["acknowledged"].as_array().into_iter().flatten() {
+        if a["via"] == "uxlint.toml" {
+            if let Some(rule) = a["rule"].as_str() {
+                if !suppressed.iter().any(|r| r == rule) {
+                    suppressed.push(rule.to_string());
+                }
+            }
+        }
+    }
     // A suppression is an implicit "reject" — feed it back so we learn which rules users don't
     // trust. Best-effort and stable-keyed (no report_id) so re-audits update, never pile up; a
     // failed post never fails the audit.
@@ -1539,6 +1552,7 @@ mod request_tests {
             desktop_only: &[],
             page_kinds: &[],
             glossary: &[],
+            suppress: &[],
             unfiled: false,
         }
     }
