@@ -52,6 +52,7 @@ pub(crate) struct AuditRequestInputs<'a> {
     /// `[page_kinds]` route-glob → kind overrides (uxlint.toml) — the server applies them over its own
     /// classification. Empty ⇒ the server's reading stands.
     pub(crate) page_kinds: &'a [(String, String)],
+    pub(crate) glossary: &'a [(String, Vec<String>)],
     /// File under NO site (`AuditArgs::unfiled`) — the server skips attaching the report anywhere.
     pub(crate) unfiled: bool,
 }
@@ -95,6 +96,7 @@ pub(crate) fn build_audit_request(i: &AuditRequestInputs) -> Value {
         "site_type": i.site_type,
         "desktop_only": i.desktop_only,
         "page_kinds": i.page_kinds.iter().map(|(route, kind)| json!({"route": route, "kind": kind})).collect::<Vec<_>>(),
+        "glossary": i.glossary.iter().map(|(say, never)| json!({"say": say, "never": never})).collect::<Vec<_>>(),
     })
 }
 

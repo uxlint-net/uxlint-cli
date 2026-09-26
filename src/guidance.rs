@@ -18,6 +18,7 @@ uxlint UI guidance — pass `topic` to get the detail. Topics:
   performance   window long lists, reserve space, size media
   accessibility semantics, names, focus, target size
   content       words are UI — active voice, honest labels, useful empty/error states
+  money         plans, checkout, usage, cost before an action, failed payments
 Pass topic=\"all\" for everything.";
 
 const LAYOUT: &str = r#"## Layout — consistency & stability
@@ -202,6 +203,38 @@ DON'T
 Testable: each action label matches the wording of its own confirmation; no "submit / click here /
 learn more"; every empty and error state names a next step; no lorem/placeholder or dead links in prod."#;
 
+// Asked for from the field (2026-09-26): money is where an agent most needs the idiom and uxlint had
+// no topic for it, while rules like pricing-page-missing fired with nothing to build to.
+const MONEY: &str = r#"## Money — plans, usage, and the cost of an action
+
+Money surfaces are trust surfaces: say what it costs BEFORE it costs it, in the same words after.
+
+DO
+- A public /pricing page for a product that charges, linked from the landing nav; each tier says what
+  it adds over the one below it (limits, seats, features), not just a price. [rule: pricing-page-missing,
+  tier-differentiation]
+- Inside the app, the CURRENT plan, usage against its limit and an upgrade path are one click from
+  settings or the account menu (a "Billing" / "Plan & usage" page). A meter shows used / limit and
+  warns before the limit, not at it.
+- Show the price of a metered action NEXT TO the action ("Generate — 3 credits"), and confirm with the
+  same number and the same verb ("Generate for 3 credits?"). No charge the user didn't see coming.
+  [rule: action-no-feedback, duplicate-cta]
+- Irreversible or paid actions confirm first, naming what happens; a disabled "Upgrade" or "Buy"
+  says why it's disabled. [rule: destructive-no-confirm, disabled-without-reason]
+- Cancelling is findable where subscribing was (settings → plan → cancel), with no dark-pattern
+  maze; say what the user keeps and until when. [rule: subscription-exit]
+- Failed payment (dunning): a banner naming the problem and a one-click fix, a stated grace period,
+  and what stops working when — never a silent downgrade.
+- Money is formatted for the reader: currency, locale separators, tax shown or stated as excluded.
+
+DON'T
+- Hide the price behind "Contact us" on self-serve tiers; charge on an action whose button didn't
+  show the cost; rename the thing between the button and the receipt. [duplicate-cta]
+
+Testable: every paid/metered action shows its cost on the control and in its confirmation; plan,
+usage and an upgrade path are reachable in ≤ 2 clicks from settings; cancel is reachable from the
+same page as upgrade; a failed-payment state has a visible fix and a stated grace period."#;
+
 /// Return the guidance for `topic`. Unknown/empty → the index; "all" → everything.
 pub(crate) fn guidance(topic: &str) -> String {
     let t = topic.trim().to_lowercase();
@@ -215,6 +248,7 @@ pub(crate) fn guidance(topic: &str) -> String {
         "performance" | "perf" => section(PERFORMANCE),
         "accessibility" | "a11y" => section(ACCESSIBILITY),
         "content" | "copy" | "writing" | "microcopy" | "words" | "voice" => section(CONTENT),
+        "money" | "billing" | "pricing" | "payments" | "usage" | "checkout" => section(MONEY),
         "all" | "*" => [
             INDEX,
             LAYOUT,
@@ -225,6 +259,7 @@ pub(crate) fn guidance(topic: &str) -> String {
             PERFORMANCE,
             ACCESSIBILITY,
             CONTENT,
+            MONEY,
         ]
         .join("\n\n"),
         _ => section(INDEX),
@@ -250,6 +285,10 @@ mod tests {
         assert!(guidance("accessibility").contains("accessible name"));
         assert!(guidance("content").contains("active voice"));
         assert!(
+            guidance("billing").contains("cost before")
+                || guidance("billing").contains("BEFORE it costs")
+        );
+        assert!(
             guidance("copy").contains("empty state")
                 || guidance("copy").contains("empty and error")
         );
@@ -267,6 +306,7 @@ mod tests {
             "Performance",
             "Accessibility",
             "Content",
+            "Money",
         ] {
             assert!(all.contains(needle), "missing {needle}");
         }
@@ -297,6 +337,7 @@ mod tests {
             "performance",
             "accessibility",
             "content",
+            "money",
         ] {
             let g = guidance(topic);
             assert!(g.contains("[rule:"), "{topic} lost its rule tags");

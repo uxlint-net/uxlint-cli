@@ -579,6 +579,10 @@ pub(crate) fn run_audit_ext(
         .as_ref()
         .map(|p| p.desktop_only.clone())
         .unwrap_or_default();
+    let glossary = project
+        .as_ref()
+        .map(|p| p.glossary.clone())
+        .unwrap_or_default();
     let page_kinds = project
         .as_ref()
         .map(|p| p.page_kinds.clone())
@@ -615,6 +619,7 @@ pub(crate) fn run_audit_ext(
         site_type: site_type.as_deref(),
         desktop_only: &desktop_only,
         page_kinds: &page_kinds,
+        glossary: &glossary,
         unfiled: args.unfiled,
     });
     // --dry-run: this is the whole point of the flag — write the EXACT payload we would POST to disk
@@ -1533,6 +1538,7 @@ mod request_tests {
             site_type: Some("saas"),
             desktop_only: &[],
             page_kinds: &[],
+            glossary: &[],
             unfiled: false,
         }
     }

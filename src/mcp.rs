@@ -1016,7 +1016,9 @@ fn project_setup_instructions(
          exclude = [\"/admin/*\"]      # routes the audit must never open (demos, fixtures, destructive tools)\n  \
          desktop_only = [\"/editor/*\"] # desktop-primary surfaces, so mobile findings there stay info-level\n\n  \
          [page_kinds]                 # only if a report shows a page read as the wrong kind\n  \
-         \"/projects/*/edit\" = \"app-workspace\"  # marketing | document | auth | app | app-collection | app-record | app-workspace | app-form\n\n\
+         \"/projects/*/edit\" = \"app-workspace\"  # marketing | document | auth | app | app-collection | app-record | app-workspace | app-form\n\n  \
+         [glossary]                   # only if the project has a say-this-not-that vocabulary\n  \
+         \"workspace\" = [\"project\", \"org\"]  # say \"workspace\"; UI copy using the others is flagged\n\n\
          If the app is behind a login, add a persona — the local client replays it, so no secret \
          reaches this tool or the transcript. Ask the user for the credential; a real secret goes in \
          a gitignored .env as ${{VAR}}, only a throwaway dev login is ever inlined:\n\n  \
@@ -1156,7 +1158,8 @@ struct AuditUrlArgs {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct UxGuidanceArgs {
     /// Which area to get guidance for: layout, forms, lists, navigation, components, performance,
-    /// accessibility, content. Omit for the index of topics; "all" for everything. Accepts aliases
+    /// accessibility, content, money (plans, checkout, usage, cost before an action). Omit for the
+    /// index of topics; "all" for everything. Accepts aliases
     /// (copy, nav, a11y, perf, dry, …) and falls back to the index for anything unrecognized.
     #[serde(default)]
     topic: Option<String>,
@@ -2165,7 +2168,7 @@ impl UxlintMcp {
     }
 
     #[tool(
-        description = "Project design memory and best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Reads the nearest project’s uxlint.design.json on each call; only explicitly approved versioned decisions guide edits. Never auto-approve or rewrite that contract to silence a lint. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, and copy that reads as UI (active voice, honest labels, useful empty/error states). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
+        description = "Project design memory and best-practice UI guidance to read BEFORE building or changing UI — usability, consistency, and performance patterns distilled from uxlint's audit corpus, so you build idiomatic, DRY, testable components the first time instead of getting audited after. Reads the nearest project’s uxlint.design.json on each call; only explicitly approved versioned decisions guide edits. Never auto-approve or rewrite that contract to silence a lint. Covers whole-row click targets, single-column labelled forms, tabs/radiogroup vs plain buttons, one shared width scale + aligned panels, pagination by scroll length, CLS-safe layout, copy that reads as UI (active voice, honest labels, useful empty/error states), and money surfaces (plans, usage, the cost of an action shown before it runs, failed payments). Each item names the uxlint rule that catches a miss, so the loop is: read the topic, build to it, then audit_url to confirm."
     )]
     async fn ux_guidance(
         &self,
