@@ -318,27 +318,61 @@ pub(crate) fn annotate(report: &mut Value, root: &Path) {
         return;
     };
     for page in pages {
+        let route = page["route"].as_str().unwrap_or("").to_string();
         let Some(findings) = page["findings"].as_array_mut() else {
             continue;
         };
         for f in findings {
-            let Some(n) = needle(f) else { continue };
-            // 1. A real source/template file (deterministic: first line of the first sorted file).
-            let hit = code.iter().find_map(|(rel, lines)| {
-                lines
-                    .iter()
-                    .position(|line| line.contains(&n))
-                    .map(|i| format!("{rel}:{}", i + 1))
-            });
-            // 2. Fall back to Markdown PROSE only (never a code fence) — better no hint than a wrong one.
-            let hit = hit.or_else(|| {
-                docs.iter().find_map(|(rel, lines)| {
-                    first_prose_match(lines, &n).map(|i| format!("{rel}:{}", i + 1))
-                })
-            });
-            if let Some(src) = hit {
-                f["source"] = Value::String(src);
-            }
+            attribute(f, &route, &code, &docs);
+        }
+    }
+}
+
+/// Attribute one finding to the source line its needle appears on. Real source first (the first
+/// sorted file, so the answer is deterministic), Markdown prose only as a fallback.
+///
+/// A short needle — a heading like "Settings" — is in many files, and the first sorted one used to
+/// win however unrelated it was (field report, 2026-09-26: a heading-attachment hint pointed at a
+/// different component with the same heading). So when several files match, prefer one whose PATH
+/// names a segment of the audited route (`/settings/billing` → `…/settings/…`), and record how many
+/// matched (`source_matches`) so the hint can say it's one of several instead of sounding certain.
+fn attribute(
+    f: &mut Value,
+    route: &str,
+    code: &[&(String, Vec<String>)],
+    docs: &[&(String, Vec<String>)],
+) {
+    let Some(n) = needle(f) else { return };
+    let hits: Vec<String> = code
+        .iter()
+        .filter_map(|(rel, lines)| {
+            lines
+                .iter()
+                .position(|line| line.contains(&n))
+                .map(|i| format!("{rel}:{}", i + 1))
+        })
+        .collect();
+    let segments: Vec<String> = route
+        .split(['/', '-', '_', '.'])
+        .filter(|s| s.len() >= 3 && !s.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_lowercase)
+        .collect();
+    let on_route = hits.iter().find(|h| {
+        let path = h
+            .rsplit_once(':')
+            .map_or(h.as_str(), |(p, _)| p)
+            .to_lowercase();
+        segments.iter().any(|seg| path.contains(seg.as_str()))
+    });
+    let hit = on_route.or(hits.first()).cloned().or_else(|| {
+        docs.iter().find_map(|(rel, lines)| {
+            first_prose_match(lines, &n).map(|i| format!("{rel}:{}", i + 1))
+        })
+    });
+    if let Some(src) = hit {
+        f["source"] = Value::String(src);
+        if hits.len() > 1 {
+            f["source_matches"] = Value::from(hits.len());
         }
     }
 }
@@ -455,25 +489,36 @@ mod tests {
     fn annotate_over(report: &mut Value, mut sources: Vec<(String, Vec<String>)>) {
         sources.sort_by(|a, b| a.0.cmp(&b.0));
         let (code, docs): (Vec<_>, Vec<_>) = sources.iter().partition(|(rel, _)| !is_markdown(rel));
+        let route = report["pages"][0]["route"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         for f in report["pages"][0]["findings"].as_array_mut().unwrap() {
-            let Some(n) = needle(f) else { continue };
-            let hit = code
-                .iter()
-                .find_map(|(rel, lines)| {
-                    lines
-                        .iter()
-                        .position(|l| l.contains(&n))
-                        .map(|i| format!("{rel}:{}", i + 1))
-                })
-                .or_else(|| {
-                    docs.iter().find_map(|(rel, lines)| {
-                        first_prose_match(lines, &n).map(|i| format!("{rel}:{}", i + 1))
-                    })
-                });
-            if let Some(s) = hit {
-                f["source"] = Value::String(s);
-            }
+            attribute(f, &route, &code, &docs);
         }
+    }
+
+    /// A heading found in several components: the one on the audited route's path wins, and the
+    /// hint records that it was one of several (field report, 2026-09-26).
+    #[test]
+    fn a_common_needle_prefers_the_routes_own_file_and_says_it_was_ambiguous() {
+        let mut r = serde_json::json!({ "pages": [ { "route": "/settings/billing",
+            "findings": [ { "msg": r#"Heading "Payment method" floats"# } ] } ] });
+        annotate_over(
+            &mut r,
+            src(&[
+                ("src/lib/Checkout.svelte", "<h2>Payment method</h2>"),
+                (
+                    "src/routes/settings/billing/+page.svelte",
+                    "<h2>Payment method</h2>",
+                ),
+            ]),
+        );
+        assert_eq!(
+            source_of(&r).as_deref(),
+            Some("src/routes/settings/billing/+page.svelte:1")
+        );
+        assert_eq!(r["pages"][0]["findings"][0]["source_matches"], 2);
     }
 
     #[test]

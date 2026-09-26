@@ -1077,6 +1077,27 @@ function collectSnapshot() {
 			const ellipsisX = cs.textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth * 1.5;
 			if (!isHeading && (clampY || ellipsisX) && (el.innerText || '').trim().length > 40) truncated = true;
 		} catch (_) { /* ignore */ }
+		// A SHORT LABEL cut on an item placed by position — a timeline clip, a canvas node, a board
+		// card — where the item's width is set by its data, so a short clip shows "Openi…" of
+		// "Opening on the pier" and the name can't be read without selecting it (field report,
+		// 2026-09-26). Only when most of the label is hidden and nothing (a title) shows the rest.
+		let truncLabel = false;
+		try {
+			const txt = (el.innerText || '').trim();
+			if (txt.length >= 10 && txt.length <= 80 && !/^H[1-6]$/.test(el.tagName)) {
+				const cutX = cs.textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth * 1.6;
+				const cutY = /hidden|clip/.test(cs.overflowY) && (cs.webkitLineClamp !== 'none' || cs.display === '-webkit-box') && el.scrollHeight > el.clientHeight * 1.6;
+				if (cutX || cutY) {
+					let placed = false, titled = false;
+					for (let a = el, k = 0; a && a !== document.body && k < 4; a = a.parentElement, k++) {
+						if (a.getAttribute && a.getAttribute('title')) titled = true;
+						const ap = getComputedStyle(a).position;
+						if (ap === 'absolute') placed = true;
+					}
+					truncLabel = placed && !titled;
+				}
+			}
+		} catch (_) { /* ignore */ }
 
 		const role = el.getAttribute('role');
 		// React/Vue attach listeners synthetically — el.onclick is null on their clickables.
@@ -1613,6 +1634,7 @@ function collectSnapshot() {
 			namedByAttr,
 			hasTitle: !!(titleAttr && titleAttr.trim()),
 			truncated,
+			...(truncLabel ? { truncLabel: true } : {}),
 			isControl,
 			inputType,
 			inFieldset,

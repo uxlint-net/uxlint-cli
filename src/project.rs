@@ -66,6 +66,33 @@ pub(crate) struct ProjectConfig {
     /// classifies every page itself; this is how a project CORRECTS a misreading, and it wins. Same
     /// wildcard grammar as `exclude`.
     pub(crate) page_kinds: Vec<(String, String)>,
+    /// `[glossary]` — `"workspace" = ["project", "org"]`: the term to say, and the terms never to show
+    /// users. Sent to the server's `glossary-term` lint, which flags banned terms in UI copy.
+    pub(crate) glossary: Vec<(String, Vec<String>)>,
+}
+
+/// `[glossary] "workspace" = ["project", "org"]` (or a single string): the term to say → the terms
+/// never to show users. Entries with nothing banned are dropped.
+fn glossary_of(v: &toml::Value) -> Vec<(String, Vec<String>)> {
+    v.get("glossary")
+        .and_then(|t| t.as_table())
+        .map(|t| {
+            t.iter()
+                .map(|(say, never)| {
+                    let never = match never {
+                        toml::Value::String(s) => vec![s.clone()],
+                        toml::Value::Array(a) => a
+                            .iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    (say.clone(), never)
+                })
+                .filter(|(_, never)| !never.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn project_config() -> Option<ProjectConfig> {
@@ -182,6 +209,7 @@ pub(crate) fn project_config() -> Option<ProjectConfig> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let glossary = glossary_of(&v);
             return Some(ProjectConfig {
                 org,
                 site,
@@ -195,6 +223,7 @@ pub(crate) fn project_config() -> Option<ProjectConfig> {
                 exclude,
                 desktop_only,
                 page_kinds,
+                glossary,
             });
         }
         if !dir.pop() {
@@ -861,6 +890,30 @@ mod credential_tests {
 
     /// The crawl signs in as `default_persona`, borrowing that persona's username/password and the
     /// site-wide `login_url` — the case our own uxlint.toml relies on.
+    #[test]
+    fn a_glossary_maps_the_word_to_say_to_the_words_never_to_show() {
+        let v = toml(
+            r#"
+[glossary]
+"workspace" = ["project", "org"]
+"renderer" = "GPU backend"
+"empty" = []
+"#,
+        );
+        let mut g = super::glossary_of(&v);
+        g.sort();
+        assert_eq!(
+            g,
+            vec![
+                ("renderer".to_string(), vec!["GPU backend".to_string()]),
+                (
+                    "workspace".to_string(),
+                    vec!["project".to_string(), "org".to_string()]
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn the_crawl_signs_in_as_the_default_persona() {
         let v = toml(
